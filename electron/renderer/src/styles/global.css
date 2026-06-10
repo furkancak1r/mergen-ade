@@ -117,7 +117,10 @@ body {
   background: #1a1a1a !important;
 }
 
-.project-explorer,
-.terminal-manager {
+.project-explorer {
   background: #141414;
+}
+
+.terminal-manager {
+  background: #181818;
 }

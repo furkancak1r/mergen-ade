@@ -1,11 +1,52 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry } from '../../../shared/types';
 import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalManagerFilterEnum, BuiltinLauncherKind, activeBuildModel } from '../../../shared/types';
 import type { TerminalInstance } from '../hooks/usePty';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
 
-function cappedTooltip(text: string, maxChars: number = 100): string {
+// Exact color palette from Rust reference (app.rs)
+const APP_BG = '#101010';
+const SURFACE_BG = '#181818';
+const SURFACE_BG_SOFT = '#1e1e1e';
+const BORDER_COLOR = '#2a2a2a';
+const ACCENT = '#aaaaaa';
+const TEXT_PRIMARY = '#f4f4f4';
+const TEXT_MUTED = '#8a8a8a';
+const BTN_BLUE = '#2563eb';
+const BTN_BLUE_HOVER = '#1d4ed8';
+const BTN_TEAL = '#0f4c5c';
+const BTN_TEAL_HOVER = '#146478';
+const BTN_RED = '#b92d2d';
+const BTN_RED_HOVER = '#dc3c3c';
+const BTN_ICON = '#1e1e1e';
+const BTN_ICON_HOVER = '#2d2d2d';
+const BTN_ICON_ACTIVE = '#2563eb';
+const CONTROL_ROW_HEIGHT = 28;
+const TERMINAL_MANAGER_FILTER_ROW_HEIGHT_EXTRA = 12;
+const TERMINAL_MANAGER_FILTER_SIDE_PADDING = 8;
+const TERMINAL_MANAGER_FILTER_CENTER_GAP = 28;
+const TERMINAL_MANAGER_FILTER_TOP_PADDING = 4;
+const TERMINAL_MANAGER_FILTER_UNDERLINE_GAP = 2;
+const TERMINAL_MANAGER_FILTER_UNDERLINE_HEIGHT = 2;
+const TERMINAL_MANAGER_WORKTREE_TERMINAL_EXTRA_INDENT = 10;
+const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH = 32;
+const SIDEBAR_ROW_LEADING_INSET = 6;
+const TERMINAL_HOVER_WIDTH = 320;
+const TERMINAL_HISTORY_POPUP_MAX_HEIGHT = 400;
+const TERMINAL_HISTORY_MESSAGE_MAX_HEIGHT = 120;
+const TERMINAL_HISTORY_POPUP_MAX_VISIBLE_ENTRIES = 5;
+const TERMINAL_HISTORY_POPUP_CHROME_HEIGHT_ESTIMATE = 56;
+const TERMINAL_HISTORY_POPUP_ROW_GAP = 4;
+
+function withAlpha(color: string, alpha: number): string {
+  const r = parseInt(color.slice(1, 3), 16);
+  const g = parseInt(color.slice(3, 5), 16);
+  const b = parseInt(color.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha / 255})`;
+}
+
+function cappedHoverText(text: string, maxChars: number = 100): string {
   const chars = Array.from(text);
   if (chars.length <= maxChars) return text;
   return chars.slice(0, maxChars).join('') + '…';
@@ -55,6 +96,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   const [fgMessagePopupText, setFgMessagePopupText] = useState('');
   const [fgMessageEditIndex, setFgMessageEditIndex] = useState<number | null>(null);
   const [historyPopupTerminalId, setHistoryPopupTerminalId] = useState<number | null>(null);
+  const [historyPopupJustOpened, setHistoryPopupJustOpened] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   const toggleProject = useCallback((projectId: number) => {
     setExpandedProjects((prev) => {
@@ -79,20 +122,15 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   const sendSavedMessage = useCallback(async (projectId: number, message: string, kind: TerminalKind) => {
     let target: TerminalInstance | undefined;
     if (kind === TerminalKindEnum.Foreground) {
-      // Target the active foreground terminal for this project
       target = terminals.find((t) => t.projectId === projectId && t.kind === kind && t.id === activeTerminalId);
       if (!target) {
-        // Fallback to first foreground terminal
         target = terminals.find((t) => t.projectId === projectId && t.kind === kind);
       }
     } else {
       target = terminals.find((t) => t.projectId === projectId && t.kind === kind);
     }
     if (!target) return;
-    // Use the centralized saved message delivery which handles bracketed paste,
-    // recent input tracking, and correct confirmation Enter scheduling.
     sendSavedMessageToTerminal?.(target.id, message, kind === TerminalKindEnum.Background);
-    // Foreground saved messages are send-and-remove
     if (kind === TerminalKindEnum.Foreground) {
       onRemoveForegroundMessage?.(projectId, message);
     }
@@ -112,130 +150,204 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
     }
   }
 
+  const hideInactive = config.ui.terminalManagerHideInactiveProjects;
+
+  // Close history popup when clicking outside
+  useEffect(() => {
+    if (historyPopupTerminalId === null) return;
+    const handleClick = (e: MouseEvent) => {
+      if (historyPopupJustOpened) {
+        setHistoryPopupJustOpened(false);
+        return;
+      }
+      const popup = document.querySelector('[data-history-popup]');
+      if (popup && !popup.contains(e.target as Node)) {
+        setHistoryPopupTerminalId(null);
+      }
+    };
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, [historyPopupTerminalId, historyPopupJustOpened]);
+
+  // Close saved messages / fg tasks popups when clicking outside
+  useEffect(() => {
+    if (showSavedMessages === null && showFgMessages === null) return;
+    const handleClick = (e: MouseEvent) => {
+      const savedPopup = document.querySelector('[data-saved-popup]');
+      const fgPopup = document.querySelector('[data-fg-popup]');
+      if (savedPopup && !savedPopup.contains(e.target as Node)) {
+        setShowSavedMessages(null);
+      }
+      if (fgPopup && !fgPopup.contains(e.target as Node)) {
+        setShowFgMessages(null);
+      }
+    };
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, [showSavedMessages, showFgMessages]);
+
   return (
-    <div className="terminal-manager" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <div style={{ display: 'flex', gap: 2, padding: '6px 8px', borderBottom: '1px solid #222' }}>
-        {([TerminalManagerFilterEnum.Foreground, TerminalManagerFilterEnum.Background] as TerminalManagerFilter[]).map((f) => (
-          <button
-            key={f}
-            onClick={() => setFilter(f)}
-            style={{
-              flex: 1,
-              padding: '4px 8px',
-              fontSize: 11,
-              background: filter === f ? '#1f3a4c' : 'transparent',
-              color: filter === f ? '#7ec0ee' : '#888',
-              border: '1px solid ' + (filter === f ? '#1f3a4c' : '#333'),
-              borderRadius: 4,
-              cursor: 'pointer',
-            }}
-          >
-            {f === TerminalManagerFilterEnum.Foreground ? 'FG' : 'BG'}
-          </button>
-        ))}
-        <button
-          onClick={() => setFilter(TerminalManagerFilterEnum.Foreground)}
-          style={{
-            flex: 1,
-            padding: '4px 8px',
-            fontSize: 11,
-            background: filter !== TerminalManagerFilterEnum.Foreground && filter !== TerminalManagerFilterEnum.Background ? '#1f3a4c' : 'transparent',
-            color: filter !== TerminalManagerFilterEnum.Foreground && filter !== TerminalManagerFilterEnum.Background ? '#7ec0ee' : '#888',
-            border: '1px solid ' + (filter !== TerminalManagerFilterEnum.Foreground && filter !== TerminalManagerFilterEnum.Background ? '#1f3a4c' : '#333'),
-            borderRadius: 4,
-            cursor: 'pointer',
-          }}
-        >
-          All
-        </button>
+    <div ref={panelRef} className="terminal-manager" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: SURFACE_BG }}>
+      {/* Filter tabs */}
+      <div style={{ display: 'flex', padding: `${TERMINAL_MANAGER_FILTER_TOP_PADDING}px ${TERMINAL_MANAGER_FILTER_SIDE_PADDING}px`, borderBottom: `1px solid ${BORDER_COLOR}`, height: CONTROL_ROW_HEIGHT + TERMINAL_MANAGER_FILTER_ROW_HEIGHT_EXTRA }}>
+        {([TerminalManagerFilterEnum.Foreground, TerminalManagerFilterEnum.Background] as TerminalManagerFilter[]).map((f) => {
+          const isSelected = filter === f;
+          const label = f === TerminalManagerFilterEnum.Foreground ? 'Foreground' : 'Background';
+          const color = f === TerminalManagerFilterEnum.Foreground ? ACCENT : TEXT_MUTED;
+          return (
+            <div
+              key={f}
+              onClick={() => setFilter(f)}
+              style={{
+                flex: 1,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                position: 'relative',
+                gap: TERMINAL_MANAGER_FILTER_CENTER_GAP,
+              }}
+            >
+              <span style={{
+                fontSize: 13,
+                fontWeight: 600,
+                color: isSelected ? color : withAlpha(TEXT_MUTED, 180),
+                userSelect: 'none',
+              }}>
+                {label}
+              </span>
+              {isSelected && (
+                <div style={{
+                  position: 'absolute',
+                  bottom: TERMINAL_MANAGER_FILTER_UNDERLINE_GAP,
+                  left: '20%',
+                  right: '20%',
+                  height: TERMINAL_MANAGER_FILTER_UNDERLINE_HEIGHT,
+                  background: color,
+                  borderRadius: 1,
+                }} />
+              )}
+            </div>
+          );
+        })}
       </div>
+
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 0' }}>
-        {rootProjects.map((project) => (
-          <div key={project.id}>
-            <ProjectGroup
-              project={project}
-              terminals={getProjectTerminals(project.id)}
-              filter={filter}
-              expanded={expandedProjects.has(project.id)}
-              onToggle={() => toggleProject(project.id)}
-              activeTerminalId={activeTerminalId}
-              onActivate={onActivateTerminal}
-              onSpawn={onSpawnTerminal}
-              onKill={onKillTerminal}
-              showSavedMessages={showSavedMessages}
-              setShowSavedMessages={setShowSavedMessages}
-              showFgMessages={showFgMessages}
-              setShowFgMessages={setShowFgMessages}
-              showLauncherMenu={showLauncherMenu}
-              setShowLauncherMenu={setShowLauncherMenu}
-              sendSavedMessage={sendSavedMessage}
-              rerunBackground={rerunBackground}
-              config={config}
-              allTerminals={terminals}
-              rootProject={project}
-              activeAcpChatByProject={activeAcpChatByProject}
-              onActivateAcpChat={onActivateAcpChat}
-              onRemoveAcpChat={onRemoveAcpChat}
-              onOpenAcpChat={onOpenAcpChat}
-              onRemoveForegroundMessage={onRemoveForegroundMessage}
-              onOpenFgMessagePopup={(projectId, message, index) => {
-                setFgMessagePopupProject(projectId);
-                setFgMessagePopupText(message);
-                setFgMessageEditIndex(index);
-              }}
-              onOpenAddFgMessagePopup={(projectId) => {
-                setFgMessagePopupProject(projectId);
-                setFgMessagePopupText('');
-                setFgMessageEditIndex(null);
-              }}
-            />
-            {/* Worktrees under this root */}
-            {(worktreesByRoot.get(project.id) || []).map((worktree) => (
-              <div key={worktree.id} style={{ paddingLeft: 12 }}>
-                <ProjectGroup
-                  project={worktree}
-                  terminals={getProjectTerminals(worktree.id)}
-                  filter={filter}
-                  expanded={expandedProjects.has(worktree.id)}
-                  onToggle={() => toggleProject(worktree.id)}
-                  activeTerminalId={activeTerminalId}
-                  onActivate={onActivateTerminal}
-                  onSpawn={onSpawnTerminal}
-                  onKill={onKillTerminal}
-                  showSavedMessages={showSavedMessages}
-                  setShowSavedMessages={setShowSavedMessages}
-                  showFgMessages={showFgMessages}
-                  setShowFgMessages={setShowFgMessages}
-                  showLauncherMenu={showLauncherMenu}
-                  setShowLauncherMenu={setShowLauncherMenu}
-                  sendSavedMessage={sendSavedMessage}
-                  rerunBackground={rerunBackground}
-                  config={config}
-                  allTerminals={terminals}
-                  rootProject={project}
-                  isWorktree
-                  activeAcpChatByProject={activeAcpChatByProject}
-                  onActivateAcpChat={onActivateAcpChat}
-                  onRemoveAcpChat={onRemoveAcpChat}
-                  onOpenAcpChat={onOpenAcpChat}
-                  onRemoveForegroundMessage={onRemoveForegroundMessage}
-                  onOpenFgMessagePopup={(projectId, message, index) => {
-                    setFgMessagePopupProject(projectId);
-                    setFgMessagePopupText(message);
-                    setFgMessageEditIndex(index);
-                  }}
-                  onOpenAddFgMessagePopup={(projectId) => {
-                    setFgMessagePopupProject(projectId);
-                    setFgMessagePopupText('');
-                    setFgMessageEditIndex(null);
-                  }}
-                />
-              </div>
-            ))}
-          </div>
-        ))}
+        {rootProjects.map((project) => {
+          const childWorktrees = worktreesByRoot.get(project.id) || [];
+          const visibleCount = getProjectTerminals(project.id).length;
+          const hasLiveTerminal = getProjectTerminals(project.id).some((t) => !t.exited);
+          const worktreeVisibleCount = childWorktrees.reduce((sum, wt) => sum + getProjectTerminals(wt.id).length, 0);
+          const worktreeHasLive = childWorktrees.some((wt) => getProjectTerminals(wt.id).some((t) => !t.exited));
+
+          if (hideInactive && !hasLiveTerminal && !worktreeHasLive && childWorktrees.length === 0) {
+            return null;
+          }
+
+          const hasChildren = visibleCount > 0 || childWorktrees.length > 0 || worktreeVisibleCount > 0;
+          const expanded = expandedProjects.has(project.id);
+
+          return (
+            <div key={project.id}>
+              <ProjectGroup
+                project={project}
+                terminals={getProjectTerminals(project.id)}
+                filter={filter}
+                expanded={expanded}
+                onToggle={() => toggleProject(project.id)}
+                activeTerminalId={activeTerminalId}
+                onActivate={onActivateTerminal}
+                onSpawn={onSpawnTerminal}
+                onKill={onKillTerminal}
+                showSavedMessages={showSavedMessages}
+                setShowSavedMessages={setShowSavedMessages}
+                showFgMessages={showFgMessages}
+                setShowFgMessages={setShowFgMessages}
+                showLauncherMenu={showLauncherMenu}
+                setShowLauncherMenu={setShowLauncherMenu}
+                sendSavedMessage={sendSavedMessage}
+                rerunBackground={rerunBackground}
+                config={config}
+                allTerminals={terminals}
+                rootProject={project}
+                activeAcpChatByProject={activeAcpChatByProject}
+                onActivateAcpChat={onActivateAcpChat}
+                onRemoveAcpChat={onRemoveAcpChat}
+                onOpenAcpChat={onOpenAcpChat}
+                onRemoveForegroundMessage={onRemoveForegroundMessage}
+                onOpenFgMessagePopup={(projectId, message, index) => {
+                  setFgMessagePopupProject(projectId);
+                  setFgMessagePopupText(message);
+                  setFgMessageEditIndex(index);
+                }}
+                onOpenAddFgMessagePopup={(projectId) => {
+                  setFgMessagePopupProject(projectId);
+                  setFgMessagePopupText('');
+                  setFgMessageEditIndex(null);
+                }}
+                historyPopupTerminalId={historyPopupTerminalId}
+                setHistoryPopupTerminalId={(id) => {
+                  setHistoryPopupTerminalId(id);
+                  if (id !== null) setHistoryPopupJustOpened(true);
+                }}
+                setHistoryPopupJustOpened={setHistoryPopupJustOpened}
+                panelRight={panelRef.current?.getBoundingClientRect().right ?? 0}
+              />
+              {/* Worktrees under this root */}
+              {expanded && childWorktrees.map((worktree) => (
+                <div key={worktree.id} style={{ paddingLeft: 12 }}>
+                  <ProjectGroup
+                    project={worktree}
+                    terminals={getProjectTerminals(worktree.id)}
+                    filter={filter}
+                    expanded={expandedProjects.has(worktree.id)}
+                    onToggle={() => toggleProject(worktree.id)}
+                    activeTerminalId={activeTerminalId}
+                    onActivate={onActivateTerminal}
+                    onSpawn={onSpawnTerminal}
+                    onKill={onKillTerminal}
+                    showSavedMessages={showSavedMessages}
+                    setShowSavedMessages={setShowSavedMessages}
+                    showFgMessages={showFgMessages}
+                    setShowFgMessages={setShowFgMessages}
+                    showLauncherMenu={showLauncherMenu}
+                    setShowLauncherMenu={setShowLauncherMenu}
+                    sendSavedMessage={sendSavedMessage}
+                    rerunBackground={rerunBackground}
+                    config={config}
+                    allTerminals={terminals}
+                    rootProject={project}
+                    isWorktree
+                    activeAcpChatByProject={activeAcpChatByProject}
+                    onActivateAcpChat={onActivateAcpChat}
+                    onRemoveAcpChat={onRemoveAcpChat}
+                    onOpenAcpChat={onOpenAcpChat}
+                    onRemoveForegroundMessage={onRemoveForegroundMessage}
+                    onOpenFgMessagePopup={(projectId, message, index) => {
+                      setFgMessagePopupProject(projectId);
+                      setFgMessagePopupText(message);
+                      setFgMessageEditIndex(index);
+                    }}
+                    onOpenAddFgMessagePopup={(projectId) => {
+                      setFgMessagePopupProject(projectId);
+                      setFgMessagePopupText('');
+                      setFgMessageEditIndex(null);
+                    }}
+                    historyPopupTerminalId={historyPopupTerminalId}
+                    setHistoryPopupTerminalId={(id) => {
+                      setHistoryPopupTerminalId(id);
+                      if (id !== null) setHistoryPopupJustOpened(true);
+                    }}
+                    setHistoryPopupJustOpened={setHistoryPopupJustOpened}
+                    panelRight={panelRef.current?.getBoundingClientRect().right ?? 0}
+                  />
+                </div>
+              ))}
+            </div>
+          );
+        })}
         {config.projects.length === 0 && (
-          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>No projects. Add a project in Settings.</div>
+          <div style={{ padding: 12, color: TEXT_MUTED, fontSize: 12 }}>No projects. Add a project in Settings.</div>
         )}
       </div>
 
@@ -261,8 +373,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
         >
           <div
             style={{
-              background: '#141414',
-              border: '1px solid #333',
+              background: SURFACE_BG,
+              border: `1px solid ${BORDER_COLOR}`,
               borderRadius: 8,
               width: 480,
               maxWidth: '90vw',
@@ -273,7 +385,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <span style={{ fontSize: 14, fontWeight: 600, color: '#eee' }}>
+              <span style={{ fontSize: 14, fontWeight: 600, color: TEXT_PRIMARY }}>
                 {fgMessageEditIndex !== null ? 'Edit Task' : 'Add Task'}
               </span>
               <button
@@ -282,7 +394,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                   setFgMessagePopupText('');
                   setFgMessageEditIndex(null);
                 }}
-                style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 14 }}
+                style={{ background: 'transparent', border: 'none', color: TEXT_MUTED, cursor: 'pointer', fontSize: 14 }}
               >
                 ✕
               </button>
@@ -318,8 +430,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
               }}
               style={{
                 width: '100%',
-                background: '#1a1a1a',
-                border: '1px solid #333',
+                background: withAlpha(SURFACE_BG, 236),
+                border: `1px solid ${withAlpha('#5c5c5c', 230)}`,
                 color: '#ccc',
                 padding: '8px',
                 fontSize: 12,
@@ -328,6 +440,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 resize: 'none',
                 minHeight: 80,
                 maxHeight: 160,
+                fontFamily: 'inherit',
               }}
               rows={3}
             />
@@ -338,7 +451,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                   setFgMessagePopupText('');
                   setFgMessageEditIndex(null);
                 }}
-                style={{ padding: '6px 16px', fontSize: 12, background: 'transparent', border: '1px solid #333', color: '#ccc', borderRadius: 4, cursor: 'pointer' }}
+                style={{ padding: '6px 16px', fontSize: 12, background: 'transparent', border: `1px solid ${BORDER_COLOR}`, color: '#ccc', borderRadius: 4, cursor: 'pointer' }}
               >
                 Cancel
               </button>
@@ -359,8 +472,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 style={{
                   padding: '6px 16px',
                   fontSize: 12,
-                  background: '#1f3a4c',
-                  border: '1px solid #1f3a4c',
+                  background: BTN_BLUE,
+                  border: `1px solid ${BTN_BLUE}`,
                   color: '#ccc',
                   borderRadius: 4,
                   cursor: fgMessagePopupText.trim() ? 'pointer' : 'not-allowed',
@@ -406,6 +519,10 @@ interface ProjectGroupProps {
   onRemoveForegroundMessage?: (projectId: number, message: string) => void;
   onOpenFgMessagePopup?: (projectId: number, message: string, index: number) => void;
   onOpenAddFgMessagePopup?: (projectId: number) => void;
+  historyPopupTerminalId: number | null;
+  setHistoryPopupTerminalId: (id: number | null) => void;
+  setHistoryPopupJustOpened: (v: boolean) => void;
+  panelRight: number;
 }
 
 const ProjectGroup: React.FC<ProjectGroupProps> = ({
@@ -437,267 +554,314 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   onRemoveForegroundMessage,
   onOpenFgMessagePopup,
   onOpenAddFgMessagePopup,
+  historyPopupTerminalId,
+  setHistoryPopupTerminalId,
+  setHistoryPopupJustOpened,
+  panelRight,
 }) => {
-  const [historyPopupTerminalId, setHistoryPopupTerminalId] = useState<number | null>(null);
-  // Worktrees inherit saved messages from root project
+  const [hoveredRow, setHoveredRow] = useState<number | null>(null);
+  const [hoveredProject, setHoveredProject] = useState(false);
   const effectiveSavedMessages = isWorktree && rootProject ? rootProject.savedMessages : project.savedMessages;
   const hasSavedMessages = effectiveSavedMessages.length > 0;
   const hasFgMessages = project.foregroundSavedMessages.length > 0;
   const hasLiveTerminals = terminals.length > 0;
   const isSelected = activeTerminalId !== null && terminals.some((t) => t.id === activeTerminalId);
+  const hasLiveTerminal = terminals.some((t) => !t.exited);
+
+  // Project header text color: bright only when has live terminal
+  const headerTextColor = hasLiveTerminal ? TEXT_PRIMARY : withAlpha(TEXT_MUTED, 180);
 
   return (
     <div style={{ marginBottom: 2 }}>
+      {/* Project / Worktree Header */}
       <div
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 4,
-          padding: '4px 8px',
+          height: CONTROL_ROW_HEIGHT,
+          padding: '0 8px',
           cursor: 'pointer',
-          borderRadius: 3,
+          borderRadius: 8,
+          position: 'relative',
         }}
         onClick={onToggle}
+        onMouseEnter={() => setHoveredProject(true)}
+        onMouseLeave={() => setHoveredProject(false)}
       >
-        <span style={{ fontSize: 10, color: '#888', width: 12 }}>{expanded ? '▼' : '▶'}</span>
+        {/* Hover background */}
+        {(hoveredProject || isSelected) && (
+          <div style={{
+            position: 'absolute',
+            inset: 1,
+            borderRadius: 8,
+            background: isSelected ? withAlpha('#262626', 220) : withAlpha(BTN_ICON_HOVER, 110),
+            border: isSelected ? `1px solid ${withAlpha('#646464', 220)}` : 'none',
+            pointerEvents: 'none',
+          }} />
+        )}
+        <span style={{ fontSize: 10, color: TEXT_MUTED, width: 12, zIndex: 1 }}>{expanded ? '▼' : '▶'}</span>
         <span style={{
           fontSize: 12,
           fontWeight: 600,
-          color: isSelected && hasLiveTerminals ? '#eee' : '#ccc',
+          color: headerTextColor,
           flex: 1,
           overflow: 'hidden',
           textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          zIndex: 1,
+          marginLeft: 4,
         }}>
           {project.name}
         </span>
         {isWorktree && (
-          <span style={{ fontSize: 10, color: '#888' }}>🌿</span>
+          <span style={{ fontSize: 10, color: withAlpha(ACCENT, 200), zIndex: 1, marginLeft: 4 }}>🌿</span>
         )}
-        <span style={{ fontSize: 10, color: '#666' }}>{terminals.length}</span>
-      </div>
-      {expanded && (
-        <div>
-          <div style={{ display: 'flex', gap: 4, padding: '2px 8px 6px', position: 'relative' }}>
-            <button
-              onClick={() => onSpawn(project.id, TerminalKindEnum.Foreground)}
-              style={{
-                padding: '2px 8px',
-                fontSize: 11,
-                background: '#1a1a1a',
-                border: '1px solid #333',
-                color: '#ccc',
-                borderRadius: 3,
-                cursor: 'pointer',
-              }}
-            >
-              + FG
-            </button>
-            <button
-              onClick={() => onSpawn(project.id, TerminalKindEnum.Background)}
-              style={{
-                padding: '2px 8px',
-                fontSize: 11,
-                background: '#1a1a1a',
-                border: '1px solid #333',
-                color: '#ccc',
-                borderRadius: 3,
-                cursor: 'pointer',
-              }}
-            >
-              + BG
-            </button>
-            {filter === TerminalManagerFilterEnum.Foreground && (
-              <div style={{ position: 'relative' }}>
-                <button
-                  onClick={() => setShowLauncherMenu(showLauncherMenu === project.id ? null : project.id)}
-                  style={{
-                    padding: '2px 8px',
-                    fontSize: 11,
-                    background: showLauncherMenu === project.id ? '#1f3a4c' : '#1a1a1a',
-                    border: '1px solid #333',
-                    color: '#ccc',
-                    borderRadius: 3,
-                    cursor: 'pointer',
+        <span style={{ fontSize: 10, color: withAlpha(TEXT_MUTED, 120), zIndex: 1, marginLeft: 4 }}>{terminals.length}</span>
+
+        {/* Action buttons on hover for project header */}
+        {hoveredProject && (
+          <div style={{ display: 'flex', gap: 2, zIndex: 1, marginLeft: 4 }}>
+            {filter === TerminalManagerFilterEnum.Foreground && !isWorktree && (
+              <>
+                <IconButton
+                  icon="▶"
+                  tooltip="Open Foreground Launcher"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (!expanded) {
+                      onToggle();
+                    }
+                    setShowLauncherMenu(showLauncherMenu === project.id ? null : project.id);
                   }}
-                >
-                  Launch
-                </button>
-                {showLauncherMenu === project.id && (
-                  <div style={{ position: 'absolute', top: '100%', left: 0, zIndex: 10, background: '#1a1a1a', border: '1px solid #333', borderRadius: 4, padding: '4px 0', width: 168, marginTop: 2 }}>
-                    {config.launchers.filter((l) => l.enabled).map((l) => (
-                      <button
-                        key={l.id}
-                        onClick={async () => {
-                          setShowLauncherMenu(null);
-                          const cmd = l.launchCommand;
-                          // For OpenCode, generate terminal runtime config before launching
-                          if (l.builtin === BuiltinLauncherKind.OpenCode) {
-                            const model = activeBuildModel(config.opencode);
-                            await api.invoke('opencode:generateTerminalConfig', {
-                              cwd: project.path,
-                              model,
-                              effort: config.opencode.planEffort,
-                              kimiStrictPermissions: config.opencode.kimiStrictPermissions,
-                            });
-                          }
-                          const targetId = await onSpawn(project.id, TerminalKindEnum.Foreground);
-                          if (targetId) {
-                            const isSlash = cmd.startsWith('/');
-                            await api.invoke('pty:write', targetId, '\x1b[200~' + cmd + '\x1b[201~');
-                            await api.invoke('pty:write', targetId, '\r');
-                            if (isSlash) {
-                              setTimeout(() => api.invoke('pty:write', targetId, '\r'), 600);
-                              setTimeout(() => api.invoke('pty:write', targetId, '\r'), 1200);
-                            } else {
-                              setTimeout(() => api.invoke('pty:write', targetId, '\r'), 1200);
-                            }
-                          }
-                        }}
-                        style={{ display: 'block', width: '100%', textAlign: 'left', padding: '4px 8px', fontSize: 11, background: 'transparent', border: 'none', color: '#ccc', cursor: 'pointer' }}
-                        title={l.displayName + (l.launchCommand ? ' — ' + l.launchCommand : '')}
-                      >
-                        {l.displayName}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
+                />
+                <IconButton
+                  icon="📁+"
+                  tooltip="Create Worktree"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    // TODO: create worktree popup
+                  }}
+                />
+              </>
             )}
-            {hasSavedMessages && filter !== TerminalManagerFilterEnum.Foreground && (
-              <button
-                onClick={() => setShowSavedMessages(showSavedMessages === project.id ? null : project.id)}
-                style={{
-                  padding: '2px 8px',
-                  fontSize: 11,
-                  background: showSavedMessages === project.id ? '#1f3a4c' : '#1a1a1a',
-                  border: '1px solid #333',
-                  color: '#ccc',
-                  borderRadius: 3,
-                  cursor: 'pointer',
+            {filter === TerminalManagerFilterEnum.Background && (
+              <IconButton
+                icon="+"
+                tooltip="New Background Terminal"
+                onClick={async (e) => {
+                  e.stopPropagation();
+                  if (!expanded) {
+                    onToggle();
+                  }
+                  await onSpawn(project.id, TerminalKindEnum.Background);
                 }}
-              >
-                Msg
-              </button>
-            )}
-            {hasFgMessages && filter === TerminalManagerFilterEnum.Foreground && (
-              <button
-                onClick={() => setShowFgMessages(showFgMessages === project.id ? null : project.id)}
-                style={{
-                  padding: '2px 8px',
-                  fontSize: 11,
-                  background: showFgMessages === project.id ? '#1f3a4c' : '#1a1a1a',
-                  border: '1px solid #333',
-                  color: hasFgMessages ? '#64c864' : '#ccc',
-                  borderRadius: 3,
-                  cursor: 'pointer',
-                }}
-              >
-                Tasks
-              </button>
+              />
             )}
           </div>
+        )}
+      </div>
 
-          {showSavedMessages === project.id && (
-            <div style={{ padding: '0 8px 4px' }}>
-              {effectiveSavedMessages.map((msg, i) => (
-                <div key={i} style={{ display: 'flex', gap: 4, marginBottom: 2 }}>
+      {expanded && (
+        <div>
+          {/* Launcher popup - positioned near header */}
+          {showLauncherMenu === project.id && (
+            <div style={{
+              position: 'fixed',
+              zIndex: 20,
+              background: SURFACE_BG,
+              border: `1px solid ${BORDER_COLOR}`,
+              borderRadius: 4,
+              padding: '4px 0',
+              width: 168,
+              boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+            }}>
+              <div style={{ background: SURFACE_BG, borderRadius: 4 }}>
+                {config.launchers.filter((l) => l.enabled).map((l) => (
                   <button
-                    onClick={() => sendSavedMessage(project.id, msg, TerminalKindEnum.Background)}
+                    key={l.id}
+                    onClick={async () => {
+                      setShowLauncherMenu(null);
+                      const cmd = l.launchCommand;
+                      if (l.builtin === BuiltinLauncherKind.OpenCode) {
+                        const model = activeBuildModel(config.opencode);
+                        await api.invoke('opencode:generateTerminalConfig', {
+                          cwd: project.path,
+                          model,
+                          effort: config.opencode.planEffort,
+                          kimiStrictPermissions: config.opencode.kimiStrictPermissions,
+                        });
+                      }
+                      const targetId = await onSpawn(project.id, TerminalKindEnum.Foreground);
+                      if (targetId) {
+                        const isSlash = cmd.startsWith('/');
+                        await api.invoke('pty:write', targetId, '\x1b[200~' + cmd + '\x1b[201~');
+                        await api.invoke('pty:write', targetId, '\r');
+                        if (isSlash) {
+                          setTimeout(() => api.invoke('pty:write', targetId, '\r'), 600);
+                          setTimeout(() => api.invoke('pty:write', targetId, '\r'), 1200);
+                        } else {
+                          setTimeout(() => api.invoke('pty:write', targetId, '\r'), 1200);
+                        }
+                      }
+                    }}
                     style={{
-                      flex: 1,
+                      display: 'block',
+                      width: '100%',
                       textAlign: 'left',
-                      padding: '3px 6px',
+                      padding: '4px 8px',
                       fontSize: 11,
                       background: 'transparent',
-                      border: '1px solid #333',
-                      color: '#aaa',
-                      borderRadius: 3,
+                      border: 'none',
+                      color: '#ccc',
+                      cursor: 'pointer',
+                    }}
+                    title={l.displayName + (l.launchCommand ? ' — ' + l.launchCommand : '')}
+                  >
+                    {l.displayName}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Saved messages popup - per terminal */}
+          {showSavedMessages !== null && (() => {
+            const t = terminals.find((x) => x.id === showSavedMessages);
+            if (!t) return null;
+            const msgs = isWorktree && rootProject ? rootProject.savedMessages : project.savedMessages;
+            return (
+              <div data-saved-popup style={{
+                position: 'fixed',
+                zIndex: 20,
+                background: SURFACE_BG,
+                border: `1px solid ${BORDER_COLOR}`,
+                borderRadius: 4,
+                padding: '4px 0',
+                width: 200,
+                boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+              }}>
+                {msgs.length === 0 && (
+                  <div style={{ padding: '4px 8px', fontSize: 11, color: TEXT_MUTED }}>No saved messages</div>
+                )}
+                {msgs.map((msg, i) => (
+                  <button
+                    key={i}
+                    onClick={() => {
+                      sendSavedMessage(t.projectId, msg, TerminalKindEnum.Background);
+                      setShowSavedMessages(null);
+                    }}
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      textAlign: 'left',
+                      padding: '4px 8px',
+                      fontSize: 11,
+                      background: 'transparent',
+                      border: 'none',
+                      color: '#ccc',
                       cursor: 'pointer',
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
                     }}
-                    title={cappedTooltip(msg)}
+                    title={cappedHoverText(msg)}
                   >
                     {msg}
                   </button>
-                </div>
-              ))}
-            </div>
-          )}
+                ))}
+              </div>
+            );
+          })()}
 
-          {showFgMessages === project.id && (
-            <div style={{ padding: '0 8px 4px', maxHeight: 300, overflow: 'auto' }}>
-              {project.foregroundSavedMessages.length === 0 && (
-                <div style={{ fontSize: 11, color: '#888', padding: '2px 0' }}>No tasks in queue</div>
-              )}
-              {project.foregroundSavedMessages.map((msg, i) => (
-                <div key={i} style={{ display: 'flex', gap: 4, marginBottom: 2, alignItems: 'center' }}>
-                  <button
-                    onClick={() => {
-                      sendSavedMessage(project.id, msg, TerminalKindEnum.Foreground);
-                    }}
-                    style={{
-                      flex: 1,
-                      textAlign: 'left',
-                      padding: '3px 6px',
-                      fontSize: 11,
-                      background: 'transparent',
-                      border: '1px solid #333',
-                      color: '#aaa',
-                      borderRadius: 3,
-                      cursor: 'pointer',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}
-                    title={cappedTooltip(msg)}
-                  >
-                    {msg}
-                  </button>
-                  <button
-                    onClick={() => {
-                      onOpenFgMessagePopup?.(project.id, msg, i);
-                    }}
-                    style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}
-                    title="Edit"
-                  >
-                    ✎
-                  </button>
-                  <button
-                    onClick={() => {
-                      onRemoveForegroundMessage?.(project.id, msg);
-                    }}
-                    style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}
-                    title="Delete"
-                  >
-                    🗑
-                  </button>
-                </div>
-              ))}
-              <button
-                onClick={() => {
-                  onOpenAddFgMessagePopup?.(project.id);
-                }}
-                style={{
-                  marginTop: 4,
-                  padding: '3px 6px',
-                  fontSize: 11,
-                  background: 'transparent',
-                  border: '1px solid #333',
-                  color: '#888',
-                  borderRadius: 3,
-                  cursor: 'pointer',
-                  width: '100%',
-                  textAlign: 'left',
-                }}
-              >
-                + Add New
-              </button>
-            </div>
-          )}
+          {/* Foreground tasks popup - per terminal */}
+          {showFgMessages !== null && (() => {
+            const t = terminals.find((x) => x.id === showFgMessages);
+            if (!t) return null;
+            return (
+              <div data-fg-popup style={{
+                position: 'fixed',
+                zIndex: 20,
+                background: SURFACE_BG,
+                border: `1px solid ${BORDER_COLOR}`,
+                borderRadius: 4,
+                padding: '4px 8px',
+                width: 200,
+                maxHeight: 300,
+                overflow: 'auto',
+                boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+              }}>
+                {project.foregroundSavedMessages.length === 0 && (
+                  <div style={{ fontSize: 11, color: TEXT_MUTED, padding: '2px 0' }}>No tasks in queue</div>
+                )}
+                {project.foregroundSavedMessages.map((msg, i) => (
+                  <div key={i} style={{ display: 'flex', gap: 4, marginBottom: 2, alignItems: 'center' }}>
+                    <button
+                      onClick={() => {
+                        sendSavedMessage(t.projectId, msg, TerminalKindEnum.Foreground);
+                        setShowFgMessages(null);
+                      }}
+                      style={{
+                        flex: 1,
+                        textAlign: 'left',
+                        padding: '3px 6px',
+                        fontSize: 11,
+                        background: 'transparent',
+                        border: `1px solid ${BORDER_COLOR}`,
+                        color: '#aaa',
+                        borderRadius: 3,
+                        cursor: 'pointer',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                      title={cappedHoverText(msg)}
+                    >
+                      {msg}
+                    </button>
+                    <button
+                      onClick={() => {
+                        onOpenFgMessagePopup?.(t.projectId, msg, i);
+                      }}
+                      style={{ background: 'transparent', border: 'none', color: TEXT_MUTED, cursor: 'pointer', fontSize: 10, padding: '2px 4px' }}
+                      title="Edit"
+                    >
+                      ✎
+                    </button>
+                    <button
+                      onClick={() => {
+                        onRemoveForegroundMessage?.(t.projectId, msg);
+                      }}
+                      style={{ background: 'transparent', border: 'none', color: TEXT_MUTED, cursor: 'pointer', fontSize: 10, padding: '2px 4px' }}
+                      title="Delete"
+                    >
+                      🗑
+                    </button>
+                  </div>
+                ))}
+                <button
+                  onClick={() => {
+                    onOpenAddFgMessagePopup?.(t.projectId);
+                  }}
+                  style={{
+                    marginTop: 4,
+                    padding: '3px 6px',
+                    fontSize: 11,
+                    background: 'transparent',
+                    border: `1px solid ${BORDER_COLOR}`,
+                    color: TEXT_MUTED,
+                    borderRadius: 3,
+                    cursor: 'pointer',
+                    width: '100%',
+                    textAlign: 'left',
+                  }}
+                >
+                  + Add New
+                </button>
+              </div>
+            );
+          })()}
 
-          {/* ACP Chat row for this project */}
+          {/* ACP Chat row */}
           {activeAcpChatByProject && activeAcpChatByProject.has(project.id) && (
             <div
               style={{
@@ -706,8 +870,9 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                 gap: 4,
                 padding: isWorktree ? '3px 8px 3px 36px' : '3px 8px 3px 24px',
                 cursor: 'pointer',
-                borderRadius: 3,
+                borderRadius: 8,
                 background: 'rgba(0,120,212,0.15)',
+                margin: '1px 4px',
               }}
               onClick={() => onActivateAcpChat?.(project.id)}
             >
@@ -731,7 +896,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   fontSize: 10,
                   background: 'transparent',
                   border: '1px solid #444',
-                  color: '#888',
+                  color: TEXT_MUTED,
                   borderRadius: 3,
                   cursor: 'pointer',
                   flexShrink: 0,
@@ -742,7 +907,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
               </button>
             </div>
           )}
-          {/* OpenCode Chat button when no active chat but project has foreground terminals */}
+          {/* OpenCode Chat button */}
           {activeAcpChatByProject && !activeAcpChatByProject.has(project.id) && filter === TerminalManagerFilterEnum.Foreground && terminals.some((t) => t.kind === 'foreground' && t.aiTool === 'opencode') && (
             <div style={{ padding: isWorktree ? '2px 8px 2px 36px' : '2px 8px 2px 24px' }}>
               <button
@@ -750,8 +915,8 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                 style={{
                   padding: '2px 8px',
                   fontSize: 11,
-                  background: '#1a1a1a',
-                  border: '1px solid #333',
+                  background: SURFACE_BG_SOFT,
+                  border: `1px solid ${BORDER_COLOR}`,
                   color: '#7ec0ee',
                   borderRadius: 3,
                   cursor: 'pointer',
@@ -762,168 +927,328 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             </div>
           )}
 
-          {terminals.map((t) => (
-            <div
-              key={t.id}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 4,
-                padding: isWorktree ? '3px 8px 3px 36px' : '3px 8px 3px 24px',
-                cursor: 'pointer',
-                borderRadius: 3,
-                background: t.id === activeTerminalId ? 'rgba(0,120,212,0.2)' : 'transparent',
-              }}
-              onClick={() => onActivate(t.id)}
-            >
-              <span style={{
-                width: 6,
-                height: 6,
-                borderRadius: '50%',
-                background: t.aiStatus === 'running' ? '#64c864' : t.aiStatus === 'attention' ? '#e8a838' : '#666',
-                flexShrink: 0,
-              }} />
-              <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {t.title || `${t.shell} #${t.id}`}
-              </span>
-              {t.recentInputs.length > 0 && (
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setHistoryPopupTerminalId(t.id);
-                  }}
-                  style={{
-                    padding: '1px 4px',
-                    fontSize: 10,
-                    background: 'transparent',
-                    border: '1px solid #444',
-                    color: '#888',
-                    borderRadius: 3,
-                    cursor: 'pointer',
-                    flexShrink: 0,
-                  }}
-                  title="Show input history"
-                >
-                  🕒
-                </button>
-              )}
-              {t.kind === 'background' && (
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    rerunBackground(t.id);
-                  }}
-                  style={{
-                    padding: '1px 4px',
-                    fontSize: 10,
-                    background: 'transparent',
-                    border: '1px solid #444',
-                    color: '#888',
-                    borderRadius: 3,
-                    cursor: 'pointer',
-                    flexShrink: 0,
-                  }}
-                  title={t.aiStatus === 'running' ? 'Interrupt' : 'Rerun'}
-                >
-                  {t.aiStatus === 'running' ? '✕' : '↻'}
-                </button>
-              )}
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onKill(t.id);
-                }}
-                style={{
-                  padding: '1px 4px',
-                  fontSize: 10,
-                  background: 'transparent',
-                  border: '1px solid #444',
-                  color: '#888',
-                  borderRadius: 3,
-                  cursor: 'pointer',
-                  flexShrink: 0,
-                }}
-                title="Kill"
-              >
-                ✕
-              </button>
-            </div>
-          ))}
-          {terminals.length === 0 && (
-            <div style={{ padding: '2px 8px 2px 24px', fontSize: 11, color: '#666' }}>No terminals</div>
-          )}
-
-          {/* Input History Popup */}
-          {historyPopupTerminalId !== null && (() => {
-            const t = allTerminals.find((x) => x.id === historyPopupTerminalId);
-            if (!t) return null;
+          {/* Terminal rows */}
+          {terminals.map((t) => {
+            const active = t.id === activeTerminalId;
+            const hovered = hoveredRow === t.id;
+            const rowChrome = terminalManagerRowChrome(active, hovered);
             return (
               <div
+                key={t.id}
                 style={{
-                  position: 'fixed',
-                  inset: 0,
-                  background: 'rgba(0,0,0,0.6)',
                   display: 'flex',
                   alignItems: 'center',
-                  justifyContent: 'center',
-                  zIndex: 1000,
+                  height: CONTROL_ROW_HEIGHT,
+                  padding: isWorktree ? '0 8px 0 36px' : '0 8px 0 24px',
+                  cursor: 'pointer',
+                  borderRadius: 8,
+                  margin: '1px 4px',
+                  position: 'relative',
                 }}
-                onClick={(e) => {
-                  if (e.target === e.currentTarget) setHistoryPopupTerminalId(null);
-                }}
+                onClick={() => onActivate(t.id)}
+                onMouseEnter={() => setHoveredRow(t.id)}
+                onMouseLeave={() => setHoveredRow(null)}
               >
-                <div
-                  style={{
-                    background: '#141414',
-                    border: '1px solid #333',
+                {/* Row background */}
+                {(active || hovered) && (
+                  <div style={{
+                    position: 'absolute',
+                    inset: 1,
                     borderRadius: 8,
-                    width: 480,
-                    maxWidth: '90vw',
-                    maxHeight: 400,
-                    display: 'flex',
-                    flexDirection: 'column',
-                    overflow: 'hidden',
-                  }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid #222' }}>
-                    <span style={{ fontSize: 14, fontWeight: 600, color: '#eee' }}>Input History</span>
+                    background: rowChrome.fill,
+                    border: rowChrome.stroke,
+                    pointerEvents: 'none',
+                  }} />
+                )}
+                {/* AI status badge */}
+                <span style={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: '50%',
+                  background: t.aiStatus === 'running' ? '#64c864' : t.aiStatus === 'attention' ? '#e8a838' : '#666',
+                  flexShrink: 0,
+                  zIndex: 1,
+                }} />
+                <span style={{
+                  fontSize: 11,
+                  color: t.exited ? withAlpha(TEXT_MUTED, 160) : rowChrome.titleColor,
+                  flex: 1,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  marginLeft: 6,
+                  zIndex: 1,
+                }}>
+                  {t.title || `${t.shell} #${t.id}`}
+                </span>
+
+                {/* Hover-driven action buttons */}
+                {(hovered || active) && (
+                  <div style={{ display: 'flex', gap: 2, zIndex: 1 }}>
+                    {t.kind === 'background' && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          rerunBackground(t.id);
+                        }}
+                        style={{
+                          padding: '1px 4px',
+                          fontSize: 10,
+                          background: 'transparent',
+                          border: '1px solid #444',
+                          color: TEXT_MUTED,
+                          borderRadius: 3,
+                          cursor: 'pointer',
+                          flexShrink: 0,
+                          width: CONTROL_ROW_HEIGHT,
+                          height: CONTROL_ROW_HEIGHT - 4,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                        title={t.aiStatus === 'running' ? 'Interrupt' : 'Rerun'}
+                      >
+                        {t.aiStatus === 'running' ? '✕' : '↻'}
+                      </button>
+                    )}
+                    {t.kind === 'foreground' && t.recentInputs.length > 0 && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setHistoryPopupTerminalId(t.id);
+                          setHistoryPopupJustOpened(true);
+                        }}
+                        style={{
+                          padding: '1px 4px',
+                          fontSize: 10,
+                          background: 'transparent',
+                          border: '1px solid #444',
+                          color: TEXT_MUTED,
+                          borderRadius: 3,
+                          cursor: 'pointer',
+                          flexShrink: 0,
+                          width: CONTROL_ROW_HEIGHT,
+                          height: CONTROL_ROW_HEIGHT - 4,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                        title="Show input history"
+                      >
+                        🕒
+                      </button>
+                    )}
+                    {t.kind === 'background' && effectiveSavedMessages.length > 0 && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setShowSavedMessages(showSavedMessages === t.id ? null : t.id);
+                        }}
+                        style={{
+                          padding: '1px 4px',
+                          fontSize: 10,
+                          background: 'transparent',
+                          border: '1px solid #444',
+                          color: TEXT_MUTED,
+                          borderRadius: 3,
+                          cursor: 'pointer',
+                          flexShrink: 0,
+                          width: TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH,
+                          height: CONTROL_ROW_HEIGHT - 4,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                        title="Send saved message"
+                      >
+                        💬
+                      </button>
+                    )}
+                    {t.kind === 'foreground' && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setShowFgMessages(showFgMessages === t.id ? null : t.id);
+                        }}
+                        style={{
+                          padding: '1px 4px',
+                          fontSize: 10,
+                          background: 'transparent',
+                          border: '1px solid #444',
+                          color: hasFgMessages ? '#64c864' : TEXT_MUTED,
+                          borderRadius: 3,
+                          cursor: 'pointer',
+                          flexShrink: 0,
+                          width: TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH,
+                          height: CONTROL_ROW_HEIGHT - 4,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                        title="Foreground tasks"
+                      >
+                        💬
+                      </button>
+                    )}
                     <button
-                      onClick={() => setHistoryPopupTerminalId(null)}
-                      style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 14 }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onKill(t.id);
+                      }}
+                      style={{
+                        padding: '1px 4px',
+                        fontSize: 10,
+                        background: 'transparent',
+                        border: '1px solid #444',
+                        color: BTN_RED,
+                        borderRadius: 3,
+                        cursor: 'pointer',
+                        flexShrink: 0,
+                        width: CONTROL_ROW_HEIGHT,
+                        height: CONTROL_ROW_HEIGHT - 4,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }}
+                      title="Kill"
                     >
                       ✕
                     </button>
                   </div>
-                  <div style={{ overflow: 'auto', padding: '8px 16px' }}>
-                    {t.recentInputs.length === 0 && (
-                      <div style={{ fontSize: 12, color: '#888', padding: '8px 0' }}>No recent inputs.</div>
-                    )}
-                    {t.recentInputs.map((input, i) => (
-                      <div
-                        key={i}
-                        style={{
-                          display: 'flex',
-                          alignItems: 'flex-start',
-                          gap: 6,
-                          padding: '4px 0',
-                          borderBottom: '1px solid #222',
-                        }}
-                      >
-                        <span style={{ fontSize: 10, color: '#666', flexShrink: 0, marginTop: 2 }}>{i + 1}.</span>
-                        <div style={{ flex: 1, overflow: 'auto', maxHeight: 120 }}>
-                          <pre style={{ margin: 0, fontSize: 11, color: '#ccc', fontFamily: 'Consolas, "Courier New", monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                            {input}
-                          </pre>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
+                )}
               </div>
             );
-          })()}
+          })}
+          {terminals.length === 0 && (
+            <div style={{ padding: '2px 8px 2px 24px', fontSize: 11, color: withAlpha(TEXT_MUTED, 120) }}>No terminals</div>
+          )}
         </div>
       )}
+
+      {/* Input History Popup - positioned to the right of the panel */}
+      {historyPopupTerminalId !== null && (() => {
+        const t = allTerminals.find((x) => x.id === historyPopupTerminalId);
+        if (!t) return null;
+        const popupWidth = Math.min(TERMINAL_HOVER_WIDTH, Math.max(200, window.innerWidth - panelRight - 16));
+        const recentInputs = t.recentInputs;
+        const deduplicated = recentInputs.filter((item, idx, arr) => arr.indexOf(item) === idx);
+        return (
+          <div
+            data-history-popup
+            style={{
+              position: 'fixed',
+              top: Math.max(8, Math.min(window.innerHeight - 300, (panelRef.current?.getBoundingClientRect().top ?? 0) + 100)),
+              left: Math.max(8, panelRight + 8),
+              width: popupWidth,
+              maxHeight: TERMINAL_HISTORY_POPUP_MAX_HEIGHT,
+              background: SURFACE_BG,
+              border: `1px solid ${BORDER_COLOR}`,
+              borderRadius: 8,
+              zIndex: 1000,
+              overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: `1px solid ${BORDER_COLOR}` }}>
+              <span style={{ fontSize: 14, fontWeight: 600, color: TEXT_PRIMARY }}>Input History</span>
+              <button
+                onClick={() => setHistoryPopupTerminalId(null)}
+                style={{ background: 'transparent', border: 'none', color: TEXT_MUTED, cursor: 'pointer', fontSize: 14 }}
+              >
+                ✕
+              </button>
+            </div>
+            <div style={{ overflow: 'auto', padding: '8px 16px' }}>
+              {deduplicated.length === 0 && (
+                <div style={{ fontSize: 12, color: TEXT_MUTED, padding: '8px 0' }}>No recent inputs.</div>
+              )}
+              {deduplicated.slice(0, TERMINAL_HISTORY_POPUP_MAX_VISIBLE_ENTRIES).map((input, i) => (
+                <div
+                  key={i}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: 6,
+                    padding: '4px 0',
+                    borderBottom: i < deduplicated.length - 1 ? `1px solid ${BORDER_COLOR}` : 'none',
+                  }}
+                >
+                  <span style={{ fontSize: 10, color: withAlpha(TEXT_MUTED, 120), flexShrink: 0, marginTop: 2 }}>{i + 1}.</span>
+                  <div style={{ flex: 1, overflow: 'auto', maxHeight: TERMINAL_HISTORY_MESSAGE_MAX_HEIGHT }}>
+                    <pre style={{ margin: 0, fontSize: 11, color: '#ccc', fontFamily: 'Consolas, "Courier New", monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                      {input}
+                    </pre>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };
+
+interface IconButtonProps {
+  icon: string;
+  tooltip: string;
+  onClick: (e: React.MouseEvent) => void;
+}
+
+const IconButton: React.FC<IconButtonProps> = ({ icon, tooltip, onClick }) => {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      title={tooltip}
+      style={{
+        width: CONTROL_ROW_HEIGHT,
+        height: CONTROL_ROW_HEIGHT,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: 'transparent',
+        border: 'none',
+        borderRadius: 8,
+        cursor: 'pointer',
+        color: hovered ? TEXT_PRIMARY : withAlpha(TEXT_PRIMARY, 178),
+        fontSize: 14,
+        ...(hovered ? { background: withAlpha(BTN_ICON_HOVER, 110) } : {}),
+      }}
+    >
+      {icon}
+    </button>
+  );
+};
+
+interface RowChrome {
+  fill: string;
+  stroke: string;
+  titleColor: string;
+}
+
+function terminalManagerRowChrome(isActive: boolean, isHovered: boolean): RowChrome {
+  if (isActive) {
+    return {
+      fill: '#262626',
+      stroke: `1px solid ${withAlpha('#646464', 220)}`,
+      titleColor: TEXT_PRIMARY,
+    };
+  } else if (isHovered) {
+    return {
+      fill: withAlpha(SURFACE_BG_SOFT, 180),
+      stroke: `1px solid ${withAlpha(BORDER_COLOR, 210)}`,
+      titleColor: withAlpha(TEXT_PRIMARY, 230),
+    };
+  } else {
+    return {
+      fill: 'transparent',
+      stroke: 'none',
+      titleColor: withAlpha(TEXT_PRIMARY, 210),
+    };
+  }
+}
