@@ -18450,31 +18450,28 @@ impl AdeApp {
 
     fn claude_codex_implementation_prompt(session: &ClaudeCodexHookSession) -> String {
         let mut prompt = format!(
-            "Claude Code Codex hook session: {}\nPlan file: {}\n\nOriginal user prompt:\n{}\n\n",
+            "Claude Code Codex hook implementation session: {}\nInstruction file: {}\n\nOriginal user prompt:\n{}\n\nAutomation requirements:\n- Stay in implementation/default mode; do not switch to Claude Code plan permission mode.\n- Do not ask the user to approve a proposal before editing.\n- Do not run slash commands for planning.\n- Carry out the requested implementation directly.\n\n",
             session.session_id,
             session.plan_path.display(),
             session.original_prompt
         );
         if let Some(plan) = &session.plan {
-            prompt.push_str("Codex read-only implementation plan:\n");
+            prompt.push_str("Codex read-only implementation instructions:\n");
             prompt.push_str(plan.trim());
-            prompt.push_str(
-                "\n\nApply this plan now. Keep the implementation scoped to the user's request.",
-            );
+            prompt.push_str("\n\nApply these instructions now. Keep the implementation scoped to the user's request.");
         } else if let Some(error) = &session.plan_error {
-            prompt.push_str("Codex planning failed, so continue with the original prompt using your normal implementation flow.\n\nPlanning error:\n");
+            prompt.push_str("Codex pre-implementation step failed, so continue with the original prompt using your normal implementation flow.\n\nPre-step error:\n");
             prompt.push_str(error.trim());
         } else {
-            prompt.push_str(
-                "Codex planning did not produce a plan. Continue with the original prompt.",
-            );
+            prompt
+                .push_str("Codex did not produce instructions. Continue with the original prompt.");
         }
         prompt
     }
 
     fn claude_codex_fix_prompt(session: &ClaudeCodexHookSession) -> String {
         format!(
-            "Claude Code Codex hook fix round {}/{}.\nPlan file: {}\n\nCodex review reported actionable findings. Fix only these findings, keep the original scope, and do not start unrelated refactors.\n\nReview output:\n{}\n\nTest summary:\n{}",
+            "Claude Code Codex hook fix round {}/{}.\nInstruction file: {}\n\nAutomation requirements:\n- Stay in implementation/default mode; do not switch to Claude Code plan permission mode.\n- Do not ask the user to approve a proposal before editing.\n- Do not run slash commands for planning.\n\nCodex review reported actionable findings. Fix only these findings, keep the original scope, and do not start unrelated refactors.\n\nReview output:\n{}\n\nTest summary:\n{}",
             session.review_round,
             MAX_REVIEW_FIX_ROUNDS,
             session.plan_path.display(),
@@ -42067,6 +42064,40 @@ mod tests {
             claude_codex_hook_phase_label(session.phase),
             "Codex hook blocked"
         );
+    }
+
+    #[test]
+    fn claude_codex_internal_prompts_require_direct_implementation_mode() {
+        let session = ClaudeCodexHookSession {
+            terminal_id: 1,
+            project_id: 7,
+            project_path: PathBuf::from("C:/repo"),
+            session_id: "mergen-1-test-1".to_owned(),
+            original_prompt: "make chess".to_owned(),
+            plan_path: PathBuf::from("C:/repo/.claude/plans/mergen-1-test-1.md"),
+            phase: ClaudeCodexHookPhase::AwaitingImplementation,
+            review_round: 1,
+            plan: Some("Create the board and piece movement.".to_owned()),
+            plan_error: None,
+            test_results: Vec::new(),
+            test_note: None,
+            review_output: Some("P1: Fix the invalid move check.".to_owned()),
+            review_error: None,
+            ui_changed_files: Vec::new(),
+            ui_verification: None,
+            final_note: None,
+        };
+
+        let implementation = AdeApp::claude_codex_implementation_prompt(&session);
+        assert!(implementation.contains("Stay in implementation/default mode"));
+        assert!(implementation.contains("Do not ask the user to approve"));
+        assert!(implementation.contains("Codex read-only implementation instructions"));
+        assert!(!implementation.contains("Apply this plan now"));
+        assert!(!implementation.contains("implementation plan:"));
+
+        let fix = AdeApp::claude_codex_fix_prompt(&session);
+        assert!(fix.contains("Stay in implementation/default mode"));
+        assert!(fix.contains("Do not ask the user to approve"));
     }
 
     #[test]

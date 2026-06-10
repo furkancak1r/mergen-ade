@@ -1001,7 +1001,7 @@ impl AcpStartupMode {
 pub struct AppConfig {
     pub version: u32,
     pub default_shell: ShellKind,
-    #[serde(default)]
+    #[serde(default = "default_claude_code_codex_hook_enabled")]
     pub claude_code_codex_hook_enabled: bool,
     pub ui: UiConfig,
     #[serde(default = "default_launchers")]
@@ -1020,12 +1020,16 @@ pub struct AppConfig {
     pub acp_startup_mode: AcpStartupMode,
 }
 
+pub const fn default_claude_code_codex_hook_enabled() -> bool {
+    true
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: APP_CONFIG_VERSION,
             default_shell: ShellKind::default(),
-            claude_code_codex_hook_enabled: false,
+            claude_code_codex_hook_enabled: default_claude_code_codex_hook_enabled(),
             ui: UiConfig::default(),
             launchers: default_launchers(),
             terminal_shortcuts: default_terminal_shortcuts(),
@@ -1132,10 +1136,10 @@ mod tests {
     }
 
     #[test]
-    fn app_config_default_disables_claude_code_codex_hook() {
+    fn app_config_default_enables_claude_code_codex_hook() {
         let config = AppConfig::default();
 
-        assert!(!config.claude_code_codex_hook_enabled);
+        assert!(config.claude_code_codex_hook_enabled);
     }
 
     #[test]
