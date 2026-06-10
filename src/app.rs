@@ -30267,8 +30267,13 @@ impl AdeApp {
                 let font_id = terminal_font_id(ui.style());
                 let char_width = terminal_char_width(ui, &font_id);
                 let line_height = terminal_line_height(ui, &font_id);
-                let smart_footer_height =
-                    Self::smart_input_footer_height(terminal, pane_height, line_height);
+                let smart_footer_layout_height =
+                    (pane_height - hook_progress_height - hook_progress_gap).max(0.0);
+                let smart_footer_height = Self::smart_input_footer_height(
+                    terminal,
+                    smart_footer_layout_height,
+                    line_height,
+                );
                 let smart_footer_gap = if smart_footer_height > 0.0 {
                     SMART_INPUT_FOOTER_GAP
                 } else {
@@ -30297,7 +30302,8 @@ impl AdeApp {
                 // visible terminal area always aligns with the PTY grid. This prevents
                 // a small dead strip (< one line tall) at the top when the pane height
                 // does not divide evenly by the cell height.
-                let output_height = (lines as f32 * line_height).max(line_height * 2.0);
+                let output_height =
+                    terminal_quantized_output_height(raw_output_size.y, line_height);
                 let output_size = Vec2::new(pane_width, output_height);
 
                 if raw_output_size.x >= char_width * 8.0 && raw_output_size.y >= line_height * 3.0 {
@@ -30444,6 +30450,18 @@ impl AdeApp {
                     self.show_create_worktree_popup,
                     self.checklist_floating_open,
                 );
+                let output_wheel_delta = if wheel_enabled {
+                    ui.ctx().input(|input| input.smooth_scroll_delta)
+                } else {
+                    Vec2::ZERO
+                };
+                let output_wheel_over_viewport = wheel_enabled
+                    && output_wheel_delta != Vec2::ZERO
+                    && ui
+                        .ctx()
+                        .input(|input| input.pointer.hover_pos().or(input.pointer.interact_pos()))
+                        .is_some_and(|pos| viewport_rect.contains(pos));
+                let mut runtime_wheel_sent = false;
 
                 let mut scroll_area_output = scroll_area.show(&mut output_ui, |ui| {
                     ui.set_width(output_size.x);
@@ -30757,6 +30775,7 @@ impl AdeApp {
                                                 x_pixel_offset: 0,
                                                 y_pixel_offset: 0,
                                             });
+                                            runtime_wheel_sent = true;
                                             ui.ctx().input_mut(|input| {
                                                 input.smooth_scroll_delta = Vec2::ZERO;
                                             });
@@ -30798,6 +30817,7 @@ impl AdeApp {
                                                 ui.ctx().input_mut(|input| {
                                                     input.smooth_scroll_delta = Vec2::ZERO;
                                                 });
+                                                runtime_wheel_sent = true;
                                                 opencode_direct_wheel_sent = true;
                                             }
                                         }
@@ -30839,10 +30859,24 @@ impl AdeApp {
                     let viewport_h = scroll_area_output.inner_rect.height();
                     let content_h = scroll_area_output.content_size.y;
                     let offset_y = scroll_area_output.state.offset.y;
-                    let at_bottom =
-                        content_h <= viewport_h || (offset_y + 1.0 >= content_h - viewport_h);
+                    let at_bottom = terminal_scroll_area_at_bottom(content_h, viewport_h, offset_y);
                     if at_bottom {
                         terminal.opencode_manual_scroll_detached = false;
+                    }
+                }
+                if output_wheel_over_viewport && !runtime_wheel_sent {
+                    let viewport_h = scroll_area_output.inner_rect.height();
+                    let content_h = scroll_area_output.content_size.y;
+                    let offset_y = scroll_area_output.state.offset.y;
+                    let can_scroll = terminal_scroll_area_can_scroll(content_h, viewport_h);
+                    if can_scroll {
+                        detach_terminal_prompt_scroll_anchor_on_manual_scroll(terminal);
+                        if terminal.ai_session.tool == Some(AiCliTool::OpenCode) {
+                            let at_bottom =
+                                terminal_scroll_area_at_bottom(content_h, viewport_h, offset_y);
+                            terminal.opencode_manual_scroll_detached =
+                                output_wheel_delta.y > 0.0 || !at_bottom;
+                        }
                     }
                 }
                 // Clamp scroll offset so blank leading rows (left by OpenCode
@@ -36176,6 +36210,7 @@ fn smart_input_max_footer_height(pane_height: f32, line_height: f32) -> f32 {
         - TERMINAL_HEADER_HEIGHT
         - TERMINAL_HEADER_GAP
         - SMART_INPUT_FOOTER_GAP
+        - SMART_INPUT_RESIZE_HANDLE_HEIGHT
         - line_height * 3.0)
         .max(0.0)
 }
@@ -39673,11 +39708,35 @@ fn terminal_output_viewport_size(output_size: Vec2) -> Vec2 {
     egui::vec2(output_size.x.max(0.0), output_size.y.max(0.0))
 }
 
+fn terminal_quantized_output_height(raw_output_height: f32, line_height: f32) -> f32 {
+    let raw_output_height = raw_output_height.max(0.0);
+    if raw_output_height <= 0.0 {
+        return 0.0;
+    }
+
+    let line_height = terminal_cell_metric(line_height);
+    let visible_lines = (raw_output_height / line_height).floor().max(1.0);
+    (visible_lines * line_height).min(raw_output_height)
+}
+
 fn terminal_output_surface_size(output_size: Vec2, content_height: f32) -> Vec2 {
     egui::vec2(
         output_size.x.max(0.0),
         output_size.y.max(content_height.max(0.0)),
     )
+}
+
+fn terminal_scroll_area_can_scroll(content_height: f32, viewport_height: f32) -> bool {
+    content_height > viewport_height + 1.0
+}
+
+fn terminal_scroll_area_at_bottom(
+    content_height: f32,
+    viewport_height: f32,
+    offset_y: f32,
+) -> bool {
+    !terminal_scroll_area_can_scroll(content_height, viewport_height)
+        || offset_y + 1.0 >= content_height - viewport_height
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40411,24 +40470,25 @@ mod tests {
         terminal_manager_diff_summary_visual, terminal_manager_row_chrome,
         terminal_manager_row_widths, terminal_output_mouse_wheel_enabled,
         terminal_output_scroll_behavior, terminal_output_surface_size,
-        terminal_output_viewport_size, terminal_secondary_click_action,
-        terminal_selection_autoscroll_delta, terminal_selection_autoscroll_speed,
-        terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
-        update_stable_cursor_row, visible_terminal_cursor, with_minimal_button_chrome,
-        with_settings_text_edit_chrome, AcpTerminalManagerAttentionReason, AdeApp, AiBadgeModel,
-        AiBadgeVisual, AppIcon, BrowserScopeKey, BrowserTabKind, BrowserVideoEncodeEvent,
-        ClaudeCodexHookPhase, ClaudeCodexHookSession, ClaudeStatusSource, CodexAttentionReason,
-        CodexCliStatusSource, CodexTransportStatus, CtrlCAction, DesignInspectDeliveryState,
-        DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
-        FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
-        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
-        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
-        NativeImagePasteTarget, OpenCodeAttentionReason, OpenCodeStatusSource,
-        OpenCodeTransportStatus, OsNotificationKind, PendingConfigChanges, PendingOsNotification,
-        PendingRerunPhase, PendingTerminalLinkClick, SettingsSection, SmartInputAttachment,
-        SmartInputMode, SmartInputState, SmartInputSubmitRequest, SmartInputTask,
-        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
-        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        terminal_output_viewport_size, terminal_quantized_output_height,
+        terminal_scroll_area_at_bottom, terminal_scroll_area_can_scroll,
+        terminal_secondary_click_action, terminal_selection_autoscroll_delta,
+        terminal_selection_autoscroll_speed, terminal_selection_point_from_pointer,
+        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
+        with_minimal_button_chrome, with_settings_text_edit_chrome,
+        AcpTerminalManagerAttentionReason, AdeApp, AiBadgeModel, AiBadgeVisual, AppIcon,
+        BrowserScopeKey, BrowserTabKind, BrowserVideoEncodeEvent, ClaudeCodexHookPhase,
+        ClaudeCodexHookSession, ClaudeStatusSource, CodexAttentionReason, CodexCliStatusSource,
+        CodexTransportStatus, CtrlCAction, DesignInspectDeliveryState, DirectoryIndexSnapshot,
+        DirectoryIndexTruncationFlags, DirectoryNode, FactoryDroidAttentionReason,
+        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
+        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
+        FactoryDroidTransportDiagnostics, FileEditorState, NativeImagePasteTarget,
+        OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OsNotificationKind,
+        PendingConfigChanges, PendingOsNotification, PendingRerunPhase, PendingTerminalLinkClick,
+        SettingsSection, SmartInputAttachment, SmartInputMode, SmartInputState,
+        SmartInputSubmitRequest, SmartInputTask, SourceControlBadgeState, SourceControlFile,
+        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
         TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT,
@@ -46121,6 +46181,17 @@ mod tests {
         AdeApp::flush_terminal_outbound(&mut terminal, &ctx, &mut outbound);
 
         assert!(!terminal.prompt_scroll_anchor_detached);
+    }
+
+    #[test]
+    fn terminal_quantized_output_height_never_exceeds_available_space() {
+        assert_eq!(terminal_quantized_output_height(55.0, 10.0), 50.0);
+        assert_eq!(terminal_quantized_output_height(8.0, 10.0), 8.0);
+        assert_eq!(terminal_quantized_output_height(-1.0, 10.0), 0.0);
+        assert!(terminal_scroll_area_can_scroll(120.0, 80.0));
+        assert!(!terminal_scroll_area_can_scroll(80.5, 80.0));
+        assert!(terminal_scroll_area_at_bottom(120.0, 80.0, 40.0));
+        assert!(!terminal_scroll_area_at_bottom(120.0, 80.0, 20.0));
     }
 
     #[test]
@@ -63185,6 +63256,142 @@ mod tests {
     // ScrollBack so users can review terminal output history.
 
     #[test]
+    fn codex_mergen_wheel_detaches_prompt_scroll_anchor() {
+        let ctx = Context::default();
+        let mut fonts = FontDefinitions::default();
+        configure_terminal_font_family(&mut fonts);
+        ctx.set_fonts(fonts);
+
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        let mut terminal = test_terminal_entry_with_runtime(1, 7, runtime);
+        terminal.kind = TerminalKind::Foreground;
+        terminal.ai_session.tool = Some(AiCliTool::CodexCli);
+        terminal.ai_session.status = AiCliStatus::Running;
+        terminal.codex_session_active = true;
+        terminal.last_seqno = terminal.runtime.latest_seqno();
+        terminal.dirty = false;
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "codex content".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 13,
+                    }],
+                };
+                300
+            ],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 280,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let mut app = test_app([(1, terminal)], Some(1));
+        let raw_input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            events: vec![
+                Event::PointerMoved(pos2(200.0, 100.0)),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 3.0),
+                    modifiers: Default::default(),
+                },
+            ],
+            ..RawInput::default()
+        };
+
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::Area::new("test".into())
+                .default_pos(pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    app.draw_terminal_pane(ui, 1, vec2(400.0, 300.0));
+                });
+        });
+
+        let terminal_after = app.terminals.get(&1).unwrap();
+        assert!(
+            terminal_after.prompt_scroll_anchor_detached,
+            "Mergen scrollback wheel must detach Codex prompt anchor"
+        );
+    }
+
+    #[test]
+    fn opencode_without_mouse_reporting_wheel_detaches_mergen_scrollback() {
+        let ctx = Context::default();
+        let mut fonts = FontDefinitions::default();
+        configure_terminal_font_family(&mut fonts);
+        ctx.set_fonts(fonts);
+
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut terminal = test_terminal_entry_with_runtime(1, 7, runtime);
+        terminal.kind = TerminalKind::Foreground;
+        terminal.ai_session.tool = Some(AiCliTool::OpenCode);
+        terminal.ai_session.status = AiCliStatus::Running;
+        terminal.opencode_session_active = true;
+        terminal.last_seqno = terminal.runtime.latest_seqno();
+        terminal.dirty = false;
+        assert!(!terminal.runtime.is_mouse_reporting_active());
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "opencode scrollback".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 19,
+                    }],
+                };
+                300
+            ],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 280,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let mut app = test_app([(1, terminal)], Some(1));
+        let raw_input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            events: vec![
+                Event::PointerMoved(pos2(200.0, 100.0)),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 3.0),
+                    modifiers: Default::default(),
+                },
+            ],
+            ..RawInput::default()
+        };
+
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::Area::new("test".into())
+                .default_pos(pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    app.draw_terminal_pane(ui, 1, vec2(400.0, 300.0));
+                });
+        });
+
+        assert_eq!(
+            capture.take_mouse_wheel_events().len(),
+            0,
+            "wheel should remain with Mergen scrollback when OpenCode mouse reporting is off"
+        );
+        let terminal_after = app.terminals.get(&1).unwrap();
+        assert!(
+            terminal_after.opencode_manual_scroll_detached,
+            "Mergen scrollback wheel must disable OpenCode bottom stickiness"
+        );
+    }
+
+    #[test]
     fn opencode_running_wheel_forwarded_directly_to_runtime() {
         // Regression test: when OpenCode is Running and mouse reporting is active,
         // wheel events should go directly to the OpenCode TUI so OpenCode scrolls its
@@ -63346,9 +63553,10 @@ mod tests {
     }
 
     #[test]
-    fn opencode_inactive_wheel_not_forwarded_to_runtime() {
+    fn opencode_inactive_wheel_stays_with_mergen_scrollback() {
         // Regression test: when OpenCode is Inactive, wheel events should NOT be
-        // forwarded to the OpenCode runtime; they stay with Mergen scrollback.
+        // forwarded to the OpenCode runtime; they stay with Mergen scrollback and
+        // detach bottom stickiness so history can move.
         let ctx = Context::default();
         let mut fonts = FontDefinitions::default();
         configure_terminal_font_family(&mut fonts);
@@ -63427,8 +63635,8 @@ mod tests {
 
         let terminal_after = app.terminals.get(&1).unwrap();
         assert!(
-            !terminal_after.opencode_manual_scroll_detached,
-            "inactive wheel should not detach manual scroll"
+            terminal_after.opencode_manual_scroll_detached,
+            "inactive wheel should detach Mergen scrollback from bottom stickiness"
         );
     }
 
@@ -66161,12 +66369,22 @@ mod tests {
         let terminal = app.terminals.get(&1).expect("terminal 1");
         let pane_height = 400.0;
         let line_height = 18.0;
-        let max_footer = AdeApp::smart_input_footer_height(terminal, pane_height, line_height);
+        let hook_reserved =
+            super::CLAUDE_CODEX_HOOK_PROGRESS_HEIGHT + super::CLAUDE_CODEX_HOOK_PROGRESS_GAP;
+        let max_footer =
+            AdeApp::smart_input_footer_height(terminal, pane_height - hook_reserved, line_height);
 
         let header = super::TERMINAL_HEADER_HEIGHT;
         let header_gap = super::TERMINAL_HEADER_GAP;
         let footer_gap = super::SMART_INPUT_FOOTER_GAP;
-        let output_height = pane_height - header - header_gap - footer_gap - max_footer;
+        let resize_handle = super::SMART_INPUT_RESIZE_HANDLE_HEIGHT;
+        let output_height = pane_height
+            - header
+            - header_gap
+            - hook_reserved
+            - resize_handle
+            - footer_gap
+            - max_footer;
 
         assert!(
             output_height >= line_height * 3.0 - 0.01,
