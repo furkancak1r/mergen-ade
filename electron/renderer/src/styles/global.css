@@ -121,6 +121,74 @@ body {
   background: #141414;
 }
 
+.project-explorer-project-select {
+  background: #1a1a1a;
+  border: 1px solid #333;
+  border-radius: 4px;
+  color: #c8c8c8;
+  flex: 1;
+  font-size: 12px;
+  height: 24px;
+  min-width: 80px;
+  outline: none;
+  padding: 2px 6px;
+}
+
+.project-explorer-project-select:focus {
+  border-color: #555;
+}
+
+.project-explorer-toolbar-btn {
+  align-items: center;
+  background: #1e1e1e;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  color: #c8c8c8;
+  cursor: pointer;
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 11px;
+  height: 24px;
+  justify-content: center;
+  line-height: 1;
+  width: 26px;
+}
+
+.project-explorer-toolbar-btn:hover:not(:disabled) {
+  background: #2d2d2d;
+  color: #f4f4f4;
+}
+
+.project-explorer-toolbar-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.project-explorer-toolbar-btn.danger {
+  color: #d47a7a;
+}
+
+.project-explorer-toolbar-btn.danger:hover:not(:disabled) {
+  color: #ff8a8a;
+}
+
+.project-explorer-feedback-toast {
+  background: #1e1e1e;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  bottom: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  color: #f4f4f4;
+  font-size: 12px;
+  left: 50%;
+  padding: 6px 10px;
+  pointer-events: none;
+  position: absolute;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  z-index: 20;
+}
+
 .terminal-manager {
   background: #181818;
 }
@@ -260,6 +328,52 @@ body {
 }
 
 .source-control-context-menu button:hover {
+  background: #2d2d2d;
+  color: #f4f4f4;
+}
+
+.terminal-manager-feedback-toast {
+  background: #1e1e1e;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  bottom: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  color: #f4f4f4;
+  font-size: 12px;
+  left: 50%;
+  padding: 6px 10px;
+  pointer-events: none;
+  position: absolute;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  z-index: 20;
+}
+
+.terminal-manager-context-menu {
+  background: #1e1e1e;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  min-width: 132px;
+  padding: 4px;
+  position: fixed;
+  z-index: 1000;
+}
+
+.terminal-manager-context-menu button {
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: #c8c8c8;
+  cursor: pointer;
+  display: block;
+  font-size: 12px;
+  padding: 6px 10px;
+  text-align: left;
+  width: 100%;
+}
+
+.terminal-manager-context-menu button:hover {
   background: #2d2d2d;
   color: #f4f4f4;
 }

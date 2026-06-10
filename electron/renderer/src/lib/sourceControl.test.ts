@@ -5,6 +5,7 @@ import {
   sourceControlFileAbsolutePath,
   sourceControlBranchLine,
   sourceControlStatusLabel,
+  sourceControlWorktreeLabel,
 } from '../../../shared/sourceControl';
 
 describe('sourceControl helpers', () => {
@@ -60,5 +61,24 @@ describe('sourceControl helpers', () => {
   it('builds platform-shaped absolute file paths from git relative paths', () => {
     expect(sourceControlFileAbsolutePath('C:\\repo\\', 'src/app.ts')).toBe('C:\\repo\\src/app.ts');
     expect(sourceControlFileAbsolutePath('/repo/', '/src/app.ts')).toBe('/repo/src/app.ts');
+  });
+
+  it('formats worktree labels like the Rust source control panel', () => {
+    expect(sourceControlWorktreeLabel({
+      path: 'C:\\repo\\worktrees\\feature',
+      branch: 'refs/heads/feature/foo',
+      detached: false,
+    })).toBe('feature/foo');
+    expect(sourceControlWorktreeLabel({
+      path: '/repo/wt',
+      branch: '',
+      head: '1234567890abcdef',
+      detached: true,
+    })).toBe('detached@90abcdef');
+    expect(sourceControlWorktreeLabel({
+      path: '/repo/worktrees/fallback',
+      branch: '',
+      detached: false,
+    })).toBe('fallback');
   });
 });

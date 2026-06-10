@@ -43,6 +43,16 @@ const TERMINAL_HISTORY_POPUP_CHROME_HEIGHT_ESTIMATE = 56;
 const TERMINAL_HISTORY_POPUP_ROW_GAP = 4;
 const TERMINAL_MANAGER_DIFF_REFRESH_INTERVAL_MS = 30_000;
 
+type TerminalManagerPathContextKind = 'project' | 'worktree';
+
+interface TerminalManagerPathContextMenu {
+  x: number;
+  y: number;
+  path: string;
+  name: string;
+  kind: TerminalManagerPathContextKind;
+}
+
 function withAlpha(color: string, alpha: number): string {
   const r = parseInt(color.slice(1, 3), 16);
   const g = parseInt(color.slice(3, 5), 16);
@@ -72,6 +82,7 @@ interface TerminalManagerProps {
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number) => void;
+  onCreateWorktree?: (projectId: number) => void;
   onOverlayOpenChange?: (open: boolean) => void;
   onUpdateFilter?: (filter: TerminalManagerFilter) => void;
   onToggleHideInactiveProjects?: () => void;
@@ -93,6 +104,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onActivateAcpChat,
   onRemoveAcpChat,
   onOpenAcpChat,
+  onCreateWorktree,
   onOverlayOpenChange,
   onUpdateFilter,
   onToggleHideInactiveProjects,
@@ -108,13 +120,17 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   const [fgMessageEditIndex, setFgMessageEditIndex] = useState<number | null>(null);
   const [historyPopupTerminalId, setHistoryPopupTerminalId] = useState<number | null>(null);
   const [historyPopupJustOpened, setHistoryPopupJustOpened] = useState(false);
+  const [pathContextMenu, setPathContextMenu] = useState<TerminalManagerPathContextMenu | null>(null);
+  const [feedback, setFeedback] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const feedbackTimerRef = useRef<number | null>(null);
 
   const overlayOpen = showSavedMessages !== null
     || showFgMessages !== null
     || showLauncherMenu !== null
     || fgMessagePopupProject !== null
-    || historyPopupTerminalId !== null;
+    || historyPopupTerminalId !== null
+    || pathContextMenu !== null;
 
   useEffect(() => {
     onOverlayOpenChange?.(overlayOpen);
@@ -201,6 +217,23 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
 
   const getProjectTerminals = (projectId: number) => filteredTerminals.filter((t) => t.projectId === projectId);
 
+  const showFeedback = useCallback((message: string) => {
+    setFeedback(message);
+    if (feedbackTimerRef.current !== null) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setFeedback(null);
+      feedbackTimerRef.current = null;
+    }, 1600);
+  }, []);
+
+  useEffect(() => () => {
+    if (feedbackTimerRef.current !== null) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+  }, []);
+
   const sendSavedMessage = useCallback(async (projectId: number, message: string, kind: TerminalKind) => {
     let target: TerminalInstance | undefined;
     if (kind === TerminalKindEnum.Foreground) {
@@ -266,8 +299,38 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
     return () => document.removeEventListener('click', handleClick);
   }, [showSavedMessages, showFgMessages]);
 
+  useEffect(() => {
+    if (!pathContextMenu) return undefined;
+
+    const closeMenu = () => setPathContextMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu();
+    };
+    window.addEventListener('click', closeMenu);
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      window.removeEventListener('click', closeMenu);
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [pathContextMenu]);
+
+  const openPathContextMenu = useCallback((event: React.MouseEvent, project: ProjectRecord, kind: TerminalManagerPathContextKind) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setShowSavedMessages(null);
+    setShowFgMessages(null);
+    setShowLauncherMenu(null);
+    setPathContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      path: project.path,
+      name: project.name,
+      kind,
+    });
+  }, []);
+
   return (
-    <div ref={panelRef} className="terminal-manager" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: SURFACE_BG }}>
+    <div ref={panelRef} className="terminal-manager" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: SURFACE_BG, position: 'relative' }}>
       {/* Filter tabs */}
       <div style={{ display: 'flex', padding: `${TERMINAL_MANAGER_FILTER_TOP_PADDING}px ${TERMINAL_MANAGER_FILTER_SIDE_PADDING}px`, borderBottom: `1px solid ${BORDER_COLOR}`, height: CONTROL_ROW_HEIGHT + TERMINAL_MANAGER_FILTER_ROW_HEIGHT_EXTRA }}>
         {([TerminalManagerFilterEnum.Foreground, TerminalManagerFilterEnum.Background] as TerminalManagerFilter[]).map((f) => {
@@ -365,6 +428,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 onActivateAcpChat={onActivateAcpChat}
                 onRemoveAcpChat={onRemoveAcpChat}
                 onOpenAcpChat={onOpenAcpChat}
+                onCreateWorktree={onCreateWorktree}
+                onPathContextMenu={openPathContextMenu}
                 onRemoveForegroundMessage={onRemoveForegroundMessage}
                 onOpenFgMessagePopup={(projectId, message, index) => {
                   setFgMessagePopupProject(projectId);
@@ -415,6 +480,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                     onActivateAcpChat={onActivateAcpChat}
                     onRemoveAcpChat={onRemoveAcpChat}
                     onOpenAcpChat={onOpenAcpChat}
+                    onCreateWorktree={onCreateWorktree}
+                    onPathContextMenu={openPathContextMenu}
                     onRemoveForegroundMessage={onRemoveForegroundMessage}
                     onOpenFgMessagePopup={(projectId, message, index) => {
                       setFgMessagePopupProject(projectId);
@@ -579,6 +646,44 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
           </div>
         </div>
       )}
+
+      {feedback && (
+        <div className="terminal-manager-feedback-toast" role="status">
+          {feedback}
+        </div>
+      )}
+
+      {pathContextMenu && (
+        <div
+          className="terminal-manager-context-menu"
+          style={{ left: pathContextMenu.x, top: pathContextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              const { path, name, kind } = pathContextMenu;
+              api.invoke('clipboard:writeText', path).catch(() => {});
+              showFeedback(`Copied path for ${kind} '${name}'`);
+              setPathContextMenu(null);
+            }}
+          >
+            Copy Path
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const { path, name, kind } = pathContextMenu;
+              api.invoke('shell:showItemInFolder', path)
+                .then(() => showFeedback(`Opened ${kind} '${name}' in Explorer`))
+                .catch((error) => showFeedback(`Open folder failed: ${error instanceof Error ? error.message : String(error)}`));
+              setPathContextMenu(null);
+            }}
+          >
+            Open in Folder
+          </button>
+        </div>
+      )}
     </div>
   );
 };
@@ -611,6 +716,8 @@ interface ProjectGroupProps {
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number) => void;
+  onCreateWorktree?: (projectId: number) => void;
+  onPathContextMenu?: (event: React.MouseEvent, project: ProjectRecord, kind: TerminalManagerPathContextKind) => void;
   onRemoveForegroundMessage?: (projectId: number, message: string) => void;
   onOpenFgMessagePopup?: (projectId: number, message: string, index: number) => void;
   onOpenAddFgMessagePopup?: (projectId: number) => void;
@@ -648,6 +755,8 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   onActivateAcpChat,
   onRemoveAcpChat,
   onOpenAcpChat,
+  onCreateWorktree,
+  onPathContextMenu,
   onRemoveForegroundMessage,
   onOpenFgMessagePopup,
   onOpenAddFgMessagePopup,
@@ -694,6 +803,9 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
         onClick={onToggle}
         onMouseEnter={() => setHoveredProject(true)}
         onMouseLeave={() => setHoveredProject(false)}
+        onContextMenu={(event) => {
+          onPathContextMenu?.(event, project, isWorktree ? 'worktree' : 'project');
+        }}
       >
         {/* Hover background */}
         {(hoveredProject || isSelected) && (
@@ -790,7 +902,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   tooltip="Create Worktree"
                   onClick={(e) => {
                     e.stopPropagation();
-                    // TODO: create worktree popup
+                    onCreateWorktree?.(project.id);
                   }}
                 />
               </>

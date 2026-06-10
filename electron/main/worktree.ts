@@ -154,40 +154,68 @@ export function removeWorktree(repoPath: string, path: string): Promise<boolean>
   });
 }
 
-export function getGitStatus(repoPath: string): Promise<SourceControlStatus> {
-  return new Promise((resolve) => {
-    const proc = spawn('git', ['status', '--porcelain', '-b'], { cwd: repoPath });
-    let stdout = '';
-    let stderr = '';
-    proc.stdout.on('data', (data) => { stdout += data; });
-    proc.stderr.on('data', (data) => { stderr += data; });
-    proc.on('close', (code) => {
-      if (code !== 0) {
-        resolve({ files: [], branch: '', ahead: 0, behind: 0 });
-        return;
+export async function getGitStatus(repoPath: string, runFetch = false): Promise<SourceControlStatus> {
+  if (runFetch) {
+    try {
+      const fetch = await runGitCommand(repoPath, ['fetch', '--all', '--prune']);
+      if (fetch.code !== 0) {
+        return {
+          files: [],
+          branch: '',
+          ahead: 0,
+          behind: 0,
+          error: fetch.stderr.trim() ? `Fetch failed: ${fetch.stderr.trim()}` : 'git fetch failed',
+        };
       }
-      const lines = stdout.split('\n');
-      let branch = '';
-      let ahead = 0;
-      let behind = 0;
-      const files: { path: string; status: string; staged: boolean }[] = [];
-      for (const line of lines) {
-        if (line.startsWith('## ')) {
-          const parsed = parseBranchHeader(line.slice(3));
-          branch = parsed.branch;
-          ahead = parsed.ahead;
-          behind = parsed.behind;
-        } else {
-          const file = parseSourceControlStatusLine(line);
-          if (file) files.push(file);
-        }
+    } catch (error) {
+      return {
+        files: [],
+        branch: '',
+        ahead: 0,
+        behind: 0,
+        error: `Fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  try {
+    const output = await runGitCommand(repoPath, ['status', '--porcelain', '-b']);
+    if (output.code !== 0) {
+      return {
+        files: [],
+        branch: '',
+        ahead: 0,
+        behind: 0,
+        error: output.stderr.trim() || 'Not a git repository',
+      };
+    }
+
+    const lines = output.stdout.split('\n');
+    let branch = '';
+    let ahead = 0;
+    let behind = 0;
+    const files: { path: string; status: string; staged: boolean }[] = [];
+    for (const line of lines) {
+      if (line.startsWith('## ')) {
+        const parsed = parseBranchHeader(line.slice(3));
+        branch = parsed.branch;
+        ahead = parsed.ahead;
+        behind = parsed.behind;
+      } else {
+        const file = parseSourceControlStatusLine(line);
+        if (file) files.push(file);
       }
-      resolve({ files, branch, ahead, behind });
-    });
-    proc.on('error', () => {
-      resolve({ files: [], branch: '', ahead: 0, behind: 0 });
-    });
-  });
+    }
+    return { files, branch: branch || 'detached', ahead, behind };
+  } catch (error) {
+    return {
+      files: [],
+      branch: '',
+      ahead: 0,
+      behind: 0,
+      error: `Status failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 export async function getGitDiffSummary(repoPath: string): Promise<GitDiffSummary> {

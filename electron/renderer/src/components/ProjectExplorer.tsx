@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import type { DirectoryNode, ProjectRecord } from '../../../shared/types';
 import { repairMojibakeDisplay } from '../lib/mojibake';
+import { collectLoadedDirectoryPaths, directoryTreeHasCollapsedFolders } from '../lib/directoryTree';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
 
@@ -60,12 +61,17 @@ function highlightMatch(text: string, query: string): React.ReactNode {
 
 interface ProjectExplorerProps {
   project: ProjectRecord;
+  projects?: ProjectRecord[];
+  selectedProjectId?: number | null;
   selectedPath?: string;
+  onSelectProject?: (projectId: number) => void;
+  onAddProject?: () => void;
+  onRemoveProject?: (project: ProjectRecord) => void;
   onSelectPath?: (path: string) => void;
   onOpenFile?: (path: string) => void;
 }
 
-export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selectedPath, onSelectPath, onOpenFile }) => {
+export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, projects, selectedProjectId, selectedPath, onSelectProject, onAddProject, onRemoveProject, onSelectPath, onOpenFile }) => {
   const [rootNode, setRootNode] = useState<DirectoryNode | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -75,6 +81,9 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [searchLoading, setSearchLoading] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
+  const refreshRequestRef = useRef(0);
+  const feedbackTimerRef = useRef<number | null>(null);
+  const [feedback, setFeedback] = useState<string | null>(null);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(query), 250);
@@ -105,36 +114,80 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
     }
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    async function init() {
-      setLoading(true);
-      setError(null);
-      try {
-        const children = await loadDirectory(project.path, true);
-        if (cancelled) return;
-        const root: DirectoryNode = {
-          name: project.name,
-          path: project.path,
-          isDirectory: true,
-          isDeferred: false,
-          isSymlink: false,
-          isExpanded: true,
-          isLoading: false,
-          children,
-        };
-        setRootNode(root);
-        expandedRef.current.add(project.path);
-        setExpanded(new Set(expandedRef.current));
-      } catch (err) {
-        if (!cancelled) setError(String(err));
-      } finally {
-        if (!cancelled) setLoading(false);
+  const showFeedback = useCallback((message: string) => {
+    setFeedback(message);
+    if (feedbackTimerRef.current !== null) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setFeedback(null);
+      feedbackTimerRef.current = null;
+    }, 1600);
+  }, []);
+
+  useEffect(() => () => {
+    if (feedbackTimerRef.current !== null) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+  }, []);
+
+  const refreshRoot = useCallback(async (): Promise<boolean> => {
+    const requestId = ++refreshRequestRef.current;
+    setLoading(true);
+    setError(null);
+    setSearchLoading(false);
+    try {
+      const children = await loadDirectory(project.path, true);
+      if (requestId !== refreshRequestRef.current) return false;
+      const root: DirectoryNode = {
+        name: project.name,
+        path: project.path,
+        isDirectory: true,
+        isDeferred: false,
+        isSymlink: false,
+        isExpanded: true,
+        isLoading: false,
+        children,
+      };
+      expandedRef.current = new Set([project.path]);
+      setRootNode(root);
+      setExpanded(new Set(expandedRef.current));
+      return true;
+    } catch (err) {
+      if (requestId === refreshRequestRef.current) {
+        setError(String(err));
+      }
+      return false;
+    } finally {
+      if (requestId === refreshRequestRef.current) {
+        setLoading(false);
       }
     }
-    init();
-    return () => { cancelled = true; };
   }, [project.path, project.name, loadDirectory]);
+
+  useEffect(() => {
+    refreshRoot();
+    return () => {
+      refreshRequestRef.current += 1;
+    };
+  }, [refreshRoot]);
+
+  const copyProjectPath = useCallback(() => {
+    api.invoke('clipboard:writeText', project.path).catch(() => {});
+    showFeedback(`Copied path for project '${project.name}'`);
+  }, [project.path, project.name, showFeedback]);
+
+  const openProjectFolder = useCallback(() => {
+    api.invoke('shell:showItemInFolder', project.path)
+      .then(() => showFeedback(`Opened project '${project.name}' in Explorer`))
+      .catch((err) => showFeedback(`Open folder failed: ${err instanceof Error ? err.message : String(err)}`));
+  }, [project.path, project.name, showFeedback]);
+
+  const refreshDirectoryIndex = useCallback(() => {
+    refreshRoot()
+      .then((ok) => showFeedback(ok ? 'Directory index refreshed' : 'Directory index refresh failed'))
+      .catch((err) => showFeedback(`Directory index refresh failed: ${err instanceof Error ? err.message : String(err)}`));
+  }, [refreshRoot, showFeedback]);
 
   const expandNode = useCallback(async (node: DirectoryNode) => {
     if (node.isSymlink) return;
@@ -288,6 +341,19 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
     if (!debouncedQuery || !rootNode) return rootNode;
     return filterTree(rootNode);
   }, [debouncedQuery, rootNode, filterTree]);
+  const hasCollapsedFolders = useMemo(() => {
+    return rootNode ? directoryTreeHasCollapsedFolders(rootNode, expanded) : false;
+  }, [rootNode, expanded]);
+  const searchActive = query.trim().length > 0;
+  const toggleAllFolders = useCallback(() => {
+    if (!rootNode || searchActive) return;
+    if (hasCollapsedFolders) {
+      expandedRef.current = new Set(collectLoadedDirectoryPaths(rootNode));
+    } else {
+      expandedRef.current = new Set([rootNode.path]);
+    }
+    setExpanded(new Set(expandedRef.current));
+  }, [rootNode, searchActive, hasCollapsedFolders]);
 
   const renderNode = (node: DirectoryNode, depth: number): React.ReactNode => {
     const isExpanded = expanded.has(node.path);
@@ -349,17 +415,69 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
   };
 
   return (
-    <div className="project-explorer" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+    <div className="project-explorer" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', position: 'relative' }}>
       <div style={{ padding: '8px 12px', borderBottom: '1px solid #222', display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: 12, fontWeight: 600, color: '#eee', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          {repairMojibakeDisplay(project.name)}
-        </span>
+        {projects && projects.length > 0 && onSelectProject ? (
+          <select
+            className="project-explorer-project-select"
+            value={selectedProjectId ?? project.id}
+            title={project.path}
+            onChange={(event) => onSelectProject(Number(event.target.value))}
+          >
+            {projects.map((item) => (
+              <option key={item.id} value={item.id}>
+                {repairMojibakeDisplay(item.name)}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span style={{ fontSize: 12, fontWeight: 600, color: '#eee', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>
+            {repairMojibakeDisplay(project.name)}
+          </span>
+        )}
+        {onAddProject && (
+          <button type="button" className="project-explorer-toolbar-btn" title="Add Project" onClick={onAddProject}>
+            +
+          </button>
+        )}
+        <button type="button" className="project-explorer-toolbar-btn" title="Copy Path" onClick={copyProjectPath}>
+          ⧉
+        </button>
+        <button type="button" className="project-explorer-toolbar-btn" title="Open in Folder" onClick={openProjectFolder}>
+          📁
+        </button>
+        <button type="button" className="project-explorer-toolbar-btn" title="Refresh Directory Index" onClick={refreshDirectoryIndex} disabled={loading}>
+          ↻
+        </button>
+        <button
+          type="button"
+          className="project-explorer-toolbar-btn"
+          title={hasCollapsedFolders ? 'Expand All Folders' : 'Collapse All Folders'}
+          onClick={toggleAllFolders}
+          disabled={!rootNode || searchActive}
+        >
+          {hasCollapsedFolders ? '⊞' : '⊟'}
+        </button>
+        {onRemoveProject && (
+          <button
+            type="button"
+            className="project-explorer-toolbar-btn danger"
+            title="Remove Project"
+            onClick={() => {
+              if (window.confirm(`Remove project '${project.name}' from Mergen? This does not delete files from disk.`)) {
+                onRemoveProject(project);
+              }
+            }}
+          >
+            ×
+          </button>
+        )}
       </div>
       <div style={{ padding: '6px 12px', borderBottom: '1px solid #222' }}>
         <input
           ref={searchRef}
           type="text"
-          placeholder="Search files..."
+          placeholder="Search files and folders"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           style={{
@@ -389,6 +507,11 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
           <div style={{ padding: 12, color: '#888', fontSize: 12 }}>No matching files or folders.</div>
         )}
       </div>
+      {feedback && (
+        <div className="project-explorer-feedback-toast" role="status">
+          {feedback}
+        </div>
+      )}
     </div>
   );
 };

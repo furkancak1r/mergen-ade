@@ -62,3 +62,52 @@ export function sanitizeWorktreeSlug(branchName: string): string {
     .replace(/\.\./g, '-')
     .replace(/^-+|-+$/g, '');
 }
+
+function pathSeparatorFor(repoPath: string): '/' | '\\' {
+  const lastSlash = repoPath.lastIndexOf('/');
+  const lastBackslash = repoPath.lastIndexOf('\\');
+  return lastBackslash > lastSlash ? '\\' : '/';
+}
+
+function trimTrailingSeparators(path: string): string {
+  if (path === '/' || /^[A-Za-z]:[\\/]$/.test(path)) {
+    return path;
+  }
+  return path.replace(/[\\/]+$/g, '');
+}
+
+function parentPathOf(repoPath: string): string {
+  const trimmed = trimTrailingSeparators(repoPath);
+  const lastSlash = trimmed.lastIndexOf('/');
+  const lastBackslash = trimmed.lastIndexOf('\\');
+  const idx = Math.max(lastSlash, lastBackslash);
+
+  if (idx < 0) {
+    return trimmed;
+  }
+  if (idx === 0) {
+    return trimmed.slice(0, 1);
+  }
+  if (idx === 2 && /^[A-Za-z]:/.test(trimmed)) {
+    return trimmed.slice(0, 3);
+  }
+  return trimmed.slice(0, idx);
+}
+
+function joinPath(base: string, separator: '/' | '\\', ...segments: string[]): string {
+  return segments.reduce((current, segment) => {
+    if (!current) {
+      return segment;
+    }
+    if (current.endsWith('/') || current.endsWith('\\')) {
+      return `${current}${segment}`;
+    }
+    return `${current}${separator}${segment}`;
+  }, base);
+}
+
+export function defaultWorktreePathForBranch(repoPath: string, branchName: string): string {
+  const separator = pathSeparatorFor(repoPath);
+  const parent = parentPathOf(repoPath);
+  return joinPath(parent, separator, 'worktrees', sanitizeWorktreeSlug(branchName));
+}

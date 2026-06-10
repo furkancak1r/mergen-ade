@@ -4156,3 +4156,204 @@
   - Added regression tests for slash/space, dot preservation, `..` replacement, and Unicode preservation.
 - Files/Commands touched: `electron/renderer/src/lib/worktree.ts`, `electron/renderer/src/lib/worktree.test.ts`, `KNOWN_ISSUES.md`
 - References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Create Worktree yolu ve base branch Rust davranisindan sapmisti {#electron-create-worktree-path-base-branch-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Create Worktree popup auto-fills the base branch from the current Source Control branch and shows the absolute auto-generated worktree path, while Electron displayed only a relative preview and left the base branch blank.
+- Error signature:
+  1. Electron rendered `../worktrees/<slug>` in the modal but submitted a separately calculated absolute path.
+  2. The create modal did not initialize `Base branch (optional)` from the current branch.
+  3. Create-in-progress state still allowed modal close and existing-worktree add actions.
+- Symptoms/Impact:
+  - Users could not verify the exact destination path before creating a worktree.
+  - Creating a branch from the active branch required retyping the base branch even though Rust prefilled it.
+  - Modal actions could drift while a git worktree create request was in flight.
+- Root cause:
+  - Electron duplicated a partial path calculation inside the component instead of sharing a Rust-parity default path helper and modal-open initialization flow.
+- Resolution:
+  - Added `defaultWorktreePathForBranch()` matching Rust's `parent/worktrees/slug` behavior for Windows and POSIX-shaped paths.
+  - Updated Source Control's Create Worktree modal to use the same computed path for display and submit.
+  - Prefilled base branch from the current snapshot branch on modal open, moved existing worktrees above the form, and disabled close/add/edit actions while creating.
+- Prevent recurrence:
+  - Added regression coverage for POSIX, Windows, drive-root, and relative default worktree paths.
+- Files/Commands touched: `electron/renderer/src/lib/worktree.ts`, `electron/renderer/src/lib/worktree.test.ts`, `electron/renderer/src/components/SourceControl.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Create Worktree hata durumu modal icinde tutulmuyordu {#electron-create-worktree-inline-error}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust keeps Create Worktree failures inside the popup as `create_worktree_error`, while Electron used a browser alert and did not recover cleanly from rejected IPC calls.
+- Error signature:
+  1. `git:createWorktree` returning `false` opened an alert instead of preserving context in the modal.
+  2. A rejected IPC call could skip `setCreateLoading(false)`.
+  3. Editing/reopening the form did not explicitly clear the previous error state because there was no local error state.
+- Symptoms/Impact:
+  - Create failures interrupted the modal workflow and could leave the button in a stale loading state.
+- Root cause:
+  - The Electron modal handled only boolean failure through `alert()` and did not mirror Rust's inline popup error lifecycle.
+- Resolution:
+  - Added local `createError` state, inline error/status text, try/catch/finally around create submit, and error clearing on reopen/edit/cancel/success.
+- Prevent recurrence:
+  - Keep create-worktree async state transitions localized to the modal instead of using browser alerts for recoverable git failures.
+- Files/Commands touched: `electron/renderer/src/components/SourceControl.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Terminal Manager Create Worktree dugmesi bagli degildi {#electron-terminal-manager-create-worktree-entry}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust opens the Create Worktree popup from Terminal Manager root project rows, while Electron rendered the matching `Create Worktree` icon button with a TODO handler.
+- Error signature:
+  1. `TerminalManager.tsx` showed the `📁+` button only as hover chrome.
+  2. Clicking it stopped propagation but did not open any create-worktree UI.
+  3. Source Control owned the only Electron create modal, so Terminal Manager had no route into the workflow.
+- Symptoms/Impact:
+  - Users could create worktrees from Source Control but not from Terminal Manager, unlike the Rust app.
+- Root cause:
+  - The initial Electron Terminal Manager port left the create-worktree action unwired instead of routing it to the existing Source Control modal.
+- Resolution:
+  - Added a Terminal Manager `onCreateWorktree` callback.
+  - Routed the App-level request to select the project, switch to Source Control, and pass an auto-open request id.
+  - Updated Source Control to open its create modal after the selected project's status snapshot is ready so the base branch can be prefilled.
+- Prevent recurrence:
+  - Keep Terminal Manager root-row action buttons wired through typed props instead of leaving local TODO handlers.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/components/SourceControl.tsx`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Terminal Manager satir path menusu eksikti {#electron-terminal-manager-path-context-menu}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust Terminal Manager project and worktree rows expose a context menu with `Copy Path` and `Open in Folder`, while Electron rows only toggled expansion.
+- Error signature:
+  1. Right-clicking Terminal Manager project/worktree headers opened no row actions.
+  2. Users had to switch panels or manually locate paths to copy/open project folders.
+- Symptoms/Impact:
+  - Terminal Manager lost Rust's quick path inspection workflow, especially for nested worktrees.
+- Root cause:
+  - The Electron Terminal Manager port implemented header hover buttons but omitted Rust's row context menu.
+- Resolution:
+  - Added a shared Terminal Manager path context menu for root project and worktree headers.
+  - Wired `Copy Path` through clipboard IPC and `Open in Folder` through shell IPC with a Rust-style feedback toast.
+  - Counted the context menu as a Terminal Manager overlay so surrounding wheel/input handling treats it like other foreground popups.
+- Prevent recurrence:
+  - Keep Terminal Manager row actions aligned with Rust header/context-menu actions whenever root/worktree rows change.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Directory ust path aksiyonlari eksikti {#electron-directory-project-path-actions}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Directory panel exposes selected-project `Copy Path`, `Open in Folder`, and `Refresh Directory Index` controls next to the project selector, while Electron's Project Explorer only showed the project name and search field.
+- Error signature:
+  1. Project Explorer had no way to copy the selected project path from the Directory panel.
+  2. Project Explorer had no direct open-folder action.
+  3. Directory refresh required switching projects or reloading instead of a panel-local refresh action.
+- Symptoms/Impact:
+  - Directory panel workflows were slower than Rust for common project path operations.
+- Root cause:
+  - The Electron Project Explorer port focused on lazy tree rendering and search but omitted Rust's selected-project toolbar actions.
+- Resolution:
+  - Added compact icon controls for `Copy Path`, `Open in Folder`, and `Refresh Directory Index`.
+  - Reused the shallow root directory scan for refresh so initial indexing remains lightweight.
+  - Added a small feedback toast matching the existing panel feedback style.
+- Prevent recurrence:
+  - Keep Directory panel header actions aligned with Rust when project selection or directory indexing controls change.
+- Files/Commands touched: `electron/renderer/src/components/ProjectExplorer.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control worktree branch kopyalama eksikti {#electron-source-control-worktree-copy-branch}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust Source Control worktree rows expose a right-click `Copy Branch Name` action, while Electron worktree rows only showed add/remove/delete buttons.
+- Error signature:
+  1. Worktree rows had no context menu.
+  2. Detached worktrees used a generic `(detached)` label instead of Rust's `detached@<short-head>` display fallback.
+  3. Worktree search matched raw branch/path only, not the Rust-style display label.
+- Symptoms/Impact:
+  - Users could not quickly copy a worktree branch name from Source Control.
+  - Detached worktree rows carried less identifying context than the Rust panel.
+- Root cause:
+  - The Electron Source Control worktree list ported row buttons but omitted Rust's worktree label helper and context-menu action.
+- Resolution:
+  - Added shared `sourceControlWorktreeLabel()` with branch-ref stripping, detached short-head fallback, and path basename fallback.
+  - Updated Source Control worktree rows and search to use the shared label.
+  - Added a worktree-row context menu with `Copy Branch Name` and feedback.
+- Prevent recurrence:
+  - Keep worktree row labels and context actions covered in shared source-control helper tests.
+- Files/Commands touched: `electron/shared/sourceControl.ts`, `electron/renderer/src/lib/sourceControl.test.ts`, `electron/renderer/src/components/SourceControl.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Directory expand collapse all kontrolu eksikti {#electron-directory-expand-collapse-all}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Directory panel can expand or collapse all loaded folders from the toolbar, while Electron required toggling folders one by one.
+- Error signature:
+  1. Project Explorer had no expand-all/collapse-all control.
+  2. Loaded lazy subtrees could not be opened or collapsed as a group.
+  3. The action was not disabled during search even though Rust avoids tree-wide open-state changes while search is active.
+- Symptoms/Impact:
+  - Directory navigation remained slower than Rust for moderately nested projects.
+- Root cause:
+  - The Electron tree port implemented lazy row expansion but did not port the toolbar-level open-state action.
+- Resolution:
+  - Added shared directory-tree helpers for loaded directory path collection and collapsed-folder detection.
+  - Added an Expand All / Collapse All toolbar button that keeps the root visible and changes only loaded folder state.
+  - Disabled the action while search text is active.
+- Prevent recurrence:
+  - Added regression tests for loaded directory collection, symlink skip behavior, and collapsed-folder detection.
+- Files/Commands touched: `electron/renderer/src/lib/directoryTree.ts`, `electron/renderer/src/lib/directoryTree.test.ts`, `electron/renderer/src/components/ProjectExplorer.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Directory panelinde proje secici ve kaldirma yoktu {#electron-directory-project-selector-actions}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Directory panel includes a project selector plus Add Project and Remove Project controls, while Electron required using the currently selected project from outside the panel and only showed Add Project when the list was empty.
+- Error signature:
+  1. Directory panel header displayed only the selected project name.
+  2. Users could not switch projects directly from Directory.
+  3. Add Project and Remove Project were not available from the active Directory panel.
+  4. Directory search placeholder said `Search files...` instead of Rust's `Search files and folders`.
+- Symptoms/Impact:
+  - Directory navigation and project management were less efficient than the Rust UI.
+- Root cause:
+  - The Electron Project Explorer component was scoped to a single project and did not receive the project list or App-level project management callbacks.
+- Resolution:
+  - Passed project list, selection, add, and remove callbacks from App into Project Explorer.
+  - Replaced the static project header with a compact project selector and Add/Remove controls.
+  - Updated the search placeholder to match Rust wording.
+- Prevent recurrence:
+  - Keep Directory panel project-management actions wired through App-level callbacks so config cleanup remains centralized.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/ProjectExplorer.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control fetch ve klasor acma kontrolleri eksikti {#electron-source-control-fetch-open-folder}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Source Control toolbar has `Refresh Status`, `Fetch and Refresh`, `Open Project Folder`, and `Create Worktree`, while Electron only had refresh and create worktree.
+- Error signature:
+  1. `git:status` could not request `git fetch --all --prune`.
+  2. Source Control fetch/status failures were collapsed into an empty clean-looking result.
+  3. Source Control had no project-folder open button.
+- Symptoms/Impact:
+  - Ahead/behind data could stay stale until the user fetched externally.
+  - Git failures were easy to misread as a clean working tree.
+  - Users had to leave Source Control to open the project folder.
+- Root cause:
+  - The Electron git status IPC was status-only and did not carry Rust's optional fetch step or error surface.
+- Resolution:
+  - Added optional `runFetch` support to `git:status`, using `git fetch --all --prune` before status when requested.
+  - Returned status/fetch errors through `SourceControlStatus.error` and rendered them in the panel.
+  - Added Source Control toolbar buttons for `Open Project Folder` and `Fetch and Refresh`.
+- Prevent recurrence:
+  - Keep Source Control toolbar actions and IPC options aligned with Rust's `request_source_control_refresh(run_fetch, manual)` behavior.
+- Files/Commands touched: `electron/main/worktree.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/components/SourceControl.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10

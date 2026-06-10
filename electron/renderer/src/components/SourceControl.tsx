@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import type { ProjectRecord, GitWorktreeInfo, SourceControlSnapshot, SourceControlStatus } from '../../../shared/types';
-import { sourceControlBranchLine, sourceControlFileAbsolutePath, sourceControlStatusLabel } from '../../../shared/sourceControl';
+import { sourceControlBranchLine, sourceControlFileAbsolutePath, sourceControlStatusLabel, sourceControlWorktreeLabel } from '../../../shared/sourceControl';
 import { repairMojibakeDisplay } from '../lib/mojibake';
-import { sanitizeWorktreeSlug } from '../lib/worktree';
+import { defaultWorktreePathForBranch } from '../lib/worktree';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).mergenApi;
 
@@ -15,27 +15,43 @@ interface SourceControlProps {
   registeredWorktreePaths?: string[];
   onOrphanWorktrees?: (paths: string[]) => void;
   onBranchChange?: (branch: string) => void;
+  autoOpenCreateRequestId?: number;
 }
 
-export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWorktree, onRemoveWorktree, onDeleteGitWorktree, hasLiveTerminals, registeredWorktreePaths, onOrphanWorktrees, onBranchChange }) => {
+export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWorktree, onRemoveWorktree, onDeleteGitWorktree, hasLiveTerminals, registeredWorktreePaths, onOrphanWorktrees, onBranchChange, autoOpenCreateRequestId }) => {
   const [snapshot, setSnapshot] = useState<SourceControlSnapshot>({ loading: true, files: [], worktrees: [] });
   const [query, setQuery] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [createBranch, setCreateBranch] = useState('');
   const [createBaseBranch, setCreateBaseBranch] = useState('');
   const [createLoading, setCreateLoading] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [fileContextMenu, setFileContextMenu] = useState<{ x: number; y: number; filePath: string; relativePath: string } | null>(null);
+  const [worktreeContextMenu, setWorktreeContextMenu] = useState<{ x: number; y: number; branchName: string } | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const feedbackTimerRef = useRef<number | null>(null);
+  const lastAutoOpenCreateRequestRef = useRef<number | undefined>(undefined);
 
-  const refresh = useCallback(async (manual = false) => {
+  const showFeedback = useCallback((message: string) => {
+    setFeedback(message);
+    if (feedbackTimerRef.current !== null) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setFeedback(null);
+      feedbackTimerRef.current = null;
+    }, 1600);
+  }, []);
+
+  const refresh = useCallback(async (manual = false, runFetch = false) => {
     if (manual) {
       setSnapshot((prev) => ({ ...prev, loading: true }));
     }
-    const result = await api.invoke('git:status', project.path) as SourceControlStatus;
+    const result = await api.invoke('git:status', project.path, runFetch) as SourceControlStatus;
     const worktrees = await api.invoke('git:discoverWorktrees', project.path) as GitWorktreeInfo[];
     setSnapshot({
       loading: false,
+      error: result.error,
       files: result.files,
       worktrees: worktrees.filter((w) => w.path !== project.path),
       branch: result.branch,
@@ -43,7 +59,10 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
       behind: result.behind,
       lastUpdated: Date.now(),
     });
-  }, [project.path]);
+    if (runFetch) {
+      showFeedback(result.error ?? 'Fetched and refreshed source control');
+    }
+  }, [project.path, showFeedback]);
 
   useEffect(() => {
     refresh();
@@ -64,9 +83,12 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
   }, []);
 
   useEffect(() => {
-    if (!fileContextMenu) return undefined;
+    if (!fileContextMenu && !worktreeContextMenu) return undefined;
 
-    const closeMenu = () => setFileContextMenu(null);
+    const closeMenu = () => {
+      setFileContextMenu(null);
+      setWorktreeContextMenu(null);
+    };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape') closeMenu();
     };
@@ -76,18 +98,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
       window.removeEventListener('click', closeMenu);
       window.removeEventListener('keydown', closeOnEscape);
     };
-  }, [fileContextMenu]);
-
-  const showFeedback = useCallback((message: string) => {
-    setFeedback(message);
-    if (feedbackTimerRef.current !== null) {
-      window.clearTimeout(feedbackTimerRef.current);
-    }
-    feedbackTimerRef.current = window.setTimeout(() => {
-      setFeedback(null);
-      feedbackTimerRef.current = null;
-    }, 1600);
-  }, []);
+  }, [fileContextMenu, worktreeContextMenu]);
 
   // Orphan worktree cleanup: auto-remove registered worktrees that no longer exist
   useEffect(() => {
@@ -124,9 +135,27 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
   const filteredWorktrees = snapshot.worktrees.filter((w) => {
     if (!query) return true;
     const q = query.toLowerCase();
-    return w.branch.toLowerCase().includes(q) || w.path.toLowerCase().includes(q);
+    return sourceControlWorktreeLabel(w).toLowerCase().includes(q) || w.path.toLowerCase().includes(q);
   });
   const branchLine = sourceControlBranchLine(snapshot);
+  const createWorktreePath = createBranch.trim()
+    ? defaultWorktreePathForBranch(project.path, createBranch.trim())
+    : '';
+  const unregisteredWorktrees = snapshot.worktrees.filter((w) => !registeredWorktreePaths?.includes(w.path));
+  const openCreateWorktreeModal = useCallback(() => {
+    setCreateBranch('');
+    setCreateBaseBranch(snapshot.branch ?? '');
+    setCreateError(null);
+    setShowCreateModal(true);
+  }, [snapshot.branch]);
+
+  useEffect(() => {
+    if (autoOpenCreateRequestId === undefined) return;
+    if (lastAutoOpenCreateRequestRef.current === autoOpenCreateRequestId) return;
+    if (snapshot.loading) return;
+    lastAutoOpenCreateRequestRef.current = autoOpenCreateRequestId;
+    openCreateWorktreeModal();
+  }, [autoOpenCreateRequestId, snapshot.loading, openCreateWorktreeModal]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', position: 'relative' }}>
@@ -143,7 +172,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
           </span>
         )}
         <button
-          onClick={() => setShowCreateModal(true)}
+          onClick={() => refresh(true)}
           style={{
             marginLeft: 'auto',
             padding: '2px 8px',
@@ -155,11 +184,48 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
             cursor: 'pointer',
             marginRight: 4,
           }}
+          title="Refresh Status"
         >
-          + Worktree
+          ↻
         </button>
         <button
-          onClick={() => refresh(true)}
+          onClick={() => refresh(true, true)}
+          style={{
+            padding: '2px 8px',
+            fontSize: 11,
+            background: '#1a1a1a',
+            border: '1px solid #333',
+            color: '#ccc',
+            borderRadius: 3,
+            cursor: 'pointer',
+            marginRight: 4,
+          }}
+          title="Fetch and Refresh"
+        >
+          ↓
+        </button>
+        <button
+          onClick={() => {
+            api.invoke('shell:showItemInFolder', project.path)
+              .then(() => showFeedback('Opened project folder'))
+              .catch((error) => showFeedback(`Open folder failed: ${error instanceof Error ? error.message : String(error)}`));
+          }}
+          style={{
+            padding: '2px 8px',
+            fontSize: 11,
+            background: '#1a1a1a',
+            border: '1px solid #333',
+            color: '#ccc',
+            borderRadius: 3,
+            cursor: 'pointer',
+            marginRight: 4,
+          }}
+          title="Open Project Folder"
+        >
+          📁
+        </button>
+        <button
+          onClick={openCreateWorktreeModal}
           style={{
             padding: '2px 8px',
             fontSize: 11,
@@ -170,7 +236,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
             cursor: 'pointer',
           }}
         >
-          ↻
+          + Worktree
         </button>
       </div>
       <div style={{ padding: '6px 12px', borderBottom: '1px solid #222' }}>
@@ -193,18 +259,30 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
       </div>
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 0' }}>
         {snapshot.loading && <div style={{ padding: 12, color: '#888', fontSize: 12 }}>Refreshing source control...</div>}
+        {snapshot.error && <div style={{ padding: 12, color: '#ff8a8a', fontSize: 12 }}>{snapshot.error}</div>}
         {!snapshot.loading && snapshot.files.length === 0 && snapshot.worktrees.length === 0 && (
-          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>Working tree clean.</div>
+          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>{snapshot.error ? 'Status unavailable.' : 'Working tree clean.'}</div>
         )}
 
         {filteredWorktrees.length > 0 && (
           <div style={{ marginBottom: 8 }}>
             <div style={{ padding: '4px 12px', fontSize: 11, color: '#888', fontWeight: 600 }}>Worktrees</div>
-            {filteredWorktrees.map((w) => (
-              <div key={w.path} style={{ padding: '3px 12px', display: 'flex', alignItems: 'center', gap: 6 }}>
+            {filteredWorktrees.map((w) => {
+              const worktreeLabel = sourceControlWorktreeLabel(w);
+              return (
+              <div
+                key={w.path}
+                style={{ padding: '3px 12px', display: 'flex', alignItems: 'center', gap: 6, cursor: 'context-menu' }}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setFileContextMenu(null);
+                  setWorktreeContextMenu({ x: event.clientX, y: event.clientY, branchName: worktreeLabel });
+                }}
+              >
                 <span style={{ fontSize: 10 }}>🌿</span>
                 <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {repairMojibakeDisplay(w.branch || '(detached)')}
+                  {repairMojibakeDisplay(worktreeLabel)}
                 </span>
                 <span style={{ fontSize: 10, color: '#666' }}>{repairMojibakeDisplay(w.path)}</span>
                 {registeredWorktreePaths?.includes(w.path) ? (
@@ -243,7 +321,8 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
                   Delete Git Worktree
                 </button>
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -259,6 +338,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
                 onContextMenu={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
+                  setWorktreeContextMenu(null);
                   setFileContextMenu({ x: event.clientX, y: event.clientY, filePath, relativePath: f.path });
                 }}
               >
@@ -321,6 +401,24 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
           </button>
         </div>
       )}
+      {worktreeContextMenu && (
+        <div
+          className="source-control-context-menu"
+          style={{ left: worktreeContextMenu.x, top: worktreeContextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              api.invoke('clipboard:writeText', worktreeContextMenu.branchName).catch(() => {});
+              showFeedback(`Copied branch name '${worktreeContextMenu.branchName}'`);
+              setWorktreeContextMenu(null);
+            }}
+          >
+            Copy Branch Name
+          </button>
+        </div>
+      )}
       {/* Create Worktree Modal */}
       {showCreateModal && (
         <div
@@ -334,7 +432,10 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
             zIndex: 1000,
           }}
           onClick={(e) => {
-            if (e.target === e.currentTarget) setShowCreateModal(false);
+            if (!createLoading && e.target === e.currentTarget) {
+              setCreateError(null);
+              setShowCreateModal(false);
+            }
           }}
         >
           <div
@@ -352,17 +453,54 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
           >
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <span style={{ fontSize: 14, fontWeight: 600, color: '#eee' }}>Create Worktree</span>
-              <button onClick={() => setShowCreateModal(false)} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 14 }}>
+              <button
+                disabled={createLoading}
+                onClick={() => {
+                  setCreateError(null);
+                  setShowCreateModal(false);
+                }}
+                style={{ background: 'transparent', border: 'none', color: '#888', cursor: createLoading ? 'not-allowed' : 'pointer', fontSize: 14, opacity: createLoading ? 0.5 : 1 }}
+              >
                 ✕
               </button>
             </div>
+
+            {unregisteredWorktrees.length > 0 && (
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>Existing worktrees not in Mergen</div>
+                <div style={{ maxHeight: 120, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {unregisteredWorktrees.map((w) => (
+                    <div key={w.path} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', background: '#1a1a1a', borderRadius: 4 }}>
+                      <span style={{ fontSize: 11, color: '#aaa', flex: 1 }}>{repairMojibakeDisplay(w.branch || '(detached)')}</span>
+                      <span style={{ fontSize: 10, color: '#666' }}>{repairMojibakeDisplay(w.path)}</span>
+                      <button
+                        disabled={createLoading}
+                        onClick={() => {
+                          onAddWorktree?.(w);
+                        }}
+                        style={{ fontSize: 10, padding: '2px 6px', background: '#1a1a1a', border: '1px solid #333', color: '#ccc', borderRadius: 3, cursor: createLoading ? 'not-allowed' : 'pointer', opacity: createLoading ? 0.5 : 1 }}
+                      >
+                        Add to Mergen
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ borderTop: '1px solid #333', marginTop: 8, paddingTop: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>Or create new worktree</div>
+                </div>
+              </div>
+            )}
 
             <div>
               <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>Branch name</div>
               <input
                 type="text"
                 value={createBranch}
-                onChange={(e) => setCreateBranch(e.target.value)}
+                onChange={(e) => {
+                  setCreateBranch(e.target.value);
+                  setCreateError(null);
+                }}
+                disabled={createLoading}
                 placeholder="feature/my-branch"
                 style={{
                   width: '100%',
@@ -373,6 +511,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
                   fontSize: 12,
                   borderRadius: 4,
                   outline: 'none',
+                  opacity: createLoading ? 0.7 : 1,
                 }}
               />
             </div>
@@ -382,8 +521,12 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
               <input
                 type="text"
                 value={createBaseBranch}
-                onChange={(e) => setCreateBaseBranch(e.target.value)}
-                placeholder="main"
+                onChange={(e) => {
+                  setCreateBaseBranch(e.target.value);
+                  setCreateError(null);
+                }}
+                disabled={createLoading}
+                placeholder="main or origin/main"
                 style={{
                   width: '100%',
                   background: '#1a1a1a',
@@ -393,17 +536,18 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
                   fontSize: 12,
                   borderRadius: 4,
                   outline: 'none',
+                  opacity: createLoading ? 0.7 : 1,
                 }}
               />
             </div>
 
             <div>
-              <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>Path</div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>Worktree path (auto)</div>
               <input
                 type="text"
                 readOnly
-                value={createBranch ? `../worktrees/${sanitizeWorktreeSlug(createBranch)}` : ''}
-                placeholder="Auto-generated from branch name"
+                value={createWorktreePath}
+                placeholder="auto-generated from branch"
                 style={{
                   width: '100%',
                   background: '#1a1a1a',
@@ -417,56 +561,47 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
               />
             </div>
 
-            {/* Existing unregistered worktrees */}
-            {snapshot.worktrees.filter((w) => !registeredWorktreePaths?.includes(w.path)).length > 0 && (
-              <div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>Existing unregistered worktrees</div>
-                <div style={{ maxHeight: 120, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
-                  {snapshot.worktrees
-                    .filter((w) => !registeredWorktreePaths?.includes(w.path))
-                    .map((w) => (
-                      <div key={w.path} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', background: '#1a1a1a', borderRadius: 4 }}>
-                        <span style={{ fontSize: 11, color: '#aaa', flex: 1 }}>{repairMojibakeDisplay(w.branch || '(detached)')}</span>
-                        <span style={{ fontSize: 10, color: '#666' }}>{repairMojibakeDisplay(w.path)}</span>
-                        <button
-                          onClick={() => {
-                            onAddWorktree?.(w);
-                          }}
-                          style={{ fontSize: 10, padding: '2px 6px', background: '#1a1a1a', border: '1px solid #333', color: '#ccc', borderRadius: 3, cursor: 'pointer' }}
-                        >
-                          Add to Mergen
-                        </button>
-                      </div>
-                    ))}
-                </div>
-              </div>
-            )}
+            {createError ? (
+              <div style={{ color: '#ff8a8a', fontSize: 12 }}>{createError}</div>
+            ) : createLoading ? (
+              <div style={{ color: '#888', fontSize: 12 }}>Creating worktree...</div>
+            ) : null}
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 4 }}>
               <button
-                onClick={() => setShowCreateModal(false)}
-                style={{ padding: '6px 16px', fontSize: 12, background: 'transparent', border: '1px solid #333', color: '#ccc', borderRadius: 4, cursor: 'pointer' }}
+                disabled={createLoading}
+                onClick={() => {
+                  setCreateError(null);
+                  setShowCreateModal(false);
+                }}
+                style={{ padding: '6px 16px', fontSize: 12, background: 'transparent', border: '1px solid #333', color: '#ccc', borderRadius: 4, cursor: createLoading ? 'not-allowed' : 'pointer', opacity: createLoading ? 0.5 : 1 }}
               >
                 Cancel
               </button>
               <button
-                disabled={!createBranch || createLoading}
+                disabled={!createBranch.trim() || !createWorktreePath || createLoading}
                 onClick={async () => {
-                  if (!createBranch) return;
+                  const branch = createBranch.trim();
+                  const baseBranch = createBaseBranch.trim();
+                  if (!branch || !createWorktreePath) return;
                   setCreateLoading(true);
-                  const slug = sanitizeWorktreeSlug(createBranch);
-                  const parentDir = project.path.replace(/[\\/][^\\/]+$/, '');
-                  const wtPath = parentDir + '/' + 'worktrees/' + slug;
-                  const ok = await api.invoke('git:createWorktree', project.path, createBranch, wtPath, createBaseBranch || undefined) as boolean;
-                  setCreateLoading(false);
-                  if (ok) {
-                    onAddWorktree?.({ path: wtPath, branch: createBranch, head: '', detached: false, locked: false, prunable: false });
-                    setShowCreateModal(false);
-                    setCreateBranch('');
-                    setCreateBaseBranch('');
-                    refresh(true);
-                  } else {
-                    alert('Failed to create worktree. Check if the branch already exists or the path is valid.');
+                  setCreateError(null);
+                  try {
+                    const ok = await api.invoke('git:createWorktree', project.path, branch, createWorktreePath, baseBranch || undefined) as boolean;
+                    if (ok) {
+                      onAddWorktree?.({ path: createWorktreePath, branch, head: '', detached: false, locked: false, prunable: false });
+                      setShowCreateModal(false);
+                      setCreateBranch('');
+                      setCreateBaseBranch('');
+                      setCreateError(null);
+                      refresh(true);
+                    } else {
+                      setCreateError('Failed to create worktree. Check if the branch already exists or the path is valid.');
+                    }
+                  } catch (error) {
+                    setCreateError(`Failed to create worktree: ${error instanceof Error ? error.message : String(error)}`);
+                  } finally {
+                    setCreateLoading(false);
                   }
                 }}
                 style={{
@@ -476,11 +611,11 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
                   border: '1px solid #1f3a4c',
                   color: '#ccc',
                   borderRadius: 4,
-                  cursor: !createBranch || createLoading ? 'not-allowed' : 'pointer',
-                  opacity: !createBranch || createLoading ? 0.5 : 1,
+                  cursor: !createBranch.trim() || !createWorktreePath || createLoading ? 'not-allowed' : 'pointer',
+                  opacity: !createBranch.trim() || !createWorktreePath || createLoading ? 0.5 : 1,
                 }}
               >
-                {createLoading ? 'Creating...' : 'Create'}
+                {createLoading ? 'Creating...' : 'Create Worktree'}
               </button>
             </div>
           </div>

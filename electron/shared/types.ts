@@ -742,6 +742,7 @@ export interface SourceControlStatus {
   branch: string;
   ahead: number;
   behind: number;
+  error?: string;
 }
 
 export interface AcpChatSession {
@@ -862,7 +863,7 @@ export interface IpcChannels {
 
   // Git / Worktree
   'git:diffSummary': (repoPath: string) => Promise<GitDiffSummary>;
-  'git:status': (repoPath: string) => Promise<SourceControlStatus>;
+  'git:status': (repoPath: string, runFetch?: boolean) => Promise<SourceControlStatus>;
   'git:discoverWorktrees': (repoPath: string) => Promise<GitWorktreeInfo[]>;
   'git:createWorktree': (repoPath: string, branch: string, worktreePath: string, baseBranch?: string) => Promise<boolean>;
   'git:removeWorktree': (repoPath: string, worktreePath: string) => Promise<boolean>;

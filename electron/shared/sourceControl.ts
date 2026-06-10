@@ -1,4 +1,4 @@
-import type { SourceControlFile } from './types';
+import type { GitWorktreeInfo, SourceControlFile } from './types';
 
 export interface BranchStatus {
   branch: string;
@@ -99,4 +99,14 @@ export function sourceControlFileAbsolutePath(projectPath: string, filePath: str
   const root = projectPath.replace(/[\\/]+$/, '');
   const relative = filePath.replace(/^[\\/]+/, '');
   return `${root}${separator}${relative}`;
+}
+
+export function sourceControlWorktreeLabel(worktree: Pick<GitWorktreeInfo, 'path' | 'branch' | 'head' | 'detached'>): string {
+  const branch = worktree.branch.replace(/^refs\/heads\//, '').trim();
+  if (branch) return branch;
+  if (worktree.detached) {
+    const short = worktree.head ? worktree.head.slice(-8) : 'detached';
+    return `detached@${short}`;
+  }
+  return worktree.path.split(/[\\/]/).filter(Boolean).at(-1) || worktree.path;
 }

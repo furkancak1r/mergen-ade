@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseGitWorktreeList, sanitizeWorktreeSlug } from './worktree';
+import { defaultWorktreePathForBranch, parseGitWorktreeList, sanitizeWorktreeSlug } from './worktree';
 
 describe('parseGitWorktreeList', () => {
   it('parses normal worktrees', () => {
@@ -80,5 +80,12 @@ prunable`;
     expect(sanitizeWorktreeSlug('release.v1')).toBe('release.v1');
     expect(sanitizeWorktreeSlug('fix..bug')).toBe('fix-bug');
     expect(sanitizeWorktreeSlug('özellik/çağrı')).toBe('özellik-çağrı');
+  });
+
+  it('builds default worktree paths like the Rust app', () => {
+    expect(defaultWorktreePathForBranch('/repos/main-app', 'feature/foo')).toBe('/repos/worktrees/feature-foo');
+    expect(defaultWorktreePathForBranch('C:\\Repos\\main-app', 'Feature/Foo Bar')).toBe('C:\\Repos\\worktrees\\feature-foo-bar');
+    expect(defaultWorktreePathForBranch('C:\\repo', 'bugfix')).toBe('C:\\worktrees\\bugfix');
+    expect(defaultWorktreePathForBranch('repo', 'release.v1')).toBe('repo/worktrees/release.v1');
   });
 });

@@ -199,8 +199,8 @@ export function registerIpcHandlers() {
   ipcMain.handle('git:diffSummary', async (_event, repoPath: string) => {
     return getGitDiffSummary(repoPath);
   });
-  ipcMain.handle('git:status', async (_event, repoPath: string) => {
-    return getGitStatus(repoPath);
+  ipcMain.handle('git:status', async (_event, repoPath: string, runFetch?: boolean) => {
+    return getGitStatus(repoPath, Boolean(runFetch));
   });
   ipcMain.handle('git:discoverWorktrees', async (_event, repoPath: string) => {
     return discoverWorktrees(repoPath);
