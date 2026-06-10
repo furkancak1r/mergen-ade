@@ -5,6 +5,7 @@ import { computeTileGrid } from '../lib/layout';
 import type { TerminalInstance } from '../hooks/usePty';
 import type { SmartInputState, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
 import { AiCliTool as AiCliToolEnum } from '../../../shared/types';
+import { claudeCodexHookProgressText, type ClaudeCodexHookProgress } from '../../../shared/claudeCodexHook';
 import type { SmartInputModeId } from '../lib/smartInputMode';
 import { shouldShowSmartInputFooter } from '../lib/smartInput';
 
@@ -92,12 +93,17 @@ export const MainArea: React.FC<MainAreaProps> = ({ terminals, activeTerminalId,
     >
       {terminals.map((t) => {
         const isActive = t.id === activeTerminalId;
-        const showSmartInput = shouldShowSmartInputFooter(t.kind, t.aiTool, t.aiStatus, t.opencodeSessionActive);
+        const showSmartInput = shouldShowSmartInputFooter(t.kind, t.aiTool, t.aiStatus, t.opencodeSessionActive, t.claudeLaunchPending);
         const modeControlsVisible = t.aiTool === AiCliToolEnum.OpenCode;
         return (
           <div key={t.id} className="tile-cell" style={{ minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-            <div style={{ flex: 1, minHeight: 0 }}>
-              <TerminalPane terminalId={t.id} projectId={t.projectId} active={isActive} onClick={() => onTerminalClick(t.id)} onTerminalOutputClick={() => onTerminalOutputClick?.(t.id)} wheelEnabled={wheelEnabled} isOpenCodeActive={t.aiTool === 'opencode' && t.opencodeSessionActive} opencodeManualScrollDetached={t.opencodeManualScrollDetached} opencodeLeadingBlankRows={t.opencodeLeadingBlankRows} onScrollDetached={(detached) => onScrollDetached?.(t.id, detached)} />
+            <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+              {t.claudeCodexHookProgress && (
+                <ClaudeCodexHookProgressBand progress={t.claudeCodexHookProgress} />
+              )}
+              <div style={{ flex: 1, minHeight: 0 }}>
+                <TerminalPane terminalId={t.id} projectId={t.projectId} active={isActive} onClick={() => onTerminalClick(t.id)} onTerminalOutputClick={() => onTerminalOutputClick?.(t.id)} wheelEnabled={wheelEnabled} isOpenCodeActive={t.aiTool === 'opencode' && t.opencodeSessionActive} opencodeManualScrollDetached={t.opencodeManualScrollDetached} opencodeLeadingBlankRows={t.opencodeLeadingBlankRows} onScrollDetached={(detached) => onScrollDetached?.(t.id, detached)} />
+              </div>
             </div>
             {showSmartInput && (
               <SmartInputFooter
@@ -121,3 +127,34 @@ export const MainArea: React.FC<MainAreaProps> = ({ terminals, activeTerminalId,
     </div>
   );
 };
+
+function ClaudeCodexHookProgressBand({ progress }: { progress: ClaudeCodexHookProgress }) {
+  const accent = progress.phase === 'blocked'
+    ? '#dc5050'
+    : progress.phase === 'awaiting_implementation'
+      ? '#78be91'
+      : '#60a5fa';
+  return (
+    <div
+      title={progress.planPath ? `Plan file: ${progress.planPath}` : progress.error}
+      style={{
+        height: 24,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        padding: '0 10px',
+        background: '#12181f',
+        borderBottom: '1px solid #263241',
+        borderLeft: `3px solid ${accent}`,
+        color: '#d8dee9',
+        fontSize: 11,
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+      }}
+    >
+      <span style={{ width: 6, height: 6, borderRadius: '50%', background: accent, flexShrink: 0 }} />
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{claudeCodexHookProgressText(progress)}</span>
+    </div>
+  );
+}

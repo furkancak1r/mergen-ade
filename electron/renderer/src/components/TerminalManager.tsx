@@ -6,6 +6,7 @@ import { gitDiffSummaryLabel } from '../../../shared/gitDiffSummary';
 import type { TerminalInstance } from '../hooks/usePty';
 import { OPENCODE_ACP_CLOSE_TOOLTIP, OPENCODE_ACP_LABEL, OPENCODE_ACP_OPEN_BUTTON_LABEL } from '../lib/acpUi';
 import { effectiveLauncherCommand } from '../lib/launcher';
+import { effectiveAiStatusForDisplay } from '../lib/smartInput';
 import { terminalManagerPathMenuLabel } from '../lib/terminalManagerState';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
@@ -74,6 +75,7 @@ interface TerminalManagerProps {
   activeTerminalId: number | null;
   onActivateTerminal: (id: number) => void;
   onSpawnTerminal: (projectId: number, kind: TerminalKind) => Promise<number>;
+  onMarkClaudeLaunchPending?: (terminalId: number, title?: string) => void;
   onKillTerminal: (id: number) => void;
   rerunBackground: (terminalId: number) => void;
   sendSavedMessageToTerminal?: (terminalId: number, message: string, recordRecentInput: boolean) => void;
@@ -96,6 +98,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   activeTerminalId,
   onActivateTerminal,
   onSpawnTerminal,
+  onMarkClaudeLaunchPending,
   onKillTerminal,
   rerunBackground,
   sendSavedMessageToTerminal,
@@ -414,6 +417,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 activeTerminalId={activeTerminalId}
                 onActivate={onActivateTerminal}
                 onSpawn={onSpawnTerminal}
+                onMarkClaudeLaunchPending={onMarkClaudeLaunchPending}
                 onKill={onKillTerminal}
                 showSavedMessages={showSavedMessages}
                 setShowSavedMessages={setShowSavedMessages}
@@ -465,6 +469,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                     activeTerminalId={activeTerminalId}
                     onActivate={onActivateTerminal}
                     onSpawn={onSpawnTerminal}
+                    onMarkClaudeLaunchPending={onMarkClaudeLaunchPending}
                     onKill={onKillTerminal}
                     showSavedMessages={showSavedMessages}
                     setShowSavedMessages={setShowSavedMessages}
@@ -701,6 +706,7 @@ interface ProjectGroupProps {
   activeTerminalId: number | null;
   onActivate: (id: number) => void;
   onSpawn: (projectId: number, kind: TerminalKind) => Promise<number>;
+  onMarkClaudeLaunchPending?: (terminalId: number, title?: string) => void;
   onKill: (id: number) => void;
   showSavedMessages: number | null;
   setShowSavedMessages: (id: number | null) => void;
@@ -740,6 +746,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   activeTerminalId,
   onActivate,
   onSpawn,
+  onMarkClaudeLaunchPending,
   onKill,
   showSavedMessages,
   setShowSavedMessages,
@@ -958,6 +965,9 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                       }
                       const targetId = await onSpawn(project.id, TerminalKindEnum.Foreground);
                       if (targetId) {
+                        if (l.builtin === BuiltinLauncherKind.Claude) {
+                          onMarkClaudeLaunchPending?.(targetId, l.launchCommand || cmd);
+                        }
                         const isSlash = cmd.startsWith('/');
                         await api.invoke('pty:write', targetId, '\x1b[200~' + cmd + '\x1b[201~');
                         await api.invoke('pty:write', targetId, '\r');
@@ -1197,6 +1207,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             const active = t.id === activeTerminalId;
             const hovered = hoveredRow === t.id;
             const rowChrome = terminalManagerRowChrome(active, hovered);
+            const displayAiStatus = effectiveAiStatusForDisplay(t.aiTool, t.aiStatus, t.claudeLaunchPending);
             return (
               <div
                 key={t.id}
@@ -1230,7 +1241,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   width: 6,
                   height: 6,
                   borderRadius: '50%',
-                  background: t.aiStatus === 'running' ? '#64c864' : t.aiStatus === 'attention' ? '#e8a838' : '#666',
+                  background: displayAiStatus === 'running' ? '#64c864' : displayAiStatus === 'attention' ? '#e8a838' : '#666',
                   flexShrink: 0,
                   zIndex: 1,
                 }} />
@@ -1286,9 +1297,9 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                             alignItems: 'center',
                             justifyContent: 'center',
                           }}
-                          title={t.aiStatus === 'running' ? 'Interrupt' : 'Rerun'}
+                          title={displayAiStatus === 'running' ? 'Interrupt' : 'Rerun'}
                         >
-                          {t.aiStatus === 'running' ? '✕' : '↻'}
+                          {displayAiStatus === 'running' ? '✕' : '↻'}
                         </button>
                       )}
                       {t.kind === 'foreground' && t.recentInputs.length > 0 && (

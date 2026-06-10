@@ -3,6 +3,7 @@ import {
   isStaleOpencodeCompletion,
   canAutoDispatch,
   canAutoDispatchClaude,
+  effectiveAiStatusForDisplay,
   smartInputFooterHeight,
   selectionEdgeAutoscrollDelta,
   shouldShowSmartInputFooter,
@@ -150,6 +151,7 @@ describe('smartInput', () => {
       expect(shouldShowSmartInputFooter('foreground', 'opencode', 'running', true)).toBe(true);
       expect(shouldShowSmartInputFooter('foreground', 'claude', 'running', false)).toBe(true);
       expect(shouldShowSmartInputFooter('foreground', 'claude', 'attention', false)).toBe(true);
+      expect(shouldShowSmartInputFooter('foreground', 'claude', 'inactive', false, true)).toBe(true);
     });
 
     it('hides Smart Input for inactive/background terminals and inactive OpenCode sessions', () => {
@@ -157,6 +159,15 @@ describe('smartInput', () => {
       expect(shouldShowSmartInputFooter('foreground', 'claude', 'inactive', false)).toBe(false);
       expect(shouldShowSmartInputFooter('foreground', 'opencode', 'attention', false)).toBe(false);
       expect(shouldShowSmartInputFooter('foreground', 'codex', 'attention', false)).toBe(false);
+    });
+  });
+
+  describe('effectiveAiStatusForDisplay', () => {
+    it('shows a pending Claude launcher as running without changing stored status semantics', () => {
+      expect(effectiveAiStatusForDisplay('claude', 'inactive', true)).toBe('running');
+      expect(effectiveAiStatusForDisplay('claude', 'attention', true)).toBe('attention');
+      expect(effectiveAiStatusForDisplay('opencode', 'inactive', true)).toBe('inactive');
+      expect(effectiveAiStatusForDisplay(undefined, undefined, true)).toBe('inactive');
     });
   });
 

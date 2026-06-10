@@ -1,5 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react';
+import { AiCliTool as AiCliToolEnum } from '../../../shared/types';
 import type { TerminalKind, ShellKind, AiHookEvent, AiCliTool, AiCliAttentionKind, SmartInputState, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
+import type { ClaudeCodexHookProgress } from '../../../shared/claudeCodexHook';
 import type { SmartInputModeId } from '../lib/smartInputMode';
 import { normalizeSmartInputModeId, shouldSendOpenCodeModeToggle } from '../lib/smartInputMode';
 import { canAutoDispatchClaude } from '../lib/smartInput';
@@ -25,6 +27,8 @@ export interface TerminalInstance {
   aiStatus: string;
   aiStatusReason?: string;
   aiAttentionKind?: AiCliAttentionKind;
+  claudeLaunchPending: boolean;
+  claudeCodexHookProgress?: ClaudeCodexHookProgress;
   opencodeSessionActive: boolean;
   opencodeTransportStatus?: string;
   opencodeAttentionReason?: string;
@@ -99,6 +103,8 @@ export function usePty() {
       pendingInputForHistory: '',
       recentInputs: [],
       aiStatus: 'inactive',
+      claudeLaunchPending: false,
+      claudeCodexHookProgress: undefined,
       opencodeSessionActive: false,
       opencodeQuestionFocusIndex: 0,
       opencodeQuestionSelectedOptions: [],
@@ -123,6 +129,21 @@ export function usePty() {
   const writeTerminal = useCallback((terminalId: number, data: string) => {
     api.invoke('pty:write', terminalId, data);
   }, []);
+
+  const markClaudeLaunchPending = useCallback((terminalId: number, title?: string) => {
+    const t = terminalsRef.current.get(terminalId);
+    if (!t) return;
+    t.aiTool = AiCliToolEnum.Claude;
+    t.aiStatus = 'inactive';
+    t.aiStatusReason = undefined;
+    t.aiAttentionKind = undefined;
+    t.claudeLaunchPending = true;
+    t.opencodePromptSubmitSince = undefined;
+    if (title?.trim()) {
+      t.title = title.trim();
+    }
+    notify();
+  }, [notify]);
 
   const resizeTerminal = useCallback((terminalId: number, cols: number, rows: number) => {
     const t = terminalsRef.current.get(terminalId);
@@ -351,8 +372,11 @@ export function usePty() {
         const isWorking = event.status === 'running' || event.status === 'attention';
         if (isWorking) t.opencodeSessionActive = true;
       }
-      if (event.tool === 'claude' && event.status === 'running') {
-        t.aiAttentionKind = undefined;
+      if (event.tool === 'claude') {
+        t.claudeLaunchPending = false;
+        if (event.status === 'running') {
+          t.aiAttentionKind = undefined;
+        }
       }
       notify();
     });
@@ -529,6 +553,13 @@ export function usePty() {
     notify();
   }, [notify]);
 
+  const updateClaudeCodexHookProgress = useCallback((terminalId: number, progress?: ClaudeCodexHookProgress) => {
+    const t = terminalsRef.current.get(terminalId);
+    if (!t) return;
+    t.claudeCodexHookProgress = progress;
+    notify();
+  }, [notify]);
+
   const pushRecentInput = useCallback((terminalId: number, message: string) => {
     const t = terminalsRef.current.get(terminalId);
     if (!t) return;
@@ -554,6 +585,7 @@ export function usePty() {
     if (t.aiTool === 'claude') {
       t.aiStatus = 'running';
       t.aiAttentionKind = undefined;
+      t.claudeLaunchPending = false;
     }
 
     // Clear previous delayed enters
@@ -585,6 +617,7 @@ export function usePty() {
     if (t.aiTool === 'claude') {
       t.aiStatus = 'running';
       t.aiAttentionKind = undefined;
+      t.claudeLaunchPending = false;
     }
 
     // Clear previous delayed enters
@@ -614,6 +647,17 @@ export function usePty() {
     const t = terminalsRef.current.get(terminalId);
     if (!t) return;
     const now = Date.now();
+
+    // Track prompt submit for settle guard
+    t.opencodePromptSubmitSince = now;
+    if (t.aiTool === 'opencode') {
+      t.opencodeTransportStatus = 'Working';
+    }
+    if (t.aiTool === 'claude') {
+      t.aiStatus = 'running';
+      t.aiAttentionKind = undefined;
+      t.claudeLaunchPending = false;
+    }
 
     // Clear previous delayed enters
     t.pendingDelayedEnters = [];
@@ -664,6 +708,7 @@ export function usePty() {
   return {
     createTerminal,
     writeTerminal,
+    markClaudeLaunchPending,
     resizeTerminal,
     killTerminal,
     getTerminals,
@@ -672,6 +717,7 @@ export function usePty() {
     setTerminalOutputFocusOverride,
     setOpencodeSessionActive,
     updateQuestionState,
+    updateClaudeCodexHookProgress,
     sendSmartInputToTerminal,
     sendShortcutToTerminal,
     sendSavedMessageToTerminal,

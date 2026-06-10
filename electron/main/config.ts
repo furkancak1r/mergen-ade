@@ -175,6 +175,18 @@ function normalizeConfig(config: AppConfig): AppConfig {
     changed = true;
   }
 
+  const legacyClaudeCodexHook = (config as unknown as { claude_code_codex_hook_enabled?: unknown }).claude_code_codex_hook_enabled;
+  if (typeof config.claudeCodeCodexHookEnabled !== 'boolean') {
+    config.claudeCodeCodexHookEnabled = typeof legacyClaudeCodexHook === 'boolean'
+      ? legacyClaudeCodexHook
+      : true;
+    changed = true;
+  }
+  if ('claude_code_codex_hook_enabled' in (config as unknown as Record<string, unknown>)) {
+    delete (config as unknown as Record<string, unknown>).claude_code_codex_hook_enabled;
+    changed = true;
+  }
+
   // Normalize shell for current platform
   const supported = process.platform === 'win32' ? ['powershell', 'cmd'] : ['zsh'];
   const shellVal = config.defaultShell;

@@ -38,6 +38,7 @@ import {
 } from './browserMcpService';
 import { generateOpencodeTerminalConfig, generateOpencodeRuntimeConfig } from './opencode';
 import { getAppDiagnostics } from './diagnostics';
+import { runClaudeCodexPlan, runClaudeCodexReview, updateClaudeCodexUiVerification } from './claudeCodexHook';
 
 export function registerIpcHandlers() {
   // Config
@@ -202,6 +203,15 @@ export function registerIpcHandlers() {
   // Hook answer bridge
   ipcMain.handle('hook:answer', async (_event, answer: { requestId: string; answers: string[]; rejected: boolean }) => {
     submitAnswer(answer);
+  });
+  ipcMain.handle('claudeCodex:runPlan', async (_event, opts) => {
+    return runClaudeCodexPlan(opts);
+  });
+  ipcMain.handle('claudeCodex:runReview', async (_event, opts) => {
+    return runClaudeCodexReview(opts);
+  });
+  ipcMain.handle('claudeCodex:updateUiVerification', async (_event, opts) => {
+    return updateClaudeCodexUiVerification(opts);
   });
 
   // Git / Worktree

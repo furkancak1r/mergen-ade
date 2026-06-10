@@ -5105,3 +5105,124 @@
   - Keep Smart Input tool support in shared helper functions and test OpenCode/Claude visibility plus Claude dispatch gating.
 - Files/Commands touched: `electron/renderer/src/lib/smartInput.ts`, `electron/renderer/src/lib/smartInput.test.ts`, `electron/renderer/src/components/MainArea.tsx`, `electron/renderer/src/components/SmartInputFooter.tsx`, `electron/renderer/src/hooks/usePty.ts`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
 - References: Original Rust Claude Smart Input behavior, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude launcher pending durumu gorunmuyordu {#electron-claude-launcher-pending-parity}
+- Date: 2026-06-11
+- Context: Rust claims Claude ownership immediately when the built-in Claude foreground launcher is used, shows the terminal as live while waiting for the first Claude title signal, and displays the configured launcher command rather than the sanitized bypass wrapper.
+- Error signature:
+  1. Electron foreground Claude launcher terminals stayed visually inactive until Claude emitted an OSC title.
+  2. Smart Input did not become available during the launch-pending window.
+  3. Saved-message sends to Claude did not mark the session as running, leaving queued Smart Input dispatch guards stale.
+- Symptoms/Impact:
+  - Claude launch feedback lagged behind the original Rust app.
+  - Users could see an inactive badge even though the foreground launcher command had already been submitted.
+- Root cause:
+  - Electron only claimed Claude ownership from PTY title detection and did not keep a renderer-side launch-pending state for explicit launcher clicks.
+- Resolution:
+  - Added renderer-side Claude launch-pending state and a `markClaudeLaunchPending` helper.
+  - Wired the built-in Claude launcher to set pending ownership and the configured command title immediately after spawning the foreground terminal.
+  - Treated pending Claude launch as `running` for display/Smart Input visibility while preserving the stored inactive status semantics until a real title event arrives.
+  - Updated saved-message sends to mark Claude as running and clear pending state.
+- Prevent recurrence:
+  - Keep explicit launcher ownership separate from title-detected status, and test display helpers for pending Claude launch semantics.
+- Files/Commands touched: `electron/renderer/src/hooks/usePty.ts`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/components/MainArea.tsx`, `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/smartInput.ts`, `electron/renderer/src/lib/smartInput.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `mark_claude_launch_pending`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude Code Codex hook ayari eksikti {#electron-claude-code-codex-hook-setting-parity}
+- Date: 2026-06-11
+- Context: Rust exposes `claude_code_codex_hook_enabled` in app config, defaults it to enabled, migrates missing configs to enabled, and shows a Settings toggle for the Claude Code Codex plan/review pipeline.
+- Error signature:
+  1. Electron `AppConfig` had no Claude Code Codex hook setting.
+  2. Existing Electron configs could not persist a user choice for this hook.
+  3. Settings had no visible control matching the Rust General settings card.
+- Symptoms/Impact:
+  - Electron could not represent or preserve the Rust hook preference, blocking later parity work for the actual Claude/Codex orchestration flow.
+- Root cause:
+  - The Electron config schema stopped at generic `aiHooks` placeholders and did not include the Rust Claude Code Codex hook toggle.
+- Resolution:
+  - Added `claudeCodeCodexHookEnabled` to Electron `AppConfig` with a default of `true`.
+  - Normalized missing JSON configs to enabled and preserved legacy `claude_code_codex_hook_enabled` values.
+  - Added the Settings > General toggle and regression tests for default/migration behavior.
+- Prevent recurrence:
+  - Keep Electron config schema parity with Rust when adding AI workflow feature flags, including legacy config migration tests.
+- Files/Commands touched: `electron/shared/types.ts`, `electron/main/config.ts`, `electron/main/config.test.ts`, `electron/renderer/src/components/SettingsPopup.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `claude_code_codex_hook_enabled`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude Code Codex hook plan fazi yoktu {#electron-claude-code-codex-hook-plan-phase-parity}
+- Date: 2026-06-11
+- Context: Rust starts a Claude Code Codex hook session for Mergen-submitted Claude prompts by creating `.claude/plans/<session>.md`, running Codex in read-only planning mode, persisting the plan, and sending Claude an implementation prompt that references the plan file.
+- Error signature:
+  1. Electron could toggle the hook setting but did not create plan files.
+  2. Electron Smart Input prompts sent to Claude bypassed the Codex planning step.
+  3. The terminal had no visible hook progress band.
+- Symptoms/Impact:
+  - Enabling the setting did not yet move Electron toward the Rust plan/review workflow.
+  - Users could not see that Codex planning was in progress before Claude implementation.
+- Root cause:
+  - Electron lacked the Claude Code Codex hook service, plan-file renderer, Codex read-only exec runner, and terminal-scoped progress state.
+- Resolution:
+  - Added shared Claude Codex hook helpers for plan rendering, Codex planning prompt construction, Claude implementation prompt construction, and progress labels.
+  - Added a main-process `claudeCodex:runPlan` IPC handler that writes the pending plan file, runs Codex read-only, updates the plan file, and returns the Claude implementation prompt.
+  - Intercepted eligible Claude Smart Input submissions when the hook is enabled and attachment-free, then sent the implementation prompt to Claude after planning.
+  - Added a compact terminal progress band for `Codex planning` / `Claude implementing Codex plan`.
+- Remaining gap:
+  - Electron still needs the later Rust phases: post-implementation test discovery/execution, Codex review, review-fix rounds, and final done/blocked lifecycle.
+- Prevent recurrence:
+  - Keep hook phases covered by shared pure helper tests before wiring additional async lifecycle steps.
+- Files/Commands touched: `electron/shared/claudeCodexHook.ts`, `electron/shared/claudeCodexHook.test.ts`, `electron/main/claudeCodexHook.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `electron/renderer/src/hooks/usePty.ts`, `electron/renderer/src/components/MainArea.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `claude_codex_hook.rs`, `try_start_claude_codex_hook_session`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude Code Codex hook review/fix fazlari eksikti {#electron-claude-code-codex-hook-review-fix-parity}
+- Date: 2026-06-11
+- Context: Rust advances Claude Code Codex hook sessions after Claude returns to idle, runs detected tests, runs read-only Codex review, and either finishes cleanly or sends Claude a scoped fix prompt for actionable P0-P3 findings.
+- Error signature:
+  1. Electron stopped after sending the Codex-planned implementation prompt to Claude.
+  2. Claude `turn_complete` did not advance hook sessions to test/review.
+  3. Codex review findings could not trigger a follow-up Claude fix prompt.
+- Symptoms/Impact:
+  - Electron lacked the main quality gate that differentiates the Rust Claude Code Codex hook from a one-shot planning helper.
+- Root cause:
+  - The Electron hook service did not include test discovery/execution, Codex review prompt generation, actionable finding detection, or renderer lifecycle advancement on Claude turn-complete.
+- Resolution:
+  - Added test discovery for Cargo and npm `lint`/`typecheck`/`test` scripts, plus test result rendering into the plan file.
+  - Added read-only Codex review execution and Rust-style actionable finding detection.
+  - Added `claudeCodex:runReview` IPC and renderer advancement from `awaiting_implementation`/`awaiting_fix` when Claude reports `turn_complete`.
+  - Added fix prompt generation with the Rust three-round remediation limit and progress phases for testing, reviewing, awaiting fix, done, and blocked.
+- Remaining gap:
+  - Electron still does not queue Browser MCP UI verification screenshots after review completion; it writes a plan note for detected UI-facing files instead.
+- Prevent recurrence:
+  - Keep hook lifecycle transitions covered by shared helper tests and preserve the Rust phase names/progress language when adding later UI verification.
+- Files/Commands touched: `electron/shared/claudeCodexHook.ts`, `electron/shared/claudeCodexHook.test.ts`, `electron/main/claudeCodexHook.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `electron/renderer/src/components/MainArea.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `advance_claude_codex_hook_sessions`, `handle_claude_codex_tests_finished`, `handle_claude_codex_review_finished`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude Code Codex hook UI verification kuyrugu eksikti {#electron-claude-code-codex-hook-ui-verification-parity}
+- Date: 2026-06-11
+- Context: Rust queues a Browser visible-area screenshot after a clean Claude Code Codex hook review when UI-facing files changed and a browser URL is known.
+- Error signature:
+  1. Electron detected UI-facing files but left only a pending note in the plan file.
+  2. The Browser panel did not open automatically for hook UI verification.
+  3. The plan file was not updated with the final UI verification outcome.
+- Symptoms/Impact:
+  - Electron users had to manually open Browser and capture screenshots after Codex review, unlike the Rust flow.
+- Root cause:
+  - The Electron review result did not return changed UI-facing files to the renderer and there was no IPC to update the plan file after a renderer-side Browser screenshot attempt.
+- Resolution:
+  - Returned `uiChangedFiles` from `claudeCodex:runReview`.
+  - Added `claudeCodex:updateUiVerification` to replace the pending UI verification note in the plan file.
+  - When a clean review finishes with UI-facing changes, Electron opens the project Browser scope, navigates to the known project URL, requests a visible-area screenshot, downloads it, and writes the outcome into the plan file.
+- Remaining gap:
+  - Electron currently uses project-scoped `browserLastUrl` / active project browser tabs and does not yet mirror Rust's broader project-family URL fallback for all worktrees.
+- Prevent recurrence:
+  - Keep plan-file outcome updates in main-process helpers and add renderer-triggered UI verification coverage before changing hook completion behavior.
+- Files/Commands touched: `electron/main/claudeCodexHook.ts`, `electron/main/claudeCodexHook.test.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/claudeCodexHook.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `try_queue_claude_codex_ui_verification`, Electron parity goal 2026-06-11

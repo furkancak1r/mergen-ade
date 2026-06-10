@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import type { AppConfig, ShellKind, TerminalKind, ProjectRecord, LeftSidebarTab, BrowserScopeKey, SmartInputState, SmartInputAttachment, AiHookEvent, AiCliAttentionKind, TerminalShortcutEntry, BrowserTab, InputHistoryFilter, TerminalManagerFilter, AppHistory } from '../../shared/types';
-import { BrowserScopeKeyType } from '../../shared/types';
+import type { ClaudeCodexPlanResult, ClaudeCodexReviewResult } from '../../shared/claudeCodexHook';
+import { BrowserScopeKeyType, AiCliTool as AiCliToolEnum } from '../../shared/types';
 import { LeftSidebarTab as LeftSidebarTabEnum, defaultAppConfig, defaultAppHistory } from '../../shared/types';
 import { MainArea } from './components/MainArea';
 import { ProjectExplorer } from './components/ProjectExplorer';
@@ -871,8 +872,186 @@ function App() {
   }, [pty]);
 
   const handleSendToTerminal = useCallback((terminalId: number, text: string, attachments: SmartInputAttachment[], modeId: SmartInputModeId) => {
+    const terminal = terminals.find((candidate) => candidate.id === terminalId);
+    const trimmed = text.trim();
+    const project = terminal ? config?.projects.find((candidate) => candidate.id === terminal.projectId) : undefined;
+    const shouldRunClaudeCodexHook = Boolean(
+      config?.claudeCodeCodexHookEnabled
+      && terminal?.aiTool === AiCliToolEnum.Claude
+      && terminal.kind === 'foreground'
+      && trimmed
+      && attachments.length === 0
+      && project?.path
+      && terminal.claudeCodexHookProgress?.phase !== 'planning'
+    );
+
+    if (shouldRunClaudeCodexHook && terminal && project) {
+      pty.updateClaudeCodexHookProgress(terminalId, {
+        phase: 'planning',
+        sessionId: 'pending',
+      });
+      api.invoke('claudeCodex:runPlan', {
+        terminalId,
+        projectPath: project.path,
+        originalPrompt: trimmed,
+      }).then((value) => {
+        const result = value as ClaudeCodexPlanResult;
+        pty.updateClaudeCodexHookProgress(terminalId, {
+          phase: 'awaiting_implementation',
+          sessionId: result.sessionId,
+          planPath: result.planPath,
+          error: result.planError,
+          originalPrompt: trimmed,
+          plan: result.plan,
+          planError: result.planError,
+          reviewRound: 0,
+        });
+        pty.sendSmartInputToTerminal(terminalId, result.implementationPrompt, [], 'build');
+      }).catch((error) => {
+        pty.updateClaudeCodexHookProgress(terminalId, {
+          phase: 'blocked',
+          sessionId: 'failed',
+          error: error instanceof Error ? error.message : String(error),
+        });
+        pty.sendSmartInputToTerminal(terminalId, text, attachments, modeId);
+      });
+      return;
+    }
+
     pty.sendSmartInputToTerminal(terminalId, text, attachments, modeId);
-  }, [pty]);
+  }, [config, pty, terminals]);
+
+  const browserUrlForProject = useCallback((project: ProjectRecord): string | undefined => {
+    const scope = { type: BrowserScopeKeyType.Project, projectId: project.id } as BrowserScopeKey;
+    const tabs = browserTabsByScope.get(scopeKeyString(scope)) ?? [];
+    const activeTabId = browserActiveTabByScope.get(scopeKeyString(scope));
+    const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs.find((tab) => tab.url);
+    return activeTab?.url || project.browserLastUrl;
+  }, [browserActiveTabByScope, browserTabsByScope]);
+
+  const queueClaudeCodexUiVerification = useCallback((project: ProjectRecord, planPath: string, uiChangedFiles: string[]) => {
+    if (uiChangedFiles.length === 0) {
+      return;
+    }
+    const url = browserUrlForProject(project);
+    if (!url) {
+      api.invoke('claudeCodex:updateUiVerification', {
+        planPath,
+        note: 'UI verification tool available, but no browser URL is known for this project.',
+      });
+      return;
+    }
+
+    const scope = { type: BrowserScopeKeyType.Project, projectId: project.id } as BrowserScopeKey;
+    const scopeKey = scopeKeyString(scope);
+    const tabId = `hook-ui-${Date.now()}`;
+    setSelectedProjectId(project.id);
+    setBrowserOpenProjects((prev) => new Set(prev).add(project.id));
+    setBrowserPanelVisibleScopeByProject((prev) => {
+      const copy = new Map(prev);
+      copy.set(project.id, scope);
+      return copy;
+    });
+    setBrowserTabsByScope((prev) => {
+      const copy = new Map(prev);
+      const current = copy.get(scopeKey) ?? [];
+      copy.set(scopeKey, current.length === 0 ? [{ id: tabId, url }] : current);
+      return copy;
+    });
+    setBrowserActiveTabByScope((prev) => {
+      const copy = new Map(prev);
+      const current = browserTabsByScope.get(scopeKey) ?? [];
+      copy.set(scopeKey, current[0]?.id ?? tabId);
+      return copy;
+    });
+    setBrowserUrlDraftByScope((prev) => {
+      const copy = new Map(prev);
+      copy.set(scopeKey, url);
+      return copy;
+    });
+    api.invoke('browser:navigate', { scope, url });
+
+    window.setTimeout(async () => {
+      try {
+        const dataUrl = await api.invoke('browser:screenshot', { scope, fullPage: false }) as string;
+        if (dataUrl) {
+          const link = document.createElement('a');
+          link.href = dataUrl;
+          link.download = `claude-codex-ui-${Date.now()}.png`;
+          link.click();
+        }
+        await api.invoke('claudeCodex:updateUiVerification', {
+          planPath,
+          note: 'UI verification queued: Browser panel opened and a desktop visible-area screenshot was requested. Mobile viewport screenshot is not supported by the current embedded Browser integration.',
+        });
+      } catch (error) {
+        await api.invoke('claudeCodex:updateUiVerification', {
+          planPath,
+          note: `UI verification attempted, but browser screenshot failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }, 900);
+  }, [browserTabsByScope, browserUrlForProject]);
+
+  useEffect(() => {
+    if (!config?.claudeCodeCodexHookEnabled) return;
+    for (const terminal of terminals) {
+      const progress = terminal.claudeCodexHookProgress;
+      if (!progress) continue;
+      if (progress.reviewInFlight) continue;
+      if (progress.phase !== 'awaiting_implementation' && progress.phase !== 'awaiting_fix') continue;
+      if (terminal.aiTool !== AiCliToolEnum.Claude || terminal.aiStatus !== 'attention' || terminal.aiAttentionKind !== 'turn_complete') continue;
+      const submitSince = terminal.opencodePromptSubmitSince ?? 0;
+      if (Date.now() - submitSince < 300) continue;
+      const project = config.projects.find((candidate) => candidate.id === terminal.projectId);
+      if (!project || !progress.planPath || !progress.originalPrompt) continue;
+
+      pty.updateClaudeCodexHookProgress(terminal.id, {
+        ...progress,
+        phase: 'testing',
+        reviewInFlight: true,
+      });
+      api.invoke('claudeCodex:runReview', {
+        terminalId: terminal.id,
+        projectPath: project.path,
+        sessionId: progress.sessionId,
+        planPath: progress.planPath,
+        originalPrompt: progress.originalPrompt,
+        plan: progress.plan,
+        planError: progress.planError,
+        reviewRound: progress.reviewRound ?? 0,
+      }).then((value) => {
+        const result = value as ClaudeCodexReviewResult;
+        if (result.fixPrompt) {
+          pty.updateClaudeCodexHookProgress(terminal.id, {
+            ...progress,
+            phase: 'awaiting_fix',
+            reviewRound: result.reviewRound,
+            reviewInFlight: false,
+          });
+          pty.sendSmartInputToTerminal(terminal.id, result.fixPrompt, [], 'build');
+          return;
+        }
+        if (result.done) {
+          queueClaudeCodexUiVerification(project, result.planPath, result.uiChangedFiles);
+        }
+        pty.updateClaudeCodexHookProgress(terminal.id, {
+          ...progress,
+          phase: result.blockedReason ? 'blocked' : 'done',
+          reviewRound: result.reviewRound,
+          reviewInFlight: false,
+          error: result.blockedReason || result.reviewError,
+        });
+      }).catch((error) => {
+        pty.updateClaudeCodexHookProgress(terminal.id, {
+          ...progress,
+          phase: 'blocked',
+          reviewInFlight: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+  }, [config, pty, queueClaudeCodexUiVerification, terminals]);
 
   const handleUpdateQuestionState = useCallback((terminalId: number, updates: { focusIndex?: number; selectedOptions?: string[]; customText?: string }) => {
     pty.updateQuestionState(terminalId, updates);
@@ -932,7 +1111,7 @@ function App() {
   useEffect(() => {
     const activeTerminal = activeTerminals.find((t) => t.id === activeTerminalId);
     if (!activeTerminal) return;
-    const showSmartInput = shouldShowSmartInputFooter(activeTerminal.kind, activeTerminal.aiTool, activeTerminal.aiStatus, activeTerminal.opencodeSessionActive);
+    const showSmartInput = shouldShowSmartInputFooter(activeTerminal.kind, activeTerminal.aiTool, activeTerminal.aiStatus, activeTerminal.opencodeSessionActive, activeTerminal.claudeLaunchPending);
     if (!showSmartInput) return;
     if (activeTerminal.terminalOutputFocusOverride) return;
     if (activeAcpChat) return;
@@ -1059,6 +1238,7 @@ function App() {
             activeTerminalId={activeTerminalId}
             onActivateTerminal={activateTerminal}
             onSpawnTerminal={spawnTerminal}
+            onMarkClaudeLaunchPending={pty.markClaudeLaunchPending}
             onKillTerminal={killTerminal}
             rerunBackground={pty.rerunBackground}
             sendSavedMessageToTerminal={pty.sendSavedMessageToTerminal}

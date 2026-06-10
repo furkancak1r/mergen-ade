@@ -371,6 +371,20 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
                   <option value="zsh">zsh</option>
                 </select>
               </div>
+              <div style={{ padding: 10, background: '#1a1a1a', border: '1px solid #262626', borderRadius: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={draft.claudeCodeCodexHookEnabled}
+                    onChange={(e) => setDraft((prev) => ({ ...prev, claudeCodeCodexHookEnabled: e.target.checked }))}
+                    id="claudeCodeCodexHookEnabled"
+                  />
+                  <label htmlFor="claudeCodeCodexHookEnabled" style={{ fontSize: 12, color: '#ccc', fontWeight: 600 }}>Enable Claude Code Codex hook</label>
+                </div>
+                <div style={{ fontSize: 11, color: '#888', marginTop: 6, lineHeight: 1.4 }}>
+                  Runs Codex planning and review around Mergen-submitted Claude Code prompts.
+                </div>
+              </div>
               <div>
                 <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 8 }}>ACP Startup Mode</div>
                 <select

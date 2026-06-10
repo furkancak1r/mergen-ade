@@ -57,11 +57,26 @@ export function shouldShowSmartInputFooter(
   aiTool: string | undefined,
   aiStatus: string | undefined,
   opencodeSessionActive: boolean,
+  claudeLaunchPending = false,
 ): boolean {
   if (terminalKind !== 'foreground') return false;
   if (aiTool === 'opencode') return opencodeSessionActive;
-  if (aiTool === 'claude') return aiStatus === 'running' || aiStatus === 'attention';
+  if (aiTool === 'claude') {
+    const effectiveStatus = effectiveAiStatusForDisplay(aiTool, aiStatus, claudeLaunchPending);
+    return effectiveStatus === 'running' || effectiveStatus === 'attention';
+  }
   return false;
+}
+
+export function effectiveAiStatusForDisplay(
+  aiTool: string | undefined,
+  aiStatus: string | undefined,
+  claudeLaunchPending = false,
+): string {
+  if (aiTool === 'claude' && claudeLaunchPending && aiStatus === 'inactive') {
+    return 'running';
+  }
+  return aiStatus ?? 'inactive';
 }
 
 export function smartInputFooterHeight(
