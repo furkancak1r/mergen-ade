@@ -102,9 +102,9 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const hasAutoCreatedRef = useRef(false);
 
-  const scope: BrowserScopeKey = visibleScopeOverride ?? (activeTerminalId
-    ? { type: BrowserScopeKeyType.Terminal, projectId: project.id, terminalId: activeTerminalId }
-    : { type: BrowserScopeKeyType.Project, projectId: project.id });
+  const terminalScope = activeTerminalId ? { type: BrowserScopeKeyType.Terminal, projectId: project.id, terminalId: activeTerminalId } : null;
+  const terminalScopeHasTabs = terminalScope && (tabsByScope.get(scopeKeyString(terminalScope)) ?? []).length > 0;
+  const scope: BrowserScopeKey = visibleScopeOverride ?? (terminalScopeHasTabs ? terminalScope : { type: BrowserScopeKeyType.Project, projectId: project.id });
 
   const scopeKey = scopeKeyString(scope);
 

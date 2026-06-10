@@ -110,6 +110,15 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
     if (!question) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.altKey || e.metaKey) return;
+      // Do not steal keyboard events from other text inputs (ACP composer, file editor, etc.)
+      const active = document.activeElement;
+      if (active) {
+        const tag = active.tagName.toLowerCase();
+        const isTextInput = tag === 'textarea' || tag === 'input' || (active as HTMLElement).isContentEditable;
+        if (isTextInput && active !== customInputRef.current) {
+          return;
+        }
+      }
 
       const options = question.options;
       const hasCustom = question.custom;

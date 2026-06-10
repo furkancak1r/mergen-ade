@@ -414,8 +414,6 @@ export function usePty() {
         t.smartInputState = {
           ...t.smartInputState,
           queue: nextQueue,
-          draftText: '',
-          draftAttachments: [],
         };
         t.opencodePromptSubmitSince = now;
         t.opencodeTransportStatus = 'Working';

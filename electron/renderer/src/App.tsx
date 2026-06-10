@@ -795,7 +795,11 @@ function App() {
               }
               // Kill any terminals running in orphan worktrees
               for (const path of orphanPaths) {
-                const orphanTerminals = terminals.filter((t) => t.cwd === path || t.cwd.startsWith(path + '\\') || t.cwd.startsWith(path + '/'));
+                const normalizedPath = path.replace(/\\/g, '/');
+                const orphanTerminals = terminals.filter((t) => {
+                  const normalizedCwd = t.cwd.replace(/\\/g, '/');
+                  return normalizedCwd === normalizedPath || normalizedCwd.startsWith(normalizedPath + '/');
+                });
                 for (const t of orphanTerminals) {
                   killTerminal(t.id);
                 }
@@ -835,7 +839,11 @@ function App() {
               }
             }}
             hasLiveTerminals={(path) => {
-              return terminals.some((t) => t.cwd === path || t.cwd.startsWith(path + '\\') || t.cwd.startsWith(path + '/'));
+              const normalizedPath = path.replace(/\\/g, '/');
+              return terminals.some((t) => {
+                const normalizedCwd = t.cwd.replace(/\\/g, '/');
+                return normalizedCwd === normalizedPath || normalizedCwd.startsWith(normalizedPath + '/');
+              });
             }}
             onBranchChange={(branch) => {
               setBranchNameByProject((prev) => {

@@ -62,6 +62,12 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   }, [session?.messages]);
 
   useEffect(() => {
+    setPendingQuestion(null);
+    setSelectedOptions([]);
+    setCustomAnswer('');
+  }, [chatId]);
+
+  useEffect(() => {
     if (disabled) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
@@ -359,11 +365,11 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.ctrlKey && !e.shiftKey) {
+              if (e.key === 'Enter' && !e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
                 e.preventDefault();
                 if (hasDraft) send();
               }
-              if (e.key === 'Enter' && e.ctrlKey) {
+              if (e.key === 'Enter' && e.ctrlKey && !e.altKey && !e.metaKey) {
                 e.preventDefault();
                 setInput((prev) => prev + '\n');
               }
