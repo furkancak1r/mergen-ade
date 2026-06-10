@@ -1,4 +1,5 @@
 import type { AcpConfigOption, AcpAvailableCommand, AcpChatMessage } from '../../../shared/types';
+import { repairMojibakeDisplay } from './mojibake';
 
 export interface AcpParsedMessage {
   type: 'initialized' | 'sessionCreated' | 'promptResponse' | 'configOptions' | 'modeUpdate' | 'commands' | 'permission' | 'raw' | 'unknown';
@@ -65,14 +66,31 @@ export function parseAcpLine(line: string): AcpParsedMessage | undefined {
 
 export function buildAcpPromptText(text: string, attachments: string[]): string {
   if (attachments.length === 0) return text;
-  const lines = attachments.map((a) => `- ${a}`);
-  const attachmentBlock = `Attached file paths:\n${lines.join('\n')}`;
-  if (!text.trim()) return attachmentBlock;
+  const attachmentBlock = `Attached file paths:\n${attachments.join('\n')}`;
+  if (text.length === 0) return attachmentBlock;
   return `${text}\n\n${attachmentBlock}`;
+}
+
+export function pathToMention(path: string): string {
+  const parts = path.split(/[/\\]/);
+  const fileName = parts[parts.length - 1] || path;
+  return `@${repairMojibakeDisplay(fileName)}`;
+}
+
+export function appendMentionsToInput(input: string, paths: string[]): string {
+  if (paths.length === 0) return input;
+  const mentions = paths.map(pathToMention).join(' ');
+  if (input.length === 0) return mentions;
+  return `${input} ${mentions}`;
 }
 
 export function removeMentionFromInput(input: string, mention: string): string {
   const idx = input.lastIndexOf(mention);
   if (idx < 0) return input;
-  return input.slice(0, idx) + input.slice(idx + mention.length);
+  const before = input.slice(0, idx);
+  const after = input.slice(idx + mention.length);
+  if (before.length > 0 && before.endsWith(' ')) {
+    return before.slice(0, -1) + after;
+  }
+  return before + after;
 }

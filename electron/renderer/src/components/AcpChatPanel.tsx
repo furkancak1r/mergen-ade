@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import type { AcpChatSession, AcpChatMessage, ProjectRecord, AcpConfigOption, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
 import { activeBuildModel, defaultAppConfig, effectivePlanModel } from '../../../shared/types';
-import { removeMentionFromInput } from '../lib/acpParser';
+import { appendMentionsToInput, pathToMention, removeMentionFromInput } from '../lib/acpParser';
 import {
   ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS,
   actionControlsEnabled,
   acpComposerHintText,
+  acpHeaderStatusColor,
   acpKimiProtectionBadge,
   acpModeUiLabel,
   acpQueuedPromptDraftEditBlockedMessage,
@@ -250,8 +251,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   const removeAttachment = useCallback((index: number) => {
     const path = attachments[index];
-    const name = path.split(/[/\\]/).pop() || path;
-    const mention = `@${name}`;
+    const mention = pathToMention(path);
     setAttachments((prev) => prev.filter((_, idx) => idx !== index));
     setInput((prev) => removeMentionFromInput(prev, mention));
   }, [attachments]);
@@ -315,6 +315,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     activeMode: currentMode,
   });
   const statusText = session ? acpStatusText(session.status) : 'Loading...';
+  const headerStatusColor = session ? acpHeaderStatusColor(session.status) : 'rgb(138, 138, 138)';
   const statusModel = session?.currentModel?.trim()
     || (currentMode === 'plan' ? effectivePlanModel(resolvedConfig.opencode) : activeBuildModel(resolvedConfig.opencode));
   const kimiProtectionBadge = acpKimiProtectionBadge(statusModel, resolvedConfig.opencode.loopProtectionEnabled);
@@ -440,11 +441,13 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', background: '#0c0c0c' }}>
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #222', flexShrink: 0 }}>
-        <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>
-          {openCodeAcpPanelTitle(project.name)}
-        </span>
-        <span style={{ fontSize: 11, color: '#888' }}>
-          {statusText}
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <span style={{ fontSize: 16, fontWeight: 700, color: '#f4f4f4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {openCodeAcpPanelTitle(project.name)}
+          </span>
+          <span style={{ fontSize: 12, color: headerStatusColor, flexShrink: 0 }}>
+            {statusText}
+          </span>
         </span>
         {onClose && (
           <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 14 }}>
@@ -549,8 +552,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               const paths = await api.invoke('dialog:showOpen', { properties: ['openFile', 'multiSelections'] }) as string[] | undefined;
               if (paths) {
                 setAttachments((prev) => [...prev, ...paths]);
-                const mentions = paths.map((p) => `@${p.split(/[/\\]/).pop() || p}`).join(' ');
-                setInput((prev) => prev ? `${prev} ${mentions}` : mentions);
+                setInput((prev) => appendMentionsToInput(prev, paths));
               }
             }}
             disabled={!controlsEnabled}
@@ -862,7 +864,7 @@ const QueuedPromptRow: React.FC<{
         title="Run next"
         style={queuedPromptActionStyle}
       >
-        ⇧
+        →
       </button>
       <button
         onClick={() => onEdit(index, prompt)}

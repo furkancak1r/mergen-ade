@@ -12,6 +12,13 @@ export function terminalManagerPathMenuLabel(action: TerminalManagerPathMenuActi
   }
 }
 
+export function shouldShowOpenCodeAcpButton(
+  terminalManagerFilter: TerminalManagerFilter,
+  hasActiveAcpChat: boolean,
+): boolean {
+  return terminalManagerFilter === TerminalManagerFilterEnum.Foreground && !hasActiveAcpChat;
+}
+
 export function withTerminalManagerFilter(
   config: AppConfig,
   terminalManagerFilter: TerminalManagerFilter,

@@ -5527,6 +5527,203 @@
 
 ---
 
+#### Electron ACP queued prompt onizlemesi Rust gibi bosluklari sikistirmiyordu {#electron-acp-queued-preview-collapse-parity}
+- Date: 2026-06-11
+- Context: Rust queued prompt rows call `acp_queued_prompt_preview()` on the queued prompt text. That helper collapses whitespace, limits the preview to 96 characters, and appends `...` when truncated.
+- Error signature:
+  1. Electron preview text only used `trim()`, so embedded newlines and repeated spaces were rendered differently.
+  2. Electron did not apply the Rust 96-character preview cap in shared helper logic.
+  3. Electron row preview preferred draft text over the final queued prompt text.
+- Symptoms/Impact:
+  - Queued rows could show multi-line attachment blocks or unusually long text unlike the Rust compact row.
+  - Attachment-only queued prompts displayed line breaks in the row preview instead of Rust's single-line collapsed text.
+- Root cause:
+  - The Electron helper implemented a simple display fallback and did not mirror Rust's `split_whitespace()` + character-limit behavior.
+- Resolution:
+  - Added `ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS = 96`.
+  - Updated `queuedPromptPreview()` to prefer `finalPromptText`, collapse whitespace to single spaces, and truncate by character count with `...`.
+  - Added regression coverage for whitespace collapse, final prompt priority, ASCII truncation, and non-ASCII character counting.
+- Prevent recurrence:
+  - Keep queued prompt preview formatting in the shared helper and compare it against Rust's `acp_queued_prompt_preview()` when changing ACP queue rows.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_queued_prompt_preview`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt Run next ikonu Rust yonunden sapmisti {#electron-acp-run-next-arrow-parity}
+- Date: 2026-06-11
+- Context: Rust queued prompt rows render `Run next` with the app's `arrow-right` icon.
+- Error signature:
+  1. Electron rendered the `Run next` action with an upward shift-like glyph.
+- Symptoms/Impact:
+  - The queued prompt row action did not visually match the Rust ACP panel.
+  - The glyph suggested moving upward rather than sending the queued prompt forward/next.
+- Root cause:
+  - The Electron row action used a placeholder text symbol instead of the Rust action direction.
+- Resolution:
+  - Changed the Electron `Run next` row glyph to a right arrow.
+- Prevent recurrence:
+  - Keep ACP queued row action glyphs aligned with Rust's `arrow-right`, `pencil`, and `trash` action order.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `draw_acp_queued_prompt_panel_row`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP header status rengi ve hizasi Rust ile uyusmuyordu {#electron-acp-header-status-color-parity}
+- Date: 2026-06-11
+- Context: Rust ACP chat header renders the `OpenCode ACP` title and status text in the same left-aligned row. Running, permission, and error states use distinct status colors; muted states stay gray. A separate muted status row remains below the composer.
+- Error signature:
+  1. Electron placed header status as a separate space-between item instead of next to the title.
+  2. Electron rendered header status with the same muted color for every state.
+- Symptoms/Impact:
+  - ACP header did not visually match the Rust panel.
+  - Running, permission, and error states lost their quick color signal in the header.
+- Root cause:
+  - Electron had only Rust-style status text mapping, not the Rust header color and layout mapping.
+- Resolution:
+  - Added `acpHeaderStatusColor()` with Rust-style status colors.
+  - Updated the ACP header to group title and status on the left and apply state-specific status color.
+  - Added regression coverage for the header status color map.
+- Prevent recurrence:
+  - Keep header status styling separate from the muted bottom status row styling.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust ACP header rendering around `header_rect`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP attachment prompt formati Rust ile uyusmuyordu {#electron-acp-attachment-prompt-format-parity}
+- Date: 2026-06-11
+- Context: Rust `build_acp_prompt_text()` appends attachment paths as plain newline-separated paths under `Attached file paths:`. It does not prefix paths with bullets.
+- Error signature:
+  1. Electron main ACP service generated `Attached file paths:\n- path` bullet lines.
+  2. Renderer test/helper logic used the same bullet format.
+- Symptoms/Impact:
+  - ACP prompts sent from Electron did not match the Rust app's final prompt text.
+  - Queued prompt previews for attachment prompts reflected the Electron-only bullet format.
+- Root cause:
+  - Electron duplicated the attachment prompt builder with markdown-style bullet lines instead of porting Rust's plain path list.
+- Resolution:
+  - Updated Electron main `buildAcpPromptText()` to append raw newline-separated attachment paths.
+  - Updated renderer `buildAcpPromptText()` and tests to assert the exact Rust attachment format.
+  - Updated ACP queued prompt preview fixture to use the Rust attachment block format.
+- Prevent recurrence:
+  - Keep attachment prompt format exact against Rust `opencode_acp::build_acp_prompt_text()` whenever ACP prompt construction changes.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/renderer/src/lib/acpParser.ts`, `electron/renderer/src/lib/acpParser.test.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `opencode_acp::build_acp_prompt_text`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP attachment mention silme bosluk temizligini Rust gibi yapmiyordu {#electron-acp-remove-mention-space-parity}
+- Date: 2026-06-11
+- Context: Rust `remove_mention_from_input()` removes the last matching attachment mention and also removes a preceding space when the mention is not at the start of the input.
+- Error signature:
+  1. Electron `removeMentionFromInput()` removed only the mention substring.
+  2. Removing the last attachment mention from text such as `hello @file.ts` left a trailing space.
+- Symptoms/Impact:
+  - Composer text could retain extra spaces after an attachment chip was removed.
+  - Electron attachment removal behavior diverged from the Rust composer.
+- Root cause:
+  - The Electron helper used a raw `lastIndexOf()` splice without Rust's preceding-space cleanup rule.
+- Resolution:
+  - Updated `removeMentionFromInput()` to remove one preceding space when present and when the mention is not at the start.
+  - Updated regression tests for duplicate mention removal and Rust's first-position behavior.
+- Prevent recurrence:
+  - Keep attachment mention add/remove behavior aligned with Rust `path_to_mention()`, `append_mentions_to_input()`, and `remove_mention_from_input()`.
+- Files/Commands touched: `electron/renderer/src/lib/acpParser.ts`, `electron/renderer/src/lib/acpParser.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `opencode_acp::remove_mention_from_input`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP attachment mention uretimi Rust helperini kullanmiyordu {#electron-acp-path-to-mention-parity}
+- Date: 2026-06-11
+- Context: Rust generates attachment composer mentions through `path_to_mention()` and `append_mentions_to_input()`, using the path basename plus mojibake display repair before inserting `@file`.
+- Error signature:
+  1. Electron generated attachment mentions inline in `AcpChatPanel`.
+  2. Electron did not reuse a shared path-to-mention helper for both add and remove flows.
+  3. Mojibake-repaired file names were not covered by ACP mention tests.
+- Symptoms/Impact:
+  - ACP attachment mention behavior could drift between add and remove paths.
+  - CP1252-corrupted Turkish file names could appear unrepaired in composer mentions.
+- Root cause:
+  - The Electron port only had generic mention removal logic and left ACP mention creation in component UI code.
+- Resolution:
+  - Added `pathToMention()` and `appendMentionsToInput()` to the renderer ACP parser helpers.
+  - Updated `AcpChatPanel` attachment add/remove flows to use the shared helpers.
+  - Added regression tests for Windows paths, Unicode file names, mojibake repair, empty input, existing input, multiple paths, and empty path lists.
+- Prevent recurrence:
+  - Keep ACP attachment mention creation and removal centralized in parser helpers, aligned with Rust `path_to_mention()`, `append_mentions_to_input()`, and `remove_mention_from_input()`.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpParser.ts`, `electron/renderer/src/lib/acpParser.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `opencode_acp::path_to_mention` and `opencode_acp::append_mentions_to_input`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP sohbet basligi ilk prompttan uretilmiyordu {#electron-acp-chat-title-from-prompt-parity}
+- Date: 2026-06-11
+- Context: Rust derives an ACP chat title from the first prompt by collapsing whitespace, truncating at 72 characters, and using that title in Terminal Manager rows after the chat has started.
+- Error signature:
+  1. Electron ACP sessions had no `title` state.
+  2. Terminal Manager always displayed `OpenCode ACP` for active ACP rows, even after a prompt had started the chat.
+  3. Renderer had no shared helper for Rust-style ACP chat title and row label formatting.
+- Symptoms/Impact:
+  - Multiple ACP conversations were harder to distinguish in Terminal Manager.
+  - The Electron ACP row did not match Rust's `OpenCode ACP - <prompt title>` behavior.
+- Root cause:
+  - The Electron ACP service tracked messages and queues but never persisted a derived chat title.
+- Resolution:
+  - Added Rust-style chat title derivation in the ACP service when a prompt is queued or sent.
+  - Added `title` to ACP session snapshots.
+  - Added renderer helpers for chat title, started-state, display title, and Terminal Manager row label.
+  - Passed active ACP session snapshots into Terminal Manager and used the derived row label.
+  - Added regression coverage for whitespace collapse, 72-character truncation, Unicode character counting, started-state, and row label formatting.
+- Prevent recurrence:
+  - Keep ACP chat row labels driven by session title snapshots rather than a fixed `OpenCode ACP` string after a chat starts.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_chat_title_from_prompt`, `acp_chat_display_title`, and `acp_terminal_manager_row_label`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP panel header proje adini basliga ekliyordu {#electron-acp-panel-header-title-parity}
+- Date: 2026-06-11
+- Context: Rust ACP panel header renders the fixed `OpenCode ACP` title next to the status text. Project and branch context is shown elsewhere, not in the header title.
+- Error signature:
+  1. Electron rendered `OpenCode ACP - <project>` in the ACP panel header.
+- Symptoms/Impact:
+  - The ACP panel header was visually wider and did not match Rust's compact title/status row.
+  - Project context was duplicated between the surrounding project selection and ACP panel title.
+- Root cause:
+  - Electron's `openCodeAcpPanelTitle()` helper encoded project context into the panel title instead of matching Rust's fixed header label.
+- Resolution:
+  - Updated `openCodeAcpPanelTitle()` to return the fixed `OpenCode ACP` label.
+  - Updated regression coverage for the Rust-style panel title.
+- Prevent recurrence:
+  - Keep per-chat prompt titles in Terminal Manager/thread rows and keep the ACP panel header label fixed.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust ACP header rendering around `header_rect`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Terminal Manager ACP acma butonu OpenCode terminaline bagliydi {#electron-terminal-manager-acp-button-visibility-parity}
+- Date: 2026-06-11
+- Context: Rust exposes OpenCode ACP as a synthetic foreground launcher row independent of whether a foreground OpenCode terminal is already running.
+- Error signature:
+  1. Electron showed the `+ ACP` button only when the project already had a foreground OpenCode terminal.
+  2. Projects without an OpenCode foreground terminal could not start ACP from Terminal Manager.
+- Symptoms/Impact:
+  - ACP discovery and launch flow differed from Rust.
+  - Users had to create or keep an OpenCode terminal before opening terminal-less ACP chat.
+- Root cause:
+  - The Electron Terminal Manager button condition conflated ACP availability with existing foreground OpenCode terminal presence.
+- Resolution:
+  - Added `shouldShowOpenCodeAcpButton()` helper.
+  - Updated Terminal Manager to show `+ ACP` whenever the Foreground filter is active and the project has no active ACP chat.
+  - Added regression coverage that the ACP button no longer requires an existing OpenCode terminal.
+- Prevent recurrence:
+  - Keep ACP launch visibility based on Terminal Manager filter and active ACP state, not terminal process presence.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/terminalManagerState.ts`, `electron/renderer/src/lib/terminalManagerState.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust foreground launcher synthetic `OpenCode ACP` row, Electron parity goal 2026-06-11
+
+---
+
 #### Electron ACP queued prompt satirinda ekstra kopya ikonu ve farkli ek etiketi vardi {#electron-acp-queued-row-actions-attachment-parity}
 - Date: 2026-06-11
 - Context: Rust queued prompt rows copy by clicking the preview text and reserve the icon buttons for Run Next, Edit, and Delete. Attachment metadata is rendered as `{count} file`.

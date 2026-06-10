@@ -29,16 +29,51 @@ export interface AcpKimiProtectionBadge {
 }
 
 export const ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS = 2;
+export const ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS = 96;
+export const ACP_CHAT_TITLE_MAX_CHARS = 72;
 export const OPENCODE_ACP_LABEL = 'OpenCode ACP';
 export const OPENCODE_ACP_OPEN_BUTTON_LABEL = '+ ACP';
 export const OPENCODE_ACP_CLOSE_TOOLTIP = `Close ${OPENCODE_ACP_LABEL}`;
 
-export function openCodeAcpPanelTitle(projectName: string): string {
-  return `${OPENCODE_ACP_LABEL} - ${projectName}`;
+export function openCodeAcpPanelTitle(_projectName?: string): string {
+  return OPENCODE_ACP_LABEL;
 }
 
 export function openCodeAcpWelcomeText(): string {
   return `Welcome to ${OPENCODE_ACP_LABEL}`;
+}
+
+export function acpChatTitleFromPrompt(promptText: string): string {
+  const collapsed = promptText.split(/\s+/).filter(Boolean).join(' ').trim();
+  if (!collapsed) return OPENCODE_ACP_LABEL;
+  const chars = Array.from(collapsed);
+  if (chars.length <= ACP_CHAT_TITLE_MAX_CHARS) return collapsed;
+  return `${chars.slice(0, ACP_CHAT_TITLE_MAX_CHARS).join('')}...`;
+}
+
+interface AcpChatTitleState {
+  messages?: readonly { role?: string }[];
+  queuedPrompts?: readonly unknown[];
+  title?: string;
+}
+
+export function acpChatHasStartedState(session: AcpChatTitleState | null | undefined): boolean {
+  return Boolean(
+    session
+      && ((session.queuedPrompts?.length ?? 0) > 0
+        || (session.messages?.some((message) => message.role === 'user') ?? false)),
+  );
+}
+
+export function acpChatDisplayTitle(session: AcpChatTitleState | null | undefined): string {
+  if (!acpChatHasStartedState(session)) return OPENCODE_ACP_LABEL;
+  const title = session?.title?.trim();
+  return title || OPENCODE_ACP_LABEL;
+}
+
+export function acpTerminalManagerRowLabel(session: AcpChatTitleState | null | undefined): string {
+  const title = acpChatDisplayTitle(session);
+  return acpChatHasStartedState(session) ? `${OPENCODE_ACP_LABEL} - ${title}` : title;
 }
 
 export function isAcpRunningStatus(status: AcpChatSession['status'] | undefined): boolean {
@@ -61,6 +96,19 @@ export function acpStatusText(status: AcpChatSession['status'] | undefined): str
       return 'Error';
     default:
       return 'Idle';
+  }
+}
+
+export function acpHeaderStatusColor(status: AcpChatSession['status'] | undefined): string {
+  switch (status) {
+    case 'running':
+      return 'rgb(100, 200, 100)';
+    case 'permission':
+      return 'rgb(255, 200, 100)';
+    case 'error':
+      return 'rgb(185, 45, 45)';
+    default:
+      return 'rgb(138, 138, 138)';
   }
 }
 
@@ -128,11 +176,18 @@ export function acpKimiProtectionBadge(
     : { label: 'Kimi unprotected', color: 'rgb(220, 170, 60)' };
 }
 
+function acpQueuedPromptPreviewText(text: string): string {
+  const collapsed = text.split(/\s+/).filter(Boolean).join(' ');
+  const chars = Array.from(collapsed);
+  if (chars.length <= ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS) return collapsed;
+  return `${chars.slice(0, ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS).join('')}...`;
+}
+
 export function queuedPromptPreview(prompt: { text?: string; finalPromptText?: string; attachments?: unknown[] }): string {
-  const directText = prompt.text?.trim();
-  if (directText) return directText;
-  const finalText = prompt.finalPromptText?.trim();
+  const finalText = prompt.finalPromptText ? acpQueuedPromptPreviewText(prompt.finalPromptText) : '';
   if (finalText) return finalText;
+  const directText = prompt.text ? acpQueuedPromptPreviewText(prompt.text) : '';
+  if (directText) return directText;
   return (prompt.attachments?.length ?? 0) > 0 ? '(Attachment)' : '(Empty prompt)';
 }
 

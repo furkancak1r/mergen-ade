@@ -1,11 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ACP_CHAT_TITLE_MAX_CHARS,
   ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS,
+  ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS,
   OPENCODE_ACP_CLOSE_TOOLTIP,
   OPENCODE_ACP_LABEL,
   OPENCODE_ACP_OPEN_BUTTON_LABEL,
   actionControlsEnabled,
   acpComposerHintText,
+  acpChatDisplayTitle,
+  acpChatHasStartedState,
+  acpChatTitleFromPrompt,
+  acpHeaderStatusColor,
   acpKimiProtectionBadge,
   acpModeUiLabel,
   acpQueuedPromptDraftEditBlockedMessage,
@@ -15,6 +21,7 @@ import {
   acpQueuedPromptPlanCount,
   acpQueuedPromptVisibleRowCount,
   acpStatusText,
+  acpTerminalManagerRowLabel,
   hasConfigSelectorOptions,
   moveQueuedPromptToFront,
   nextAcpActivityState,
@@ -35,8 +42,31 @@ describe('acpUi', () => {
     expect(OPENCODE_ACP_LABEL).toBe('OpenCode ACP');
     expect(OPENCODE_ACP_OPEN_BUTTON_LABEL).toBe('+ ACP');
     expect(OPENCODE_ACP_CLOSE_TOOLTIP).toBe('Close OpenCode ACP');
-    expect(openCodeAcpPanelTitle('Mergen')).toBe('OpenCode ACP - Mergen');
+    expect(openCodeAcpPanelTitle('Mergen')).toBe('OpenCode ACP');
     expect(openCodeAcpWelcomeText()).toBe('Welcome to OpenCode ACP');
+  });
+
+  it('derives ACP chat titles from prompts like Rust', () => {
+    expect(acpChatTitleFromPrompt('')).toBe(OPENCODE_ACP_LABEL);
+    expect(acpChatTitleFromPrompt('  hello\n\nworld  ')).toBe('hello world');
+    const maxTitle = 'x'.repeat(ACP_CHAT_TITLE_MAX_CHARS);
+    expect(acpChatTitleFromPrompt(maxTitle)).toBe(maxTitle);
+    expect(acpChatTitleFromPrompt(`${maxTitle}y`)).toBe(`${maxTitle}...`);
+    expect(acpChatTitleFromPrompt(`${'ş'.repeat(ACP_CHAT_TITLE_MAX_CHARS)}z`)).toBe(`${'ş'.repeat(ACP_CHAT_TITLE_MAX_CHARS)}...`);
+  });
+
+  it('formats ACP chat display and Terminal Manager labels like Rust', () => {
+    const emptySession = { messages: [], queuedPrompts: [], title: 'first prompt' };
+    const startedSession = { messages: [{ role: 'user' as const, text: 'hello', timestamp: 1 }], queuedPrompts: [], title: 'first prompt' };
+    const queuedSession = { messages: [], queuedPrompts: [{ modeId: 'build' }], title: 'queued prompt' };
+
+    expect(acpChatHasStartedState(emptySession)).toBe(false);
+    expect(acpChatDisplayTitle(emptySession)).toBe(OPENCODE_ACP_LABEL);
+    expect(acpTerminalManagerRowLabel(emptySession)).toBe(OPENCODE_ACP_LABEL);
+    expect(acpChatHasStartedState(startedSession)).toBe(true);
+    expect(acpChatDisplayTitle(startedSession)).toBe('first prompt');
+    expect(acpTerminalManagerRowLabel(startedSession)).toBe('OpenCode ACP - first prompt');
+    expect(acpTerminalManagerRowLabel(queuedSession)).toBe('OpenCode ACP - queued prompt');
   });
 
   it('keeps ACP running true after promptSent events without a status field', () => {
@@ -69,6 +99,15 @@ describe('acpUi', () => {
     expect(acpStatusText('permission')).toBe('Permission');
     expect(acpStatusText('error')).toBe('Error');
     expect(acpStatusText(undefined)).toBe('Idle');
+  });
+
+  it('maps ACP header status colors to Rust-style state colors', () => {
+    expect(acpHeaderStatusColor('running')).toBe('rgb(100, 200, 100)');
+    expect(acpHeaderStatusColor('permission')).toBe('rgb(255, 200, 100)');
+    expect(acpHeaderStatusColor('error')).toBe('rgb(185, 45, 45)');
+    expect(acpHeaderStatusColor('idle')).toBe('rgb(138, 138, 138)');
+    expect(acpHeaderStatusColor('starting')).toBe('rgb(138, 138, 138)');
+    expect(acpHeaderStatusColor(undefined)).toBe('rgb(138, 138, 138)');
   });
 
   it('does not show welcome while queued prompts are visible', () => {
@@ -116,10 +155,20 @@ describe('acpUi', () => {
   });
 
   it('uses Rust-style ACP queued prompt previews', () => {
-    expect(queuedPromptPreview({ text: '  Build this  ', finalPromptText: 'ignored' })).toBe('Build this');
-    expect(queuedPromptPreview({ text: '', finalPromptText: 'Attached file paths:\n- a.png' })).toBe('Attached file paths:\n- a.png');
+    expect(queuedPromptPreview({ text: 'draft value', finalPromptText: '  Build\n\nthis   now  ' })).toBe('Build this now');
+    expect(queuedPromptPreview({ text: '  Build this  ' })).toBe('Build this');
+    expect(queuedPromptPreview({ text: '', finalPromptText: 'Attached file paths:\na.png' })).toBe('Attached file paths: a.png');
     expect(queuedPromptPreview({ attachments: ['a.png'] })).toBe('(Attachment)');
     expect(queuedPromptPreview({})).toBe('(Empty prompt)');
+  });
+
+  it('truncates ACP queued prompt previews by Rust character count', () => {
+    const maxPreview = 'x'.repeat(ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS);
+    expect(queuedPromptPreview({ text: maxPreview })).toBe(maxPreview);
+    expect(queuedPromptPreview({ text: `${maxPreview}y` })).toBe(`${maxPreview}...`);
+
+    const unicodePreview = `${'ş'.repeat(ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS)}z`;
+    expect(queuedPromptPreview({ text: unicodePreview })).toBe(`${'ş'.repeat(ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS)}...`);
   });
 
   it('moves queued ACP prompts to the front by index without mutating the queue', () => {

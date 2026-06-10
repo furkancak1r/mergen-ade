@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import type { AppConfig, ShellKind, TerminalKind, ProjectRecord, LeftSidebarTab, BrowserScopeKey, SmartInputState, SmartInputAttachment, AiHookEvent, AiCliAttentionKind, TerminalShortcutEntry, BrowserTab, InputHistoryFilter, TerminalManagerFilter, AppHistory } from '../../shared/types';
+import type { AcpChatSession, AppConfig, ShellKind, TerminalKind, ProjectRecord, LeftSidebarTab, BrowserScopeKey, SmartInputState, SmartInputAttachment, AiHookEvent, AiCliAttentionKind, TerminalShortcutEntry, BrowserTab, InputHistoryFilter, TerminalManagerFilter, AppHistory } from '../../shared/types';
 import type { ClaudeCodexPlanResult, ClaudeCodexReviewResult } from '../../shared/claudeCodexHook';
 import { BrowserScopeKeyType, AiCliTool as AiCliToolEnum } from '../../shared/types';
 import { LeftSidebarTab as LeftSidebarTabEnum, defaultAppConfig, defaultAppHistory } from '../../shared/types';
@@ -72,6 +72,7 @@ function App() {
 
   const [activeAcpChat, setActiveAcpChat] = useState<{ chatId: string; projectId: number } | null>(null);
   const [activeAcpChatByProject, setActiveAcpChatByProject] = useState<Map<number, string>>(new Map());
+  const [activeAcpSessionByProject, setActiveAcpSessionByProject] = useState<Map<number, AcpChatSession>>(new Map());
   const [acpRunning, setAcpRunning] = useState(false);
   const [acpQueuedPrompts, setAcpQueuedPrompts] = useState(false);
 
@@ -217,6 +218,21 @@ function App() {
   // Track ACP running state and queued prompts
   useEffect(() => {
     const unsub = api.on('acp:event', (eventChatId: string, event: AcpEventLike) => {
+      const projectEntry = Array.from(activeAcpChatByProject.entries()).find(([, chatId]) => chatId === eventChatId);
+      if (projectEntry) {
+        const [projectId] = projectEntry;
+        api.invoke('acp:getSession', eventChatId).then((session) => {
+          setActiveAcpSessionByProject((prev) => {
+            const next = new Map(prev);
+            if (session) {
+              next.set(projectId, session as AcpChatSession);
+            } else {
+              next.delete(projectId);
+            }
+            return next;
+          });
+        });
+      }
       if (activeAcpChat && eventChatId === activeAcpChat.chatId) {
         const next = nextAcpActivityState({ running: acpRunning, hasQueuedPrompts: acpQueuedPrompts }, event);
         setAcpRunning(next.running);
@@ -224,7 +240,7 @@ function App() {
       }
     });
     return () => { unsub(); };
-  }, [activeAcpChat, acpRunning, acpQueuedPrompts]);
+  }, [activeAcpChat, activeAcpChatByProject, acpRunning, acpQueuedPrompts]);
 
   // Browser hide on modal open (Settings) with grace period after close.
   // Check-list is a non-modal floating panel and must not hide Browser.
@@ -814,6 +830,14 @@ function App() {
       next.set(projectId, chatId);
       return next;
     });
+    const session = await api.invoke('acp:getSession', chatId) as AcpChatSession | undefined;
+    if (session) {
+      setActiveAcpSessionByProject((prev) => {
+        const next = new Map(prev);
+        next.set(projectId, session);
+        return next;
+      });
+    }
     setActiveAcpChat({ chatId, projectId });
     setFileEditorState((prev) => withFileEditorHidden(prev));
     // Reveal Terminal Manager with Foreground filter and expand root project
@@ -827,6 +851,11 @@ function App() {
 
   const removeAcpChatForProject = useCallback((projectId: number) => {
     setActiveAcpChatByProject((prev) => {
+      const next = new Map(prev);
+      next.delete(projectId);
+      return next;
+    });
+    setActiveAcpSessionByProject((prev) => {
       const next = new Map(prev);
       next.delete(projectId);
       return next;
@@ -1090,6 +1119,15 @@ function App() {
       }
       return prev;
     });
+    if (removedIds.length > 0) {
+      setActiveAcpSessionByProject((prev) => {
+        const next = new Map(prev);
+        for (const projectId of removedIds) {
+          next.delete(projectId);
+        }
+        return next;
+      });
+    }
     // Kill visible ACP chats and clear standby for removed projects
     for (const projectId of removedIds) {
       const chatId = activeAcpChatByProject.get(projectId);
@@ -1268,6 +1306,7 @@ function App() {
               setConfig({ ...config, projects: newProjects });
             }}
             activeAcpChatByProject={activeAcpChatByProject}
+            activeAcpSessionByProject={activeAcpSessionByProject}
             onActivateAcpChat={restoreActiveAcpForProject}
             onRemoveAcpChat={removeAcpChatForProject}
             onOpenAcpChat={openAcpChat}

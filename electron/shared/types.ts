@@ -753,6 +753,7 @@ export interface SourceControlStatus {
 export interface AcpChatSession {
   sessionId?: string;
   status: 'starting' | 'connected' | 'session_created' | 'idle' | 'running' | 'permission' | 'error';
+  title?: string;
   messages: AcpChatMessage[];
   promptInput: string;
   attachments: string[];

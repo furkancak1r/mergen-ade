@@ -1,13 +1,13 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import type { AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry } from '../../../shared/types';
+import type { AcpChatSession, AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry } from '../../../shared/types';
 import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalManagerFilterEnum, BuiltinLauncherKind, activeBuildModel } from '../../../shared/types';
 import type { GitDiffSummary } from '../../../shared/gitDiffSummary';
 import { gitDiffSummaryLabel } from '../../../shared/gitDiffSummary';
 import type { TerminalInstance } from '../hooks/usePty';
-import { OPENCODE_ACP_CLOSE_TOOLTIP, OPENCODE_ACP_LABEL, OPENCODE_ACP_OPEN_BUTTON_LABEL } from '../lib/acpUi';
+import { OPENCODE_ACP_CLOSE_TOOLTIP, OPENCODE_ACP_LABEL, OPENCODE_ACP_OPEN_BUTTON_LABEL, acpTerminalManagerRowLabel } from '../lib/acpUi';
 import { effectiveLauncherCommand } from '../lib/launcher';
 import { effectiveAiStatusForDisplay } from '../lib/smartInput';
-import { terminalManagerPathMenuLabel } from '../lib/terminalManagerState';
+import { shouldShowOpenCodeAcpButton, terminalManagerPathMenuLabel } from '../lib/terminalManagerState';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
 
@@ -83,6 +83,7 @@ interface TerminalManagerProps {
   onAddForegroundMessage?: (projectId: number, message: string) => void;
   onUpdateForegroundMessage?: (projectId: number, index: number, message: string) => void;
   activeAcpChatByProject?: Map<number, string>;
+  activeAcpSessionByProject?: Map<number, AcpChatSession>;
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number) => void;
@@ -106,6 +107,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onAddForegroundMessage,
   onUpdateForegroundMessage,
   activeAcpChatByProject,
+  activeAcpSessionByProject,
   onActivateAcpChat,
   onRemoveAcpChat,
   onOpenAcpChat,
@@ -431,6 +433,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 allTerminals={terminals}
                 rootProject={project}
                 activeAcpChatByProject={activeAcpChatByProject}
+                activeAcpSessionByProject={activeAcpSessionByProject}
                 onActivateAcpChat={onActivateAcpChat}
                 onRemoveAcpChat={onRemoveAcpChat}
                 onOpenAcpChat={onOpenAcpChat}
@@ -484,6 +487,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                     rootProject={project}
                     isWorktree
                     activeAcpChatByProject={activeAcpChatByProject}
+                    activeAcpSessionByProject={activeAcpSessionByProject}
                     onActivateAcpChat={onActivateAcpChat}
                     onRemoveAcpChat={onRemoveAcpChat}
                     onOpenAcpChat={onOpenAcpChat}
@@ -721,6 +725,7 @@ interface ProjectGroupProps {
   rootProject?: ProjectRecord;
   isWorktree?: boolean;
   activeAcpChatByProject?: Map<number, string>;
+  activeAcpSessionByProject?: Map<number, AcpChatSession>;
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number) => void;
@@ -761,6 +766,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   rootProject,
   isWorktree,
   activeAcpChatByProject,
+  activeAcpSessionByProject,
   onActivateAcpChat,
   onRemoveAcpChat,
   onOpenAcpChat,
@@ -782,6 +788,8 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   const hasLiveTerminals = terminals.length > 0;
   const isSelected = activeTerminalId !== null && terminals.some((t) => t.id === activeTerminalId);
   const hasLiveTerminal = terminals.some((t) => !t.exited);
+  const hasActiveAcpChat = activeAcpChatByProject?.has(project.id) ?? false;
+  const showOpenCodeAcpButton = shouldShowOpenCodeAcpButton(filter, hasActiveAcpChat);
   const diffLabel = gitDiffSummaryLabel(diffSummary, diffSummaryLoading);
   const showReadyDiff = Boolean(
     diffSummary
@@ -1137,7 +1145,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
           })()}
 
           {/* OpenCode ACP row */}
-          {activeAcpChatByProject && activeAcpChatByProject.has(project.id) && (
+          {hasActiveAcpChat && (
             <div
               style={{
                 display: 'flex',
@@ -1159,7 +1167,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                 flexShrink: 0,
               }} />
               <span style={{ fontSize: 11, color: '#7ec0ee', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {OPENCODE_ACP_LABEL}
+                {acpTerminalManagerRowLabel(activeAcpSessionByProject?.get(project.id))}
               </span>
               <button
                 onClick={(e) => {
@@ -1183,7 +1191,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             </div>
           )}
           {/* OpenCode ACP button */}
-          {activeAcpChatByProject && !activeAcpChatByProject.has(project.id) && filter === TerminalManagerFilterEnum.Foreground && terminals.some((t) => t.kind === 'foreground' && t.aiTool === 'opencode') && (
+          {showOpenCodeAcpButton && (
             <div style={{ padding: isWorktree ? '2px 8px 2px 36px' : '2px 8px 2px 24px' }}>
               <button
                 onClick={() => onOpenAcpChat?.(project.id)}

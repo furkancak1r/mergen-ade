@@ -26,10 +26,23 @@ import { getOpencodeBinPath } from './opencode';
 
 function buildAcpPromptText(text: string, attachments: string[]): string {
   if (attachments.length === 0) return text;
-  const lines = attachments.map((a) => `- ${a}`);
-  const attachmentBlock = `Attached file paths:\n${lines.join('\n')}`;
-  if (!text.trim()) return attachmentBlock;
+  const attachmentBlock = `Attached file paths:\n${attachments.join('\n')}`;
+  if (text.length === 0) return attachmentBlock;
   return `${text}\n\n${attachmentBlock}`;
+}
+
+function acpChatTitleFromPrompt(promptText: string): string {
+  const collapsed = promptText.split(/\s+/).filter(Boolean).join(' ').trim();
+  if (!collapsed) return 'OpenCode ACP';
+  const chars = Array.from(collapsed);
+  if (chars.length <= 72) return collapsed;
+  return `${chars.slice(0, 72).join('')}...`;
+}
+
+function updateAcpChatTitleFromPrompt(session: AcpSession, promptText: string): void {
+  if (!session.title || session.title === 'OpenCode ACP') {
+    session.title = acpChatTitleFromPrompt(promptText);
+  }
 }
 
 type AcpPendingInteraction =
@@ -44,6 +57,7 @@ interface AcpSession {
   cwd: string;
   mcpServers: string[];
   status: AcpChatSession['status'];
+  title: string;
   messages: AcpChatMessage[];
   promptInput: string;
   attachments: string[];
@@ -155,6 +169,7 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
     cwd: opts.cwd,
     mcpServers: opts.mcpServers,
     status: 'starting',
+    title: 'OpenCode ACP',
     messages: [],
     promptInput: '',
     attachments: [],
@@ -559,6 +574,7 @@ function flushNextQueuedPrompt(session: AcpSession): void {
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
   const msg: AcpChatMessage = { role: 'user', text: fullText, timestamp: Date.now() };
+  updateAcpChatTitleFromPrompt(session, fullText);
   session.messages.push(msg);
   sendRpc(session, 'session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: fullText }] });
   broadcast('acp:event', session.chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
@@ -626,6 +642,7 @@ export function sendAcpPrompt(chatId: string, promptText: string, attachments: s
   // Queue when session is not ready or a turn is active
   const shouldQueue = !session.sessionId || session.status === 'starting' || session.status === 'session_created' || session.status === 'running' || session.status === 'permission';
   if (shouldQueue) {
+    updateAcpChatTitleFromPrompt(session, fullText);
     session.queuedPrompts.push({ text: promptText, attachments, modeId: effectiveModeId, finalPromptText: fullText });
     broadcast('acp:event', chatId, { type: 'queued', count: session.queuedPrompts.length, queuedPrompts: session.queuedPrompts.length });
     return;
@@ -639,6 +656,7 @@ export function sendAcpPrompt(chatId: string, promptText: string, attachments: s
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
   const msg: AcpChatMessage = { role: 'user', text: fullText, timestamp: Date.now() };
+  updateAcpChatTitleFromPrompt(session, fullText);
   session.messages.push(msg);
   sendRpc(session, 'session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: fullText }] });
   broadcast('acp:event', chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
@@ -733,6 +751,7 @@ export function getAcpSession(chatId: string): AcpChatSession | undefined {
   return {
     sessionId: session.sessionId,
     status: session.status,
+    title: session.title,
     messages: session.messages,
     promptInput: session.promptInput,
     attachments: session.attachments,

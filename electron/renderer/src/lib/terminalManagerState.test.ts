@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { defaultAppConfig, LeftSidebarTab, TerminalManagerFilter } from '../../../shared/types';
 import {
   normalizeTerminalManagerStartupState,
+  shouldShowOpenCodeAcpButton,
   terminalManagerPathMenuLabel,
   withTerminalManagerFilter,
   withTerminalManagerOpened,
@@ -75,5 +76,11 @@ describe('terminalManagerState', () => {
   it('uses icon-prefixed labels for path context menu actions', () => {
     expect(terminalManagerPathMenuLabel('copy_path')).toBe('⧉ Copy Path');
     expect(terminalManagerPathMenuLabel('open_folder')).toBe('📂 Open in Folder');
+  });
+
+  it('shows OpenCode ACP button in Foreground without requiring an OpenCode terminal', () => {
+    expect(shouldShowOpenCodeAcpButton(TerminalManagerFilter.Foreground, false)).toBe(true);
+    expect(shouldShowOpenCodeAcpButton(TerminalManagerFilter.Foreground, true)).toBe(false);
+    expect(shouldShowOpenCodeAcpButton(TerminalManagerFilter.Background, false)).toBe(false);
   });
 });

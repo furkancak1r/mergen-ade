@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseAcpLine, buildAcpPromptText, removeMentionFromInput } from './acpParser';
+import { parseAcpLine, appendMentionsToInput, buildAcpPromptText, pathToMention, removeMentionFromInput } from './acpParser';
 
 describe('acpParser', () => {
   it('parses initialized', () => {
@@ -106,20 +106,38 @@ describe('acpParser', () => {
     const text = 'analyze this';
     const attachments = ['/a/b.ts', '/c/d.ts'];
     const result = buildAcpPromptText(text, attachments);
-    expect(result).toContain('analyze this');
-    expect(result).toContain('Attached file paths:');
-    expect(result).toContain('- /a/b.ts');
-    expect(result).toContain('- /c/d.ts');
+    expect(result).toBe('analyze this\n\nAttached file paths:\n/a/b.ts\n/c/d.ts');
+  });
+
+  it('buildAcpPromptText matches Rust attachment-only format', () => {
+    expect(buildAcpPromptText('', ['/a/b.ts'])).toBe('Attached file paths:\n/a/b.ts');
   });
 
   it('buildAcpPromptText returns text only when no attachments', () => {
     expect(buildAcpPromptText('hello', [])).toBe('hello');
   });
 
+  it('pathToMention matches Rust basename and mojibake repair behavior', () => {
+    expect(pathToMention('C:/test/file.rs')).toBe('@file.rs');
+    expect(pathToMention('/home/user/şema.rs')).toBe('@şema.rs');
+    expect(pathToMention('C:/test/TÃ¼rkÃ§e.txt')).toBe('@Türkçe.txt');
+  });
+
+  it('appendMentionsToInput matches Rust spacing behavior', () => {
+    expect(appendMentionsToInput('', ['C:/test/foo.rs'])).toBe('@foo.rs');
+    expect(appendMentionsToInput('bunu incele', ['C:/test/foo.rs'])).toBe('bunu incele @foo.rs');
+    expect(appendMentionsToInput('incele', ['C:/test/a.rs', 'D:/test/b.rs'])).toBe('incele @a.rs @b.rs');
+    expect(appendMentionsToInput('incele', [])).toBe('incele');
+  });
+
   it('removeMentionFromInput removes last exact match', () => {
     const input = 'hello @file.ts world @file.ts';
     const result = removeMentionFromInput(input, '@file.ts');
-    expect(result).toBe('hello @file.ts world ');
+    expect(result).toBe('hello @file.ts world');
+  });
+
+  it('removeMentionFromInput keeps Rust first-position behavior', () => {
+    expect(removeMentionFromInput('@file.ts world', '@file.ts')).toBe(' world');
   });
 
   it('removeMentionFromInput returns unchanged when mention not found', () => {
