@@ -22,6 +22,8 @@ describe('browser MCP tool metadata', () => {
     expect(names).toContain('browser_cookie_delete');
     expect(names).toContain('browser_cookie_clear');
     expect(names).toContain('browser_navigate');
+    expect(names).toContain('browser_sessionstorage_get');
+    expect(names).toContain('browser_console_messages');
     expect(names).toContain('browser_page_summary');
     expect(names).toContain('browser_click');
     expect(names).toContain('browser_take_screenshot');
@@ -34,6 +36,8 @@ describe('browser MCP tool metadata', () => {
   it('uses advertised tools for allow checks', () => {
     expect(isBrowserMcpToolAllowed('browser_click', ['devtools'])).toBe(true);
     expect(isBrowserMcpToolAllowed('browser_cookie_list', ['devtools'])).toBe(true);
+    expect(isBrowserMcpToolAllowed('browser_sessionstorage_get', ['devtools'])).toBe(true);
+    expect(isBrowserMcpToolAllowed('browser_console_messages', ['devtools'])).toBe(true);
     expect(isBrowserMcpToolAllowed('browser_mouse_click_xy', ['devtools'])).toBe(false);
     expect(isBrowserMcpToolAllowed('browser_localstorage_get', ['devtools'])).toBe(false);
     expect(isBrowserMcpToolAllowed('browser_localstorage_get', ['storage'])).toBe(true);

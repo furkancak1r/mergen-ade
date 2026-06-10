@@ -65,6 +65,12 @@ export function actionControlsEnabled(session: Pick<AcpChatSession, 'sessionId'>
   return Boolean(session?.sessionId);
 }
 
+export function acpModeUiLabel(modeId: string | undefined): string | undefined {
+  if (modeId === 'plan') return 'Plan';
+  if (!modeId || modeId === 'build') return undefined;
+  return modeId;
+}
+
 function commandText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }

@@ -4924,3 +4924,115 @@
   - Prefer Electron session APIs for Browser state operations instead of DOM-only fallbacks when the Rust feature targets browser-level state.
 - Files/Commands touched: `electron/main/browserMcpTools.ts`, `electron/main/browserMcpService.ts`, `electron/main/browserMcpTools.test.ts`, `KNOWN_ISSUES.md`
 - References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser MCP core/devtools tool listesi Rust ile tam hizali degildi {#electron-browser-mcp-tool-list-core-devtools-parity}
+- Date: 2026-06-10
+- Context: Rust Browser MCP advertises `browser_sessionstorage_*` in the core tool set and `browser_console_messages` in the devtools set. Electron advertised session storage only behind the optional `storage` capability and did not advertise the console messages tool. MCP-driven `browser_navigate` also mutated main-process BrowserView tab state without notifying the renderer tab model.
+- Error signature:
+  1. `tools/list --caps=devtools,vision` omitted `browser_sessionstorage_get` even though the Rust helper includes session storage in core tools.
+  2. `tools/list --caps=devtools` omitted `browser_console_messages`.
+  3. `browser_navigate` could create or retarget a BrowserView tab without mirroring that tab into React state, leaving the Browser panel tab strip stale.
+- Symptoms/Impact:
+  - OpenCode Browser MCP sessions in Electron saw a smaller tool surface than the Rust reference for the same capabilities.
+  - Agent-driven navigation could be active in the native BrowserView while the Electron UI did not show the corresponding tab/update.
+- Root cause:
+  - Electron's helper schema split session storage with local storage under `storage` instead of matching Rust's core/session-storage distinction.
+  - Main-process Browser MCP navigation reused BrowserView state without emitting the existing `browser:tabOpened` sync event.
+- Resolution:
+  - Moved `browser_sessionstorage_*` schemas into Electron Browser MCP core tools while keeping `browser_localstorage_*` under `storage`.
+  - Added the Rust-compatible `browser_console_messages` devtools schema with the same explicit not-implemented behavior.
+  - Changed `navigateBrowser()` to return the active tab snapshot and broadcast MCP navigation changes to renderer state.
+- Prevent recurrence:
+  - Keep Browser MCP capability placement covered in `browserMcpTools.test.ts`.
+  - When Browser MCP mutates main-process tabs, broadcast the changed tab state so renderer and BrowserView do not drift.
+- Files/Commands touched: `electron/main/browserMcpTools.ts`, `electron/main/browserMcpService.ts`, `electron/main/browserViewManager.ts`, `electron/main/browserMcpTools.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron ACP panel render hatasi tum ana ekrani karartabiliyordu {#electron-acp-panel-render-error-boundary}
+- Date: 2026-06-10
+- Context: The ACP chat panel is rendered directly inside the main content area. A renderer exception triggered from ACP-only UI state, such as slash command hint rendering or unexpected ACP event payloads, could tear down the React subtree and leave the user with a black main screen.
+- Error signature:
+  1. Typing `/` in the OpenCode ACP composer could make the UI go black instead of keeping the chat usable.
+  2. The failure was isolated to the ACP panel path, but there was no local error boundary around that path.
+- Symptoms/Impact:
+  - A malformed or unexpected ACP UI state could blank the active workspace view.
+  - Users had no in-app recovery action except closing/restarting or switching context.
+- Root cause:
+  - ACP-specific render failures were not isolated from the main area React tree.
+- Resolution:
+  - Added an `AcpErrorBoundary` component with a dark-theme fallback and close action.
+  - Wrapped `AcpChatPanel` with the boundary keyed by `chatId` so a new ACP chat resets the boundary state.
+- Prevent recurrence:
+  - Keep high-churn ACP UI paths, especially slash hints and permission/question cards, isolated behind the ACP boundary.
+  - Continue adding focused ACP UI helper tests for data-shape normalization before rendering.
+- Files/Commands touched: `electron/renderer/src/components/AcpErrorBoundary.tsx`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10; user report 2026-06-10
+
+---
+
+#### Electron ACP composer stack sirasi Rust gorunumunden sapmisti {#electron-acp-composer-stack-order-parity}
+- Date: 2026-06-10
+- Context: The Rust ACP chat panel stacks queued prompts above the composer body, slash command hints above the capsule, the composer capsule next, attachments and permission/question UI below the capsule, and a thin status row below the composer. Electron rendered the status row above the permission card and composer, and rendered attachment chips above the capsule.
+- Error signature:
+  1. The Electron ACP status row appeared between queued prompts and the interaction/composer area.
+  2. Attachment chips appeared above the rounded composer capsule instead of below it.
+  3. Permission/question UI was visually detached from the composer stack.
+- Symptoms/Impact:
+  - Electron ACP looked and behaved less like the Rust reference panel.
+  - Slash hints, permission cards, attachments, and status metadata did not preserve the same vertical relationship as the original.
+- Root cause:
+  - The first Electron ACP panel used a simpler React section order instead of the Rust composer stack layout.
+- Resolution:
+  - Reordered the Electron ACP panel so queued prompts remain above the composer, slash hints sit above the capsule, attachment chips and permission/question UI sit below the capsule, and the status row sits below the composer.
+  - Kept the single right-side composer action button behavior unchanged.
+- Prevent recurrence:
+  - When changing ACP UI, preserve the Rust stack order: queue, slash, capsule, attachments, permission/question, status.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser MCP tab secme/kapatma UI state'ini guncellemiyordu {#electron-browser-mcp-tab-snapshot-sync}
+- Date: 2026-06-10
+- Context: Rust keeps Browser MCP tab operations and UI state in the same app state. Electron split BrowserView state in the main process from React tab state in the renderer. Earlier parity work mirrored tab creation, but MCP-driven select/close operations still only changed main-process state.
+- Error signature:
+  1. `browser_tabs action=select` switched the native BrowserView tab but did not update the renderer active tab id.
+  2. `browser_tabs action=close` or `browser_close` removed/closed tabs in the main process but left stale tabs in the Browser panel.
+  3. Saved recording tabs opened through Browser MCP could be visible initially, but later MCP tab operations could drift from the React tab strip.
+- Symptoms/Impact:
+  - Browser MCP agents and the visible Browser panel could disagree about which tab is active or whether a tab still exists.
+  - Closing the last MCP-owned tab could leave stale UI chrome around an empty BrowserView state.
+- Root cause:
+  - Electron only emitted `browser:tabOpened` from Browser MCP, not a full tab snapshot after all MCP tab mutations.
+- Resolution:
+  - Added a main-process Browser tab snapshot helper.
+  - Added `browser:tabsChanged` IPC and renderer handling for tabs, active tab, URL draft, open project state, and terminal-scope visible override cleanup.
+  - Broadcast full snapshots after MCP navigate, new tab, select, close, `browser_close`, and saved recording tab creation.
+- Prevent recurrence:
+  - Browser MCP operations that mutate tabs must emit a full snapshot, not only one-off creation events.
+- Files/Commands touched: `electron/main/browserViewManager.ts`, `electron/main/browserMcpService.ts`, `electron/renderer/src/App.tsx`, `electron/shared/types.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron ACP queued row plan etiketi Rust gibi basliklandirilmiyordu {#electron-acp-queued-mode-label-parity}
+- Date: 2026-06-10
+- Context: Rust renders ACP mode labels with `plan` shown as `Plan`, hides the default `build` mode, and leaves custom mode ids visible. Electron already hid `build`, but rendered queued Plan prompts with the raw lowercase `plan` id.
+- Error signature:
+  1. Queued ACP rows showed `plan` instead of `Plan`.
+  2. Mode label formatting was embedded directly in the row instead of using a shared helper.
+- Symptoms/Impact:
+  - Electron ACP queued rows looked less polished and did not match the Rust panel.
+- Root cause:
+  - The Electron row only checked `modeId !== 'build'` and displayed the raw id.
+- Resolution:
+  - Added `acpModeUiLabel()` to mirror Rust's mode label behavior.
+  - Updated queued prompt rows to use the helper and added regression coverage.
+- Prevent recurrence:
+  - Keep ACP mode display formatting in `acpUi.ts` and cover plan/build/custom labels in `acpUi.test.ts`.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10

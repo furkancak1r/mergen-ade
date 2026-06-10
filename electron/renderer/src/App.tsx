@@ -9,6 +9,7 @@ import { SourceControl } from './components/SourceControl';
 import { FileEditor } from './components/FileEditor';
 import { Checklist } from './components/Checklist';
 import { AcpChatPanel } from './components/AcpChatPanel';
+import { AcpErrorBoundary } from './components/AcpErrorBoundary';
 import { BrowserPanel } from './components/BrowserPanel';
 import { SettingsPopup } from './components/SettingsPopup';
 import { InputHistory } from './components/InputHistory';
@@ -318,6 +319,79 @@ function App() {
         copy.set(scope.projectId, scope);
         return copy;
       });
+    });
+    return () => { unsub(); };
+  }, [config]);
+
+  useEffect(() => {
+    const unsub = api.on('browser:tabsChanged', (
+      scope: BrowserScopeKey,
+      state: { tabs: BrowserTab[]; activeTabId?: string; urlDraft?: string },
+    ) => {
+      if (config && !config.projects.some((project) => project.id === scope.projectId)) return;
+      const key = scopeKeyString(scope);
+      const tabs = state.tabs ?? [];
+      const activeTabId = state.activeTabId ?? tabs[0]?.id ?? null;
+      const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0];
+
+      setBrowserTabsByScope((prev) => {
+        const copy = new Map(prev);
+        if (tabs.length > 0) {
+          copy.set(key, tabs);
+        } else {
+          copy.delete(key);
+        }
+        const projectHasTabs = Array.from(copy.entries()).some(([scopeKey, scopeTabs]) => (
+          scopeTabs.length > 0
+          && (scopeKey === `project:${scope.projectId}` || scopeKey.startsWith(`terminal:${scope.projectId}:`))
+        ));
+        setBrowserOpenProjects((openPrev) => {
+          const next = new Set(openPrev);
+          if (projectHasTabs) {
+            next.add(scope.projectId);
+          } else {
+            next.delete(scope.projectId);
+          }
+          return next;
+        });
+        return copy;
+      });
+      setBrowserActiveTabByScope((prev) => {
+        const copy = new Map(prev);
+        if (activeTabId) {
+          copy.set(key, activeTabId);
+        } else {
+          copy.delete(key);
+        }
+        return copy;
+      });
+      setBrowserUrlDraftByScope((prev) => {
+        const copy = new Map(prev);
+        const urlDraft = state.urlDraft || activeTab?.url || '';
+        if (urlDraft) {
+          copy.set(key, urlDraft);
+        } else {
+          copy.delete(key);
+        }
+        return copy;
+      });
+      if (tabs.length > 0) {
+        setBrowserPanelVisibleScopeByProject((prev) => {
+          const copy = new Map(prev);
+          copy.set(scope.projectId, scope);
+          return copy;
+        });
+      } else if (scope.type === BrowserScopeKeyType.Terminal) {
+        setBrowserPanelVisibleScopeByProject((prev) => {
+          const override = prev.get(scope.projectId);
+          if (override && override.type === BrowserScopeKeyType.Terminal && override.terminalId === scope.terminalId) {
+            const copy = new Map(prev);
+            copy.delete(scope.projectId);
+            return copy;
+          }
+          return prev;
+        });
+      }
     });
     return () => { unsub(); };
   }, [config]);
@@ -1132,14 +1206,16 @@ function App() {
 
       <div className="main-area" ref={mainRef}>
         {activeAcpChat && acpProject ? (
-          <AcpChatPanel
-            project={acpProject}
-            chatId={activeAcpChat.chatId}
-            config={config || defaultAppConfig()}
-            onClose={closeAcpChat}
-            disabled={settingsOpen || checklistVisible}
-            branchName={branchNameByProject.get(activeAcpChat.projectId)}
-          />
+          <AcpErrorBoundary key={activeAcpChat.chatId} onClose={closeAcpChat}>
+            <AcpChatPanel
+              project={acpProject}
+              chatId={activeAcpChat.chatId}
+              config={config || defaultAppConfig()}
+              onClose={closeAcpChat}
+              disabled={settingsOpen || checklistVisible}
+              branchName={branchNameByProject.get(activeAcpChat.projectId)}
+            />
+          </AcpErrorBoundary>
         ) : fileEditorOpen && fileEditorPath && fileEditorName ? (
           <FileEditor
             filePath={fileEditorPath}

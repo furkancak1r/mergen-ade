@@ -4,6 +4,7 @@ import {
   OPENCODE_ACP_LABEL,
   OPENCODE_ACP_OPEN_BUTTON_LABEL,
   actionControlsEnabled,
+  acpModeUiLabel,
   hasConfigSelectorOptions,
   nextAcpActivityState,
   openCodeAcpPanelTitle,
@@ -58,6 +59,13 @@ describe('acpUi', () => {
     expect(actionControlsEnabled(null)).toBe(false);
     expect(actionControlsEnabled({ sessionId: undefined })).toBe(false);
     expect(actionControlsEnabled({ sessionId: 'sess-1' })).toBe(true);
+  });
+
+  it('matches Rust ACP mode labels for composer and queued rows', () => {
+    expect(acpModeUiLabel('plan')).toBe('Plan');
+    expect(acpModeUiLabel('build')).toBeUndefined();
+    expect(acpModeUiLabel(undefined)).toBeUndefined();
+    expect(acpModeUiLabel('custom')).toBe('custom');
   });
 
   it('normalizes slash command hints from id or name', () => {

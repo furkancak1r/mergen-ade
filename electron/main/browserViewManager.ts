@@ -1,5 +1,5 @@
 import { BrowserView, BrowserWindow } from 'electron';
-import type { BrowserScopeKey } from '../shared/types';
+import type { BrowserScopeKey, BrowserTab } from '../shared/types';
 import { BROWSER_MAX_TABS_PER_SCOPE, BrowserScopeKeyType } from '../shared/types';
 import path from 'path';
 import fs from 'fs';
@@ -7,7 +7,7 @@ import fs from 'fs';
 interface BrowserInstance {
   view: BrowserView;
   scope: BrowserScopeKey;
-  tabs: { id: string; url: string; title?: string; kind?: 'page' | 'recording' }[];
+  tabs: BrowserTab[];
   activeTabId?: string;
   urlDraft: string;
   designInspectEnabled: boolean;
@@ -104,6 +104,18 @@ export function getBrowserInstance(scope: BrowserScopeKey): BrowserInstance | un
   return instances.get(scopeKey(scope));
 }
 
+export function getBrowserTabsSnapshot(scope: BrowserScopeKey): { tabs: BrowserTab[]; activeTabId?: string; urlDraft: string } {
+  const instance = instances.get(scopeKey(scope));
+  if (!instance) {
+    return { tabs: [], activeTabId: undefined, urlDraft: '' };
+  }
+  return {
+    tabs: instance.tabs.map((tab) => ({ ...tab })),
+    activeTabId: instance.activeTabId,
+    urlDraft: instance.urlDraft,
+  };
+}
+
 export function syncBrowserBounds(scope: BrowserScopeKey, bounds: { x: number; y: number; width: number; height: number }): void {
   const instance = instances.get(scopeKey(scope));
   if (!instance) return;
@@ -151,23 +163,31 @@ export function hideBrowserView(scope: BrowserScopeKey): void {
   instance.cachedVisible = false;
 }
 
-export function navigateBrowser(scope: BrowserScopeKey, url: string): void {
+export function navigateBrowser(scope: BrowserScopeKey, url: string): BrowserTab | undefined {
   const instance = getBrowserInstance(scope) ?? createBrowserView(scope);
   const normalized = normalizeBrowserUrl(url);
-  if (!normalized) return;
+  if (!normalized) return undefined;
 
+  let active: BrowserTab | undefined;
   if (instance.tabs.length === 0) {
     const tabId = `tab-${Date.now()}`;
-    instance.tabs.push({ id: tabId, url: normalized });
+    active = { id: tabId, url: normalized, kind: 'page' };
+    instance.tabs.push(active);
     instance.activeTabId = tabId;
   } else {
-    const active = instance.tabs.find((t) => t.id === instance.activeTabId);
+    active = instance.tabs.find((t) => t.id === instance.activeTabId);
+    if (!active) {
+      active = instance.tabs[0];
+      instance.activeTabId = active?.id;
+    }
     if (active) {
       active.url = normalized;
+      active.kind = active.kind ?? 'page';
     }
   }
 
   instance.view.webContents.loadURL(normalized);
+  return active ? { ...active } : undefined;
 }
 
 export function browserGoBack(scope: BrowserScopeKey): void {

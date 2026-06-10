@@ -15,8 +15,9 @@ import {
   browserCloseTab,
   browserSwitchTab,
   destroyBrowserInstance,
+  getBrowserTabsSnapshot,
 } from './browserViewManager';
-import { BrowserScopeKeyType, type BrowserScopeKey, type BrowserTab } from '../shared/types';
+import { BrowserScopeKeyType, type BrowserScopeKey, type BrowserState, type BrowserTab } from '../shared/types';
 import { registerBrowserMcpHandler } from './hookService';
 import { normalizeBrowserMcpToolName } from './browserMcpTools';
 import { browserRecordingsDir } from './config';
@@ -76,6 +77,14 @@ function broadcastBrowserTabOpened(scope: BrowserScopeKey, tab: BrowserTab): voi
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
       win.webContents.send('browser:tabOpened', scope, tab);
+    }
+  }
+}
+
+function broadcastBrowserTabsChanged(scope: BrowserScopeKey, state: Pick<BrowserState, 'tabs' | 'activeTabId' | 'urlDraft'> = getBrowserTabsSnapshot(scope)): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) {
+      win.webContents.send('browser:tabsChanged', scope, state);
     }
   }
 }
@@ -188,7 +197,11 @@ async function executeBrowserMcpToolDirect(
   switch (tool) {
     case 'browser_navigate': {
       const url = String(p.url || '');
-      navigateBrowser(scope, url);
+      const tab = navigateBrowser(scope, url);
+      if (tab) {
+        broadcastBrowserTabOpened(scope, tab);
+        broadcastBrowserTabsChanged(scope);
+      }
       return { success: true, text: `Navigating to ${url}`, url };
     }
     case 'browser_click': {
@@ -239,6 +252,7 @@ async function executeBrowserMcpToolDirect(
     }
     case 'browser_close': {
       const closed = closeBrowserTabForParams(scope, p);
+      broadcastBrowserTabsChanged(scope);
       return { success: true, text: closed ? 'Closed browser tab' : 'Closed browser panel' };
     }
     case 'browser_wait_for': {
@@ -296,6 +310,7 @@ async function executeBrowserMcpToolDirect(
     }
     case 'browser_network_request':
     case 'browser_network_requests':
+    case 'browser_console_messages':
       return { success: false, error: `${tool} is not implemented by Electron Browser MCP yet` };
     case 'browser_start_video':
       return startBrowserVideoRecording(scope);
@@ -407,6 +422,7 @@ async function stopBrowserVideoRecording(scope: BrowserScopeKey): Promise<unknow
       title: `Recording ${path.basename(outputPath)}`,
       kind: 'recording',
     });
+    broadcastBrowserTabsChanged(scope);
     return {
       success: true,
       text: `Saved embedded Mergen browser video and opened it in tab ${tabId}: ${outputPath} (${state.frames.length} frames).`,
@@ -588,18 +604,21 @@ function handleBrowserTabsTool(scope: BrowserScopeKey, originalMethod: string, p
     const url = String(params.url || '');
     const tabId = browserAddTab(scope, url);
     broadcastBrowserTabOpened(scope, { id: tabId, url, kind: 'page' });
+    broadcastBrowserTabsChanged(scope);
     return { success: true, text: `Opened browser tab ${tabId}`, tabId };
   }
   if (action === 'select') {
     const tabId = tabIdFromParams(instance, params);
     if (!tabId) return { success: false, error: 'browser_tabs select requires tabId or index' };
     browserSwitchTab(scope, tabId);
+    broadcastBrowserTabsChanged(scope);
     return { success: true, text: `Selected browser tab ${tabId}`, tabId };
   }
   if (action === 'close') {
     const tabId = tabIdFromParams(instance, params);
     if (!tabId) return { success: false, error: 'browser_tabs close requires tabId or index' };
     browserCloseTab(scope, tabId);
+    broadcastBrowserTabsChanged(scope);
     return { success: true, text: `Closed browser tab ${tabId}`, tabId };
   }
   const tabs = instance?.tabs ?? [];

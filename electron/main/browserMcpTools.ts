@@ -88,6 +88,14 @@ function coreTools(): BrowserMcpToolSchema[] {
     tool('browser_navigate_back', 'Go back in the browser history.', schema({})),
     tool('browser_navigate_forward', 'Go forward in the browser history.', schema({})),
     tool('browser_reload', 'Reload the current page.', schema({})),
+    tool('browser_sessionstorage_clear', 'Clear session storage.', schema({})),
+    tool('browser_sessionstorage_delete', 'Delete a session storage item.', schema({ key: { type: 'string' } }, ['key'])),
+    tool('browser_sessionstorage_get', 'Get a session storage item.', schema({ key: { type: 'string' } }, ['key'])),
+    tool('browser_sessionstorage_list', 'List session storage keys.', schema({})),
+    tool('browser_sessionstorage_set', 'Set a session storage item.', schema({
+      key: { type: 'string' },
+      value: { type: 'string' },
+    }, ['key', 'value'])),
     tool('browser_tabs', 'List, create, select, or close tabs in the Mergen Browser panel. At most five tabs can be open per project.', schema({
       action: { type: 'string', enum: ['list', 'new', 'select', 'close'], default: 'list' },
       index: { type: 'integer' },
@@ -108,6 +116,7 @@ function coreTools(): BrowserMcpToolSchema[] {
 
 function devtoolsTools(): BrowserMcpToolSchema[] {
   return [
+    tool('browser_console_messages', 'Get browser console messages (not implemented by Electron Browser MCP yet).', schema({})),
     tool('browser_hide_highlight', 'Hide the active browser highlight overlay.', schema({})),
     tool('browser_highlight', 'Show a highlight overlay for a visible element.', schema(elementProperties({
       ref: { type: 'string', description: 'Element ref from browser_page_summary, e.g. e1' },
@@ -193,14 +202,6 @@ function storageTools(): BrowserMcpToolSchema[] {
     tool('browser_localstorage_get', 'Get a local storage item.', schema({ key: { type: 'string' } }, ['key'])),
     tool('browser_localstorage_list', 'List local storage keys.', schema({})),
     tool('browser_localstorage_set', 'Set a local storage item.', schema({
-      key: { type: 'string' },
-      value: { type: 'string' },
-    }, ['key', 'value'])),
-    tool('browser_sessionstorage_clear', 'Clear session storage.', schema({})),
-    tool('browser_sessionstorage_delete', 'Delete a session storage item.', schema({ key: { type: 'string' } }, ['key'])),
-    tool('browser_sessionstorage_get', 'Get a session storage item.', schema({ key: { type: 'string' } }, ['key'])),
-    tool('browser_sessionstorage_list', 'List session storage keys.', schema({})),
-    tool('browser_sessionstorage_set', 'Set a session storage item.', schema({
       key: { type: 'string' },
       value: { type: 'string' },
     }, ['key', 'value'])),

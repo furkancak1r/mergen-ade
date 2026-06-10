@@ -4,6 +4,7 @@ import { defaultAppConfig } from '../../../shared/types';
 import { removeMentionFromInput } from '../lib/acpParser';
 import {
   actionControlsEnabled,
+  acpModeUiLabel,
   hasConfigSelectorOptions,
   openCodeAcpPanelTitle,
   openCodeAcpWelcomeText,
@@ -378,103 +379,6 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         </div>
       )}
 
-      {/* Status row */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 12px', fontSize: 11, color: '#666', flexShrink: 0 }}>
-        <span>{branchNameDisplay}</span>
-        <span>Local</span>
-        <span>{session?.status || 'Idle'}</span>
-      </div>
-
-      {/* Permission card */}
-      {pendingQuestion && (
-        <div style={{ padding: '8px 12px', borderTop: '1px solid #222', background: '#1a1a1a', flexShrink: 0 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>{pendingQuestion.header}</div>
-          {pendingQuestion.kind === 'question' ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {(pendingQuestion.questions && pendingQuestion.questions.length > 0 ? pendingQuestion.questions : [{ header: pendingQuestion.header, question: pendingQuestion.question, options: pendingQuestion.options }]).map((q, idx) => (
-                <div key={idx} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                  {idx > 0 && <div style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>{q.header}</div>}
-                  <div style={{ fontSize: 12, color: '#aaa' }}>{q.question}</div>
-                  {q.options.length > 0 ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      {q.options.map((opt) => (
-                        <label key={`${idx}-${opt.label}`} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, fontSize: 12, color: '#ccc', cursor: 'pointer' }}>
-                          <input
-                            type="radio"
-                            name={`acp-question-${idx}`}
-                            checked={questionAnswers[idx] === opt.id}
-                            onChange={() => setQuestionAnswers((prev) => ({ ...prev, [idx]: opt.id }))}
-                            style={{ marginTop: 2 }}
-                          />
-                          <span>
-                            <span>{opt.label}</span>
-                            {opt.description && <span style={{ display: 'block', color: '#777', fontSize: 11 }}>{opt.description}</span>}
-                          </span>
-                        </label>
-                      ))}
-                    </div>
-                  ) : (
-                    <input
-                      value={questionAnswers[idx] || ''}
-                      onChange={(e) => setQuestionAnswers((prev) => ({ ...prev, [idx]: e.target.value }))}
-                      placeholder="Your answer..."
-                      style={{ width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', fontSize: 12, padding: '4px 8px', borderRadius: 4 }}
-                    />
-                  )}
-                </div>
-              ))}
-            </div>
-          ) : (
-            <>
-              <div style={{ fontSize: 12, color: '#aaa', marginBottom: 8 }}>{pendingQuestion.question}</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {pendingQuestion.options.map((opt) => (
-                  <label key={opt.id} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#ccc', cursor: 'pointer' }}>
-                    <input
-                      type={pendingQuestion.multiple ? 'checkbox' : 'radio'}
-                      name="acp-permission"
-                      checked={selectedOptions.includes(opt.id)}
-                      onChange={() => {
-                        if (pendingQuestion.multiple) {
-                          setSelectedOptions((prev) => prev.includes(opt.id) ? prev.filter((x) => x !== opt.id) : [...prev, opt.id]);
-                        } else {
-                          setSelectedOptions([opt.id]);
-                        }
-                      }}
-                    />
-                    {opt.label}
-                  </label>
-                ))}
-              </div>
-              {pendingQuestion.custom && (
-                <input
-                  ref={customInputRef}
-                  value={customAnswer}
-                  onChange={(e) => setCustomAnswer(e.target.value)}
-                  placeholder="Your answer..."
-                  style={{ marginTop: 8, width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', fontSize: 12, padding: '4px 8px', borderRadius: 4 }}
-                />
-              )}
-            </>
-          )}
-          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-            <button
-              onClick={submitPendingInteraction}
-              disabled={!pendingQuestionSubmitEnabled}
-              style={{ fontSize: 12, padding: '4px 12px', borderRadius: 4, border: '1px solid #333', background: '#1f3a4c', color: '#ccc', cursor: pendingQuestionSubmitEnabled ? 'pointer' : 'not-allowed', opacity: pendingQuestionSubmitEnabled ? 1 : 0.55 }}
-            >
-              Submit
-            </button>
-            <button
-              onClick={rejectPendingInteraction}
-              style={{ fontSize: 12, padding: '4px 12px', borderRadius: 4, border: '1px solid #333', background: 'transparent', color: '#888', cursor: 'pointer' }}
-            >
-              Reject
-            </button>
-          </div>
-        </div>
-      )}
-
       {/* Composer area */}
       <div style={{ padding: '8px 12px', borderTop: '1px solid #222', flexShrink: 0 }}>
         {/* Slash hints above input */}
@@ -491,18 +395,6 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               >
                 {hint}
               </button>
-            ))}
-          </div>
-        )}
-
-        {/* Attachment chips below capsule */}
-        {attachments.length > 0 && (
-          <div style={{ display: 'flex', gap: 4, marginBottom: 6, flexWrap: 'wrap' }}>
-            {attachments.map((a, i) => (
-              <span key={i} style={{ fontSize: 11, color: '#b4b4b4', background: '#282828', padding: '2px 6px', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 4, border: '1px solid #5a5a5a' }}>
-                {a.split(/[/\\]/).pop() || a}
-                <button onClick={() => removeAttachment(i)} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}>✕</button>
-              </span>
             ))}
           </div>
         )}
@@ -648,6 +540,117 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
             {showStop ? '✕' : '➤'}
           </button>
         </div>
+
+        {/* Attachment chips below capsule */}
+        {attachments.length > 0 && (
+          <div style={{ display: 'flex', gap: 4, marginTop: 6, flexWrap: 'wrap' }}>
+            {attachments.map((a, i) => (
+              <span key={i} style={{ fontSize: 11, color: '#b4b4b4', background: '#282828', padding: '2px 6px', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 4, border: '1px solid #5a5a5a' }}>
+                {a.split(/[/\\]/).pop() || a}
+                <button onClick={() => removeAttachment(i)} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}>✕</button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Permission card below capsule */}
+        {pendingQuestion && (
+          <div style={{ marginTop: 6, padding: '8px 10px', borderRadius: 6, border: '1px solid #2a2a2a', background: '#171717', flexShrink: 0 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>{pendingQuestion.header}</div>
+            {pendingQuestion.kind === 'question' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {(pendingQuestion.questions && pendingQuestion.questions.length > 0 ? pendingQuestion.questions : [{ header: pendingQuestion.header, question: pendingQuestion.question, options: pendingQuestion.options }]).map((q, idx) => (
+                  <div key={idx} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {idx > 0 && <div style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>{q.header}</div>}
+                    <div style={{ fontSize: 12, color: '#aaa' }}>{q.question}</div>
+                    {q.options.length > 0 ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                        {q.options.map((opt) => (
+                          <label key={`${idx}-${opt.label}`} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, fontSize: 12, color: '#ccc', cursor: 'pointer' }}>
+                            <input
+                              type="radio"
+                              name={`acp-question-${idx}`}
+                              checked={questionAnswers[idx] === opt.id}
+                              onChange={() => setQuestionAnswers((prev) => ({ ...prev, [idx]: opt.id }))}
+                              style={{ marginTop: 2 }}
+                            />
+                            <span>
+                              <span>{opt.label}</span>
+                              {opt.description && <span style={{ display: 'block', color: '#777', fontSize: 11 }}>{opt.description}</span>}
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    ) : (
+                      <input
+                        value={questionAnswers[idx] || ''}
+                        onChange={(e) => setQuestionAnswers((prev) => ({ ...prev, [idx]: e.target.value }))}
+                        placeholder="Your answer..."
+                        style={{ width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', fontSize: 12, padding: '4px 8px', borderRadius: 4 }}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <>
+                <div style={{ fontSize: 12, color: '#aaa', marginBottom: 8 }}>{pendingQuestion.question}</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {pendingQuestion.options.map((opt) => (
+                    <label key={opt.id} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#ccc', cursor: 'pointer' }}>
+                      <input
+                        type={pendingQuestion.multiple ? 'checkbox' : 'radio'}
+                        name="acp-permission"
+                        checked={selectedOptions.includes(opt.id)}
+                        onChange={() => {
+                          if (pendingQuestion.multiple) {
+                            setSelectedOptions((prev) => prev.includes(opt.id) ? prev.filter((x) => x !== opt.id) : [...prev, opt.id]);
+                          } else {
+                            setSelectedOptions([opt.id]);
+                          }
+                        }}
+                      />
+                      {opt.label}
+                    </label>
+                  ))}
+                </div>
+                {pendingQuestion.custom && (
+                  <input
+                    ref={customInputRef}
+                    value={customAnswer}
+                    onChange={(e) => setCustomAnswer(e.target.value)}
+                    placeholder="Your answer..."
+                    style={{ marginTop: 8, width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', fontSize: 12, padding: '4px 8px', borderRadius: 4 }}
+                  />
+                )}
+              </>
+            )}
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <button
+                onClick={submitPendingInteraction}
+                disabled={!pendingQuestionSubmitEnabled}
+                style={{ fontSize: 12, padding: '4px 12px', borderRadius: 4, border: '1px solid #333', background: '#1f3a4c', color: '#ccc', cursor: pendingQuestionSubmitEnabled ? 'pointer' : 'not-allowed', opacity: pendingQuestionSubmitEnabled ? 1 : 0.55 }}
+              >
+                Submit
+              </button>
+              <button
+                onClick={rejectPendingInteraction}
+                style={{ fontSize: 12, padding: '4px 12px', borderRadius: 4, border: '1px solid #333', background: 'transparent', color: '#888', cursor: 'pointer' }}
+              >
+                Reject
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Status row */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '0 12px 6px', fontSize: 11, color: '#666', flexShrink: 0 }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{branchNameDisplay}</span>
+          <span>Local</span>
+        </span>
+        <span>{session?.status || 'Idle'}</span>
       </div>
     </div>
   );
@@ -678,12 +681,13 @@ const MessageBubble: React.FC<{ message: AcpChatMessage }> = ({ message }) => {
 };
 
 const QueuedPromptRow: React.FC<{ prompt: QueuedAcpPrompt }> = ({ prompt }) => {
+  const modeLabel = acpModeUiLabel(prompt.modeId);
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#1a1a1a', borderRadius: 8, marginBottom: 4, fontSize: 12, color: '#888' }}>
       <span style={{ color: '#666', fontWeight: 600 }}>Queued</span>
       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prompt.text || prompt.finalPromptText}</span>
-      {prompt.modeId && prompt.modeId !== 'build' && (
-        <span style={{ fontSize: 10, color: '#666', background: '#222', padding: '2px 6px', borderRadius: 3 }}>{prompt.modeId}</span>
+      {modeLabel && (
+        <span style={{ fontSize: 10, color: '#666', background: '#222', padding: '2px 6px', borderRadius: 3 }}>{modeLabel}</span>
       )}
     </div>
   );
