@@ -7,11 +7,24 @@ const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...ar
 interface FileEditorProps {
   filePath: string;
   displayName: string;
+  canNavigateBack?: boolean;
+  canNavigateForward?: boolean;
+  onNavigateBack?: () => void;
+  onNavigateForward?: () => void;
   onClose?: () => void;
   onDirtyChange?: (dirty: boolean) => void;
 }
 
-export const FileEditor: React.FC<FileEditorProps> = ({ filePath, displayName, onClose, onDirtyChange }) => {
+export const FileEditor: React.FC<FileEditorProps> = ({
+  filePath,
+  displayName,
+  canNavigateBack = false,
+  canNavigateForward = false,
+  onNavigateBack,
+  onNavigateForward,
+  onClose,
+  onDirtyChange,
+}) => {
   const [text, setText] = useState('');
   const [savedText, setSavedText] = useState('');
   const [loading, setLoading] = useState(true);
@@ -55,6 +68,10 @@ export const FileEditor: React.FC<FileEditorProps> = ({ filePath, displayName, o
   }, [filePath, text]);
 
   const isDirty = text !== savedText;
+  const backEnabled = Boolean(onNavigateBack && canNavigateBack && !isDirty);
+  const forwardEnabled = Boolean(onNavigateForward && canNavigateForward && !isDirty);
+  const backTitle = isDirty ? 'Save changes before navigating back' : canNavigateBack ? 'Back' : 'No previous file';
+  const forwardTitle = isDirty ? 'Save changes before navigating forward' : canNavigateForward ? 'Forward' : 'No next file';
 
   useEffect(() => {
     onDirtyChange?.(isDirty);
@@ -209,11 +226,33 @@ export const FileEditor: React.FC<FileEditorProps> = ({ filePath, displayName, o
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#0c0c0c' }}>
       {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #222', flexShrink: 0 }}>
-        <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>
-          {cappedHoverText(displayName, 60)}
-          {isDirty && <span style={{ color: '#e8a838', marginLeft: 4 }}>●</span>}
-        </span>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #222', flexShrink: 0, gap: 8 }}>
+        <div className="file-editor-title-group">
+          <div className="file-editor-nav-group" aria-label="File editor navigation">
+            <button
+              className="file-editor-toolbar-btn"
+              onClick={onNavigateBack}
+              disabled={!backEnabled}
+              title={backTitle}
+              aria-label="Back"
+            >
+              ←
+            </button>
+            <button
+              className="file-editor-toolbar-btn"
+              onClick={onNavigateForward}
+              disabled={!forwardEnabled}
+              title={forwardTitle}
+              aria-label="Forward"
+            >
+              →
+            </button>
+          </div>
+          <span className="file-editor-title" title={displayName}>
+            {cappedHoverText(displayName, 60)}
+            {isDirty && <span style={{ color: '#e8a838', marginLeft: 4 }}>●</span>}
+          </span>
+        </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button
             className={`file-editor-toolbar-btn ${isDirty ? '' : 'muted'}`}

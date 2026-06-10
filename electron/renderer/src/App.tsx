@@ -27,6 +27,16 @@ import { recordInputHistory, removeProjectsInputHistory } from './lib/inputHisto
 import { activityRailItem, isLeftSidebarTabActive, withLeftSidebarRailToggle, withLeftSidebarTabOpen } from './lib/activityRail';
 import { checklistRightOffset } from './lib/checklist';
 import { browserProjectIdsAfterScopeEmpty } from './lib/browserToolbar';
+import { OPENCODE_ACP_LABEL } from './lib/acpUi';
+import {
+  fileEditorLocationFromPath,
+  initialFileEditorNavigationState,
+  withFileEditorClosed,
+  withFileEditorHidden,
+  withFileEditorNavigateBack,
+  withFileEditorNavigateForward,
+  withFileEditorOpened,
+} from './lib/fileEditor';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -43,10 +53,11 @@ function App() {
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
 
-  const [fileEditorOpen, setFileEditorOpen] = useState(false);
-  const [fileEditorPath, setFileEditorPath] = useState<string | null>(null);
-  const [fileEditorName, setFileEditorName] = useState<string | null>(null);
+  const [fileEditorState, setFileEditorState] = useState(initialFileEditorNavigationState);
   const [fileEditorDirty, setFileEditorDirty] = useState(false);
+  const fileEditorOpen = fileEditorState.open;
+  const fileEditorPath = fileEditorState.active?.path ?? null;
+  const fileEditorName = fileEditorState.active?.displayName ?? null;
 
   const [checklistVisible, setChecklistVisible] = useState(false);
 
@@ -181,8 +192,8 @@ function App() {
       const parts: string[] = [];
       if (fileEditorDirty) parts.push('You have unsaved changes in the file editor.');
       if (terminals.length > 0) parts.push(`${terminals.length} terminal session(s) are still running.`);
-      if (acpRunning) parts.push('An ACP chat session is still running.');
-      if (acpQueuedPrompts) parts.push('You have queued prompts in the ACP chat.');
+      if (acpRunning) parts.push(`An ${OPENCODE_ACP_LABEL} session is still running.`);
+      if (acpQueuedPrompts) parts.push(`You have queued prompts in ${OPENCODE_ACP_LABEL}.`);
       const message = parts.length > 0
         ? `Are you sure you want to close Mergen ADE?\n\n${parts.join('\n')}`
         : 'Are you sure you want to close Mergen ADE?';
@@ -294,7 +305,7 @@ function App() {
 
   const activateTerminal = useCallback((id: number) => {
     setActiveTerminalId(id);
-    setFileEditorOpen(false);
+    setFileEditorState((prev) => withFileEditorHidden(prev));
     setActiveAcpChat(null);
     suppressAcpRestoreRef.current = true;
     const t = terminals.find((x) => x.id === id);
@@ -309,7 +320,7 @@ function App() {
     const chatId = activeAcpChatByProject.get(projectId);
     if (chatId) {
       setActiveAcpChat({ chatId, projectId });
-      setFileEditorOpen(false);
+      setFileEditorState((prev) => withFileEditorHidden(prev));
       setActiveTab(LeftSidebarTabEnum.TerminalManager);
       setConfig((prev) => prev ? withTerminalManagerOpened(prev) : prev);
     }
@@ -601,15 +612,26 @@ function App() {
   }, [pty, activeTerminalId, terminals]);
 
   const openFile = useCallback((filePath: string) => {
-    setFileEditorPath(filePath);
-    setFileEditorName(filePath.split(/[\\/]/).pop() || filePath);
-    setFileEditorOpen(true);
+    setFileEditorState((prev) => withFileEditorOpened(prev, fileEditorLocationFromPath(filePath)));
     setActiveAcpChat(null);
   }, []);
 
   const closeFileEditor = useCallback(() => {
-    setFileEditorOpen(false);
+    setFileEditorState((prev) => withFileEditorClosed(prev));
+    setFileEditorDirty(false);
   }, []);
+
+  const navigateFileEditorBack = useCallback(() => {
+    if (fileEditorDirty) return;
+    setFileEditorState((prev) => withFileEditorNavigateBack(prev));
+    setFileEditorDirty(false);
+  }, [fileEditorDirty]);
+
+  const navigateFileEditorForward = useCallback(() => {
+    if (fileEditorDirty) return;
+    setFileEditorState((prev) => withFileEditorNavigateForward(prev));
+    setFileEditorDirty(false);
+  }, [fileEditorDirty]);
 
   const handleAddProject = useCallback(async () => {
     const result = await api.invoke('dialog:showOpen', { properties: ['openDirectory'] }) as string[] | undefined;
@@ -689,7 +711,7 @@ function App() {
       return next;
     });
     setActiveAcpChat({ chatId, projectId });
-    setFileEditorOpen(false);
+    setFileEditorState((prev) => withFileEditorHidden(prev));
     // Reveal Terminal Manager with Foreground filter and expand root project
     setActiveTab(LeftSidebarTabEnum.TerminalManager);
     setConfig((prev) => prev ? withTerminalManagerOpened(prev) : prev);
@@ -1084,6 +1106,10 @@ function App() {
           <FileEditor
             filePath={fileEditorPath}
             displayName={fileEditorName}
+            canNavigateBack={fileEditorState.backStack.length > 0}
+            canNavigateForward={fileEditorState.forwardStack.length > 0}
+            onNavigateBack={navigateFileEditorBack}
+            onNavigateForward={navigateFileEditorForward}
             onClose={closeFileEditor}
             onDirtyChange={setFileEditorDirty}
           />

@@ -17,6 +17,18 @@ export interface AcpCommandLike {
   name?: unknown;
 }
 
+export const OPENCODE_ACP_LABEL = 'OpenCode ACP';
+export const OPENCODE_ACP_OPEN_BUTTON_LABEL = '+ ACP';
+export const OPENCODE_ACP_CLOSE_TOOLTIP = `Close ${OPENCODE_ACP_LABEL}`;
+
+export function openCodeAcpPanelTitle(projectName: string): string {
+  return `${OPENCODE_ACP_LABEL} - ${projectName}`;
+}
+
+export function openCodeAcpWelcomeText(): string {
+  return `Welcome to ${OPENCODE_ACP_LABEL}`;
+}
+
 export function isAcpRunningStatus(status: AcpChatSession['status'] | undefined): boolean {
   return status === 'running' || status === 'permission';
 }

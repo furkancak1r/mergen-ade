@@ -4,7 +4,9 @@ import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalMana
 import type { GitDiffSummary } from '../../../shared/gitDiffSummary';
 import { gitDiffSummaryLabel } from '../../../shared/gitDiffSummary';
 import type { TerminalInstance } from '../hooks/usePty';
+import { OPENCODE_ACP_CLOSE_TOOLTIP, OPENCODE_ACP_LABEL, OPENCODE_ACP_OPEN_BUTTON_LABEL } from '../lib/acpUi';
 import { effectiveLauncherCommand } from '../lib/launcher';
+import { terminalManagerPathMenuLabel } from '../lib/terminalManagerState';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
 
@@ -668,7 +670,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
               setPathContextMenu(null);
             }}
           >
-            Copy Path
+            {terminalManagerPathMenuLabel('copy_path')}
           </button>
           <button
             type="button"
@@ -680,7 +682,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
               setPathContextMenu(null);
             }}
           >
-            Open in Folder
+            {terminalManagerPathMenuLabel('open_folder')}
           </button>
         </div>
       )}
@@ -888,7 +890,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                 />
                 <IconButton
                   icon="💬"
-                  tooltip="OpenCode Chat"
+                  tooltip={OPENCODE_ACP_LABEL}
                   onClick={(e) => {
                     e.stopPropagation();
                     if (!expanded) {
@@ -1124,7 +1126,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             );
           })()}
 
-          {/* ACP Chat row */}
+          {/* OpenCode ACP row */}
           {activeAcpChatByProject && activeAcpChatByProject.has(project.id) && (
             <div
               style={{
@@ -1147,7 +1149,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                 flexShrink: 0,
               }} />
               <span style={{ fontSize: 11, color: '#7ec0ee', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                OpenCode Chat
+                {OPENCODE_ACP_LABEL}
               </span>
               <button
                 onClick={(e) => {
@@ -1164,13 +1166,13 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   cursor: 'pointer',
                   flexShrink: 0,
                 }}
-                title="Close Chat"
+                title={OPENCODE_ACP_CLOSE_TOOLTIP}
               >
                 ✕
               </button>
             </div>
           )}
-          {/* OpenCode Chat button */}
+          {/* OpenCode ACP button */}
           {activeAcpChatByProject && !activeAcpChatByProject.has(project.id) && filter === TerminalManagerFilterEnum.Foreground && terminals.some((t) => t.kind === 'foreground' && t.aiTool === 'opencode') && (
             <div style={{ padding: isWorktree ? '2px 8px 2px 36px' : '2px 8px 2px 24px' }}>
               <button
@@ -1185,7 +1187,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   cursor: 'pointer',
                 }}
               >
-                + Chat
+                {OPENCODE_ACP_OPEN_BUTTON_LABEL}
               </button>
             </div>
           )}

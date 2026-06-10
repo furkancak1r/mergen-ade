@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { defaultAppConfig, LeftSidebarTab, TerminalManagerFilter } from '../../../shared/types';
 import {
   normalizeTerminalManagerStartupState,
+  terminalManagerPathMenuLabel,
   withTerminalManagerFilter,
   withTerminalManagerOpened,
   withToggledTerminalManagerHideInactive,
@@ -69,5 +70,10 @@ describe('terminalManagerState', () => {
 
     expect(next.ui.terminalManagerFilter).toBe(TerminalManagerFilter.Background);
     expect(next.ui.terminalManagerHideInactiveProjects).toBe(false);
+  });
+
+  it('uses icon-prefixed labels for path context menu actions', () => {
+    expect(terminalManagerPathMenuLabel('copy_path')).toBe('⧉ Copy Path');
+    expect(terminalManagerPathMenuLabel('open_folder')).toBe('📂 Open in Folder');
   });
 });

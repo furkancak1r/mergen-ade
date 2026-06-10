@@ -1,7 +1,14 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import type { DirectoryNode, ProjectRecord } from '../../../shared/types';
 import { repairMojibakeDisplay } from '../lib/mojibake';
-import { collectLoadedDirectoryPaths, directoryNodeContextActions, directoryTreeHasCollapsedFolders, type DirectoryNodeContextAction } from '../lib/directoryTree';
+import {
+  DIRECTORY_NO_MATCHING_MESSAGE,
+  collectLoadedDirectoryPaths,
+  directoryNodeContextActionLabel,
+  directoryNodeContextActions,
+  directoryTreeHasCollapsedFolders,
+  type DirectoryNodeContextAction,
+} from '../lib/directoryTree';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
 
@@ -57,19 +64,6 @@ function highlightMatch(text: string, query: string): React.ReactNode {
     i = idx + query.length;
   }
   return parts;
-}
-
-function directoryContextActionLabel(action: DirectoryNodeContextAction): string {
-  switch (action) {
-    case 'openInEditor':
-      return 'Open in Editor';
-    case 'openWithDefaultApp':
-      return 'Open with Default App';
-    case 'revealInFolder':
-      return 'Reveal in Folder';
-    case 'copyPath':
-      return 'Copy Path';
-  }
 }
 
 interface ProjectExplorerProps {
@@ -570,7 +564,7 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, proje
           <div style={{ padding: 12, color: '#888', fontSize: 12 }}>Searching folders...</div>
         )}
         {!loading && !error && !searchLoading && filteredRoot === null && (
-          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>No matching files or folders.</div>
+          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>{DIRECTORY_NO_MATCHING_MESSAGE}</div>
         )}
       </div>
       {feedback && (
@@ -594,7 +588,7 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, proje
                 setNodeContextMenu(null);
               }}
             >
-              {directoryContextActionLabel(action)}
+              {directoryNodeContextActionLabel(action)}
             </button>
           ))}
         </div>

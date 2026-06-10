@@ -1,14 +1,27 @@
 import { describe, expect, it } from 'vitest';
 import {
+  OPENCODE_ACP_CLOSE_TOOLTIP,
+  OPENCODE_ACP_LABEL,
+  OPENCODE_ACP_OPEN_BUTTON_LABEL,
   actionControlsEnabled,
   hasConfigSelectorOptions,
   nextAcpActivityState,
+  openCodeAcpPanelTitle,
+  openCodeAcpWelcomeText,
   shouldShowAcpWelcome,
   slashCommandHint,
   slashCommandHints,
 } from './acpUi';
 
 describe('acpUi', () => {
+  it('uses OpenCode ACP as the canonical user-facing label', () => {
+    expect(OPENCODE_ACP_LABEL).toBe('OpenCode ACP');
+    expect(OPENCODE_ACP_OPEN_BUTTON_LABEL).toBe('+ ACP');
+    expect(OPENCODE_ACP_CLOSE_TOOLTIP).toBe('Close OpenCode ACP');
+    expect(openCodeAcpPanelTitle('Mergen')).toBe('OpenCode ACP - Mergen');
+    expect(openCodeAcpWelcomeText()).toBe('Welcome to OpenCode ACP');
+  });
+
   it('keeps ACP running true after promptSent events without a status field', () => {
     const next = nextAcpActivityState({ running: false, hasQueuedPrompts: false }, { type: 'promptSent' });
     expect(next.running).toBe(true);

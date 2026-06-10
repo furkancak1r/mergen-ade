@@ -4765,3 +4765,89 @@
   - Keep Browser toolbar metadata covered in `browserToolbar.test.ts` before changing URL toolbar controls.
 - Files/Commands touched: `electron/renderer/src/components/BrowserPanel.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
 - References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron File Editor geri/ileri gecmisi yoktu {#electron-file-editor-navigation-history-parity}
+- Date: 2026-06-10
+- Context: Rust's built-in File Editor keeps a bounded navigation history (`back_stack`, `forward_stack`, `max_history = 20`) and exposes back/forward navigation state. Electron only tracked the currently visible file path/name.
+- Error signature:
+  1. Opening another file replaced the active editor target without any previous/next file history.
+  2. Switching to a terminal or ACP chat hid the editor but there was no reusable history state to restore navigation context.
+  3. The File Editor header had Save/Close actions only.
+- Symptoms/Impact:
+  - Users could not move between recently opened files from the editor, making Electron less capable than the Rust reference during source inspection.
+- Root cause:
+  - The Electron port modeled File Editor state as separate `open`, `path`, and `name` values instead of the Rust-style active file plus bounded navigation stacks.
+- Resolution:
+  - Added tested File Editor navigation helpers with active location, back stack, forward stack, hide, close, and max-history behavior.
+  - Converted App File Editor state to a single navigation state object.
+  - Added compact Back/Forward icon buttons to the File Editor header.
+  - Disabled navigation while the current file has unsaved edits so Electron does not discard dirty textarea state during path changes.
+- Prevent recurrence:
+  - Keep File Editor navigation behavior covered in `fileEditor.test.ts` when changing editor state or header controls.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/FileEditor.tsx`, `electron/renderer/src/lib/fileEditor.ts`, `electron/renderer/src/lib/fileEditor.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Terminal Manager path menusu ikonlu aksiyonlardan sapmisti {#electron-terminal-manager-path-menu-icon-parity}
+- Date: 2026-06-10
+- Context: Rust's path context menus use icon-prefixed actions for copying paths and opening folders. Electron Terminal Manager had the same actions, but rendered them as plain `Copy Path` and `Open in Folder` labels.
+- Error signature:
+  1. Project/worktree path context menu actions had no leading icon.
+  2. Terminal Manager context menu labels did not match the visual treatment already ported to other Electron panels.
+- Symptoms/Impact:
+  - The menu looked less like the Rust reference and less consistent with Source Control and Browser action menus.
+- Root cause:
+  - Terminal Manager kept early text-only labels after the Rust icon-prefixed context menu treatment was ported elsewhere.
+- Resolution:
+  - Added a tested Terminal Manager path menu label helper.
+  - Updated Copy Path and Open in Folder menu rows to use icon-prefixed labels.
+- Prevent recurrence:
+  - Keep Terminal Manager path menu labels covered in `terminalManagerState.test.ts`.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/terminalManagerState.ts`, `electron/renderer/src/lib/terminalManagerState.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron OpenCode ACP etiketleri Chat/ACP arasinda drift etmisti {#electron-opencode-acp-label-parity}
+- Date: 2026-06-10
+- Context: Rust standardized user-facing OpenCode ACP labels to `OpenCode ACP`, including the ACP panel header, Terminal Manager foreground row, launcher row, and Settings shortcut card. Electron still used a mix of `ACP Chat`, `OpenCode Chat`, `+ Chat`, and `Close Chat`.
+- Error signature:
+  1. ACP panel header rendered `ACP Chat - <project>`.
+  2. ACP welcome text rendered `Welcome to ACP Chat`.
+  3. Terminal Manager foreground row rendered `OpenCode Chat` and the open button rendered `+ Chat`.
+  4. Settings sections rendered generic `ACP Mode Toggle Shortcut` / `ACP Favorite Models`.
+- Symptoms/Impact:
+  - Users saw multiple names for the same terminal-less OpenCode ACP feature, making Electron look inconsistent with the Rust reference and with current docs.
+- Root cause:
+  - Electron kept labels from an earlier identity-leak mitigation phase after the Rust UI was later standardized back to `OpenCode ACP`.
+- Resolution:
+  - Added tested canonical OpenCode ACP label helpers in `acpUi.ts`.
+  - Updated ACP panel, Terminal Manager, close warning, and Settings labels to use the shared `OpenCode ACP` copy.
+- Prevent recurrence:
+  - Keep canonical ACP labels covered in `acpUi.test.ts`; avoid hardcoding `OpenCode Chat` / `ACP Chat` in user-facing UI.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/components/SettingsPopup.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Directory context menusu ve bos sonuc metni Rust'tan sapmisti {#electron-directory-context-menu-copy-parity}
+- Date: 2026-06-10
+- Context: Rust's Directory panel uses a noktasiz `No matching files or folders` empty search label and icon-prefixed context menu rows for Open in Editor, Reveal in Folder, and Copy Path. Electron had a trailing period in the empty label and plain text context menu rows.
+- Error signature:
+  1. Search no-result state rendered `No matching files or folders.` with a trailing period.
+  2. File context menu rows rendered `Open in Editor`, `Reveal in Folder`, and `Copy Path` without Rust-style leading icons.
+  3. Directory context menu rendered plain `Copy Path`.
+- Symptoms/Impact:
+  - Directory panel looked subtly inconsistent with the Rust reference and with the icon-prefixed context menu treatment already ported into Source Control and Terminal Manager.
+- Root cause:
+  - Directory panel labels were kept as local component strings instead of being centralized in the tested Directory helper layer.
+- Resolution:
+  - Added tested Directory empty-state and context action label helpers.
+  - Updated Project Explorer to use the shared helpers for no-match and context menu text.
+- Prevent recurrence:
+  - Keep Directory no-match and context menu labels covered in `directoryTree.test.ts` when changing Project Explorer row actions.
+- Files/Commands touched: `electron/renderer/src/components/ProjectExplorer.tsx`, `electron/renderer/src/lib/directoryTree.ts`, `electron/renderer/src/lib/directoryTree.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10

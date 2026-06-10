@@ -269,6 +269,31 @@ body {
   cursor: not-allowed;
 }
 
+.file-editor-title-group {
+  align-items: center;
+  display: flex;
+  flex: 1 1 auto;
+  gap: 8px;
+  min-width: 0;
+}
+
+.file-editor-nav-group {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 2px;
+}
+
+.file-editor-title {
+  color: #eee;
+  font-size: 12px;
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .file-editor-toolbar-btn {
   align-items: center;
   background: transparent;

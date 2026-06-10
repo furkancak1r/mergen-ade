@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { DirectoryNode } from '../../../shared/types';
-import { collectLoadedDirectoryPaths, directoryNodeContextActions, directoryTreeHasCollapsedFolders } from './directoryTree';
+import {
+  DIRECTORY_NO_MATCHING_MESSAGE,
+  collectLoadedDirectoryPaths,
+  directoryNodeContextActionLabel,
+  directoryNodeContextActions,
+  directoryTreeHasCollapsedFolders,
+} from './directoryTree';
 
 function node(partial: Partial<DirectoryNode> & Pick<DirectoryNode, 'name' | 'path'>): DirectoryNode {
   return {
@@ -47,5 +53,13 @@ describe('directoryTree helpers', () => {
       'revealInFolder',
       'copyPath',
     ]);
+  });
+
+  it('matches Rust directory empty-state and context menu copy', () => {
+    expect(DIRECTORY_NO_MATCHING_MESSAGE).toBe('No matching files or folders');
+    expect(directoryNodeContextActionLabel('openInEditor')).toBe('<> Open in Editor');
+    expect(directoryNodeContextActionLabel('openWithDefaultApp')).toBe('Open with Default App');
+    expect(directoryNodeContextActionLabel('revealInFolder')).toBe('📂 Reveal in Folder');
+    expect(directoryNodeContextActionLabel('copyPath')).toBe('⧉ Copy Path');
   });
 });

@@ -32,6 +32,7 @@ import {
   runtimeOverview,
   type ActiveTerminalDiagnostics,
 } from '../lib/diagnostics';
+import { OPENCODE_ACP_LABEL } from '../lib/acpUi';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).mergenApi;
 
@@ -638,7 +639,7 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
                 <label htmlFor="autoApprove" style={{ fontSize: 12, color: '#ccc' }}>Auto-approve ACP permissions</label>
               </div>
               <div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 8 }}>ACP Mode Toggle Shortcut</div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 8 }}>{OPENCODE_ACP_LABEL} Mode Toggle Shortcut</div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <input
                     type="checkbox"
@@ -660,9 +661,9 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
                 </div>
               </div>
               <div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 8 }}>ACP Favorite Models</div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 8 }}>{OPENCODE_ACP_LABEL} Favorite Models</div>
                 {draft.opencode.acpKnownModels.length === 0 ? (
-                  <div style={{ fontSize: 11, color: '#666' }}>No known models yet. Open an ACP chat to populate this list.</div>
+                  <div style={{ fontSize: 11, color: '#666' }}>No known models yet. Open {OPENCODE_ACP_LABEL} to populate this list.</div>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                     {draft.opencode.acpKnownModels.map((model) => {

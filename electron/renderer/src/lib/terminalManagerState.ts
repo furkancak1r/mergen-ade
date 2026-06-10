@@ -1,6 +1,17 @@
 import type { AppConfig, TerminalManagerFilter } from '../../../shared/types';
 import { LeftSidebarTab, TerminalManagerFilter as TerminalManagerFilterEnum } from '../../../shared/types';
 
+export type TerminalManagerPathMenuAction = 'copy_path' | 'open_folder';
+
+export function terminalManagerPathMenuLabel(action: TerminalManagerPathMenuAction): string {
+  switch (action) {
+    case 'copy_path':
+      return '⧉ Copy Path';
+    case 'open_folder':
+      return '📂 Open in Folder';
+  }
+}
+
 export function withTerminalManagerFilter(
   config: AppConfig,
   terminalManagerFilter: TerminalManagerFilter,

@@ -2,7 +2,15 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import type { AcpChatSession, AcpChatMessage, ProjectRecord, AcpConfigOption, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
 import { defaultAppConfig } from '../../../shared/types';
 import { removeMentionFromInput } from '../lib/acpParser';
-import { actionControlsEnabled, hasConfigSelectorOptions, optionValues, shouldShowAcpWelcome, slashCommandHints } from '../lib/acpUi';
+import {
+  actionControlsEnabled,
+  hasConfigSelectorOptions,
+  openCodeAcpPanelTitle,
+  openCodeAcpWelcomeText,
+  optionValues,
+  shouldShowAcpWelcome,
+  slashCommandHints,
+} from '../lib/acpUi';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -331,7 +339,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #222', flexShrink: 0 }}>
         <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>
-          ACP Chat — {project.name}
+          {openCodeAcpPanelTitle(project.name)}
         </span>
         <span style={{ fontSize: 11, color: '#888' }}>
           {session?.status || 'Loading...'}
@@ -348,7 +356,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         {isWelcome ? (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16 }}>
             <div style={{ color: '#666', fontSize: 13, textAlign: 'center' }}>
-              Welcome to ACP Chat
+              {openCodeAcpWelcomeText()}
             </div>
           </div>
         ) : (
