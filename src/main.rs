@@ -30,6 +30,7 @@ mod app;
 mod browser_mcp_helper;
 mod browser_mcp_service;
 mod browser_video;
+mod claude_codex_hook;
 mod codex;
 mod config;
 mod hooks;

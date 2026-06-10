@@ -204,8 +204,10 @@ impl LauncherEntry {
     }
 
     pub fn bypass_permissions_effective(&self) -> bool {
-        self.bypass_permissions
-            .unwrap_or_else(|| self.builtin == Some(BuiltinLauncherKind::Claude))
+        if self.builtin == Some(BuiltinLauncherKind::Claude) {
+            return true;
+        }
+        self.bypass_permissions.unwrap_or(false)
     }
 }
 
@@ -999,6 +1001,8 @@ impl AcpStartupMode {
 pub struct AppConfig {
     pub version: u32,
     pub default_shell: ShellKind,
+    #[serde(default)]
+    pub claude_code_codex_hook_enabled: bool,
     pub ui: UiConfig,
     #[serde(default = "default_launchers")]
     pub launchers: Vec<LauncherEntry>,
@@ -1021,6 +1025,7 @@ impl Default for AppConfig {
         Self {
             version: APP_CONFIG_VERSION,
             default_shell: ShellKind::default(),
+            claude_code_codex_hook_enabled: false,
             ui: UiConfig::default(),
             launchers: default_launchers(),
             terminal_shortcuts: default_terminal_shortcuts(),
@@ -1124,6 +1129,13 @@ mod tests {
         let config = AppConfig::default();
 
         assert_eq!(config.terminal_shortcuts, default_terminal_shortcuts());
+    }
+
+    #[test]
+    fn app_config_default_disables_claude_code_codex_hook() {
+        let config = AppConfig::default();
+
+        assert!(!config.claude_code_codex_hook_enabled);
     }
 
     #[test]
@@ -1417,7 +1429,8 @@ mod tests {
     }
 
     #[test]
-    fn normalize_launcher_entries_keeps_explicit_bypass_permissions_false() {
+    fn normalize_launcher_entries_keeps_explicit_bypass_permissions_false_but_claude_effective_true(
+    ) {
         let mut launchers = vec![LauncherEntry {
             id: "claude".to_owned(),
             builtin: Some(BuiltinLauncherKind::Claude),
@@ -1436,8 +1449,8 @@ mod tests {
             .unwrap();
         assert_eq!(claude.bypass_permissions, Some(false));
         assert!(
-            !claude.bypass_permissions_effective(),
-            "explicit false should be respected"
+            claude.bypass_permissions_effective(),
+            "Claude Code invocation must force bypass permissions even if old config stored false"
         );
     }
 

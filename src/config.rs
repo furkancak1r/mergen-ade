@@ -289,6 +289,7 @@ impl From<LegacyAppConfig> for AppConfig {
         AppConfig {
             version: value.version,
             default_shell: value.default_shell,
+            claude_code_codex_hook_enabled: false,
             ui: value.ui,
             launchers: default_launchers(),
             terminal_shortcuts: default_terminal_shortcuts(),
@@ -486,6 +487,25 @@ path = "C:/work/demo"
         let config = load_config(&path).expect("should load config");
 
         assert_eq!(config.default_shell, ShellKind::default());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_claude_code_codex_hook_setting_defaults_disabled() {
+        let path = unique_temp_path("missing-claude-code-codex-hook");
+        fs::write(
+            &path,
+            r#"
+version = 1
+default_shell = "powershell"
+"#,
+        )
+        .expect("should write config");
+
+        let config = load_config(&path).expect("should load config");
+
+        assert!(!config.claude_code_codex_hook_enabled);
 
         let _ = fs::remove_file(path);
     }

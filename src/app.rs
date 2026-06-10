@@ -52,6 +52,9 @@ use crate::browser_mcp_service::{
 use crate::browser_video::{
     encode_browser_video_mp4, BrowserVideoChapter, BrowserVideoEncodeResult, BrowserVideoFrame,
 };
+use crate::claude_codex_hook::{
+    self, PlanFileContent, PlanStatus, TestCommand, TestCommandResult, MAX_REVIEW_FIX_ROUNDS,
+};
 use crate::codex::{self, CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
 use crate::config;
 use crate::hooks::{
@@ -269,6 +272,8 @@ const TERMINAL_HISTORY_POPUP_HEIGHT_SCALE: f32 = 1.5;
 const CHECKLIST_MESSAGE_MAX_HEIGHT: f32 = 120.0;
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
+const CLAUDE_CODEX_HOOK_PROGRESS_HEIGHT: f32 = 24.0;
+const CLAUDE_CODEX_HOOK_PROGRESS_GAP: f32 = 4.0;
 const TERMINAL_TILE_GAP_X: f32 = 0.0;
 const TERMINAL_TILE_GAP_Y: f32 = 0.0;
 const TERMINAL_PANE_INNER_MARGIN: f32 = 2.0;
@@ -1874,6 +1879,7 @@ static CODEX_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OPENCODE_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BROWSER_MCP_PENDING_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BROWSER_SCREENSHOT_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CLAUDE_CODEX_HOOK_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // Default blank project constants
 const RESERVED_BLANK_PROJECT_ID: u64 = 0;
@@ -3098,6 +3104,155 @@ impl TerminalPromptSubmitOptions {
             clear_previous_delayed_enters: true,
         }
     }
+
+    const fn claude_codex_internal() -> Self {
+        Self {
+            activate_after_send: true,
+            set_visible_in_main: true,
+            schedule_confirmation_enter: true,
+            confirmation_enter_count: 2,
+            record_history: false,
+            update_status_line: false,
+            clear_previous_delayed_enters: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeCodexHookPhase {
+    Planning,
+    AwaitingImplementation,
+    Testing,
+    Reviewing,
+    AwaitingFix,
+    Done,
+    Blocked,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeCodexHookSession {
+    terminal_id: u64,
+    project_id: u64,
+    project_path: PathBuf,
+    session_id: String,
+    original_prompt: String,
+    plan_path: PathBuf,
+    phase: ClaudeCodexHookPhase,
+    review_round: u8,
+    plan: Option<String>,
+    plan_error: Option<String>,
+    test_results: Vec<TestCommandResult>,
+    test_note: Option<String>,
+    review_output: Option<String>,
+    review_error: Option<String>,
+    ui_changed_files: Vec<String>,
+    ui_verification: Option<String>,
+    final_note: Option<String>,
+}
+
+impl ClaudeCodexHookSession {
+    fn plan_file_content(&self, status: PlanStatus) -> PlanFileContent {
+        PlanFileContent {
+            session_id: self.session_id.clone(),
+            status: Some(status),
+            original_prompt: self.original_prompt.clone(),
+            plan: self.plan.clone(),
+            plan_error: self.plan_error.clone(),
+            test_results: self.test_results.clone(),
+            test_note: self.test_note.clone(),
+            review_round: self.review_round,
+            review_output: self.review_output.clone(),
+            review_error: self.review_error.clone(),
+            ui_changed_files: self.ui_changed_files.clone(),
+            ui_verification: self.ui_verification.clone(),
+            final_note: self.final_note.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ClaudeCodexHookProgressModel {
+    text: String,
+    tooltip: String,
+    accent: Color32,
+}
+
+fn claude_codex_hook_phase_label(phase: ClaudeCodexHookPhase) -> &'static str {
+    match phase {
+        ClaudeCodexHookPhase::Planning => "Codex planning",
+        ClaudeCodexHookPhase::AwaitingImplementation => "Claude implementing Codex plan",
+        ClaudeCodexHookPhase::Testing => "Running tests",
+        ClaudeCodexHookPhase::Reviewing => "Codex reviewing",
+        ClaudeCodexHookPhase::AwaitingFix => "Claude fixing Codex review findings",
+        ClaudeCodexHookPhase::Done => "Codex hook done",
+        ClaudeCodexHookPhase::Blocked => "Codex hook blocked",
+    }
+}
+
+fn claude_codex_hook_phase_accent(phase: ClaudeCodexHookPhase) -> Color32 {
+    match phase {
+        ClaudeCodexHookPhase::Planning => Color32::from_rgb(96, 165, 250),
+        ClaudeCodexHookPhase::AwaitingImplementation => Color32::from_rgb(120, 190, 145),
+        ClaudeCodexHookPhase::Testing => Color32::from_rgb(220, 170, 60),
+        ClaudeCodexHookPhase::Reviewing => Color32::from_rgb(96, 165, 250),
+        ClaudeCodexHookPhase::AwaitingFix => Color32::from_rgb(235, 150, 80),
+        ClaudeCodexHookPhase::Done => Color32::from_rgb(95, 190, 130),
+        ClaudeCodexHookPhase::Blocked => Color32::from_rgb(220, 80, 80),
+    }
+}
+
+fn claude_codex_hook_progress_model(
+    session: &ClaudeCodexHookSession,
+) -> ClaudeCodexHookProgressModel {
+    let phase_label = claude_codex_hook_phase_label(session.phase);
+    let text = match session.phase {
+        ClaudeCodexHookPhase::AwaitingFix => format!(
+            "Claude Code Codex hook: {phase_label} ({}/{})",
+            session.review_round.min(MAX_REVIEW_FIX_ROUNDS),
+            MAX_REVIEW_FIX_ROUNDS
+        ),
+        ClaudeCodexHookPhase::Reviewing if session.review_round > 0 => {
+            format!(
+                "Claude Code Codex hook: {phase_label} ({}/{})",
+                session.review_round.min(MAX_REVIEW_FIX_ROUNDS),
+                MAX_REVIEW_FIX_ROUNDS
+            )
+        }
+        _ => format!("Claude Code Codex hook: {phase_label}"),
+    };
+    let tooltip = format!(
+        "Session: {}\nStatus: {}\nPlan file: {}",
+        session.session_id,
+        phase_label,
+        session.plan_path.display()
+    );
+
+    ClaudeCodexHookProgressModel {
+        text,
+        tooltip,
+        accent: claude_codex_hook_phase_accent(session.phase),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ClaudeCodexHookEvent {
+    PlanFinished {
+        terminal_id: u64,
+        session_id: String,
+        result: Result<String, String>,
+    },
+    TestsFinished {
+        terminal_id: u64,
+        session_id: String,
+        commands: Vec<TestCommand>,
+        results: Vec<TestCommandResult>,
+        ui_changed_files: Vec<String>,
+    },
+    ReviewFinished {
+        terminal_id: u64,
+        session_id: String,
+        result: Result<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3653,6 +3808,9 @@ pub struct AdeApp {
     foreground_message_popup_draft: String,
     foreground_message_popup_submit_pending: bool,
     smart_input_submit_pending: Option<SmartInputSubmitRequest>,
+    claude_codex_hook_sessions: BTreeMap<u64, ClaudeCodexHookSession>,
+    claude_codex_hook_events_tx: Sender<ClaudeCodexHookEvent>,
+    claude_codex_hook_events_rx: Receiver<ClaudeCodexHookEvent>,
     launcher_draft: LauncherDraftState,
     launcher_icon_textures: BTreeMap<LauncherIconKey, TextureHandle>,
     launcher_icon_failures: BTreeSet<LauncherIconKey>,
@@ -5189,6 +5347,7 @@ impl DirectorySearchVisiblePaths {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PendingConfigChanges {
     default_shell: bool,
+    claude_codex_hook: bool,
     launchers: bool,
     shortcuts: bool,
     opencode: bool,
@@ -5315,6 +5474,7 @@ struct SettingsEditOutcome {
     should_persist: bool,
     ui_config_changed: bool,
     default_shell_changed: bool,
+    claude_codex_hook_changed: bool,
     launchers_changed: bool,
     opencode_changed: bool,
     projects_changed: bool,
@@ -5331,6 +5491,11 @@ impl SettingsEditOutcome {
     fn note_default_shell_change(&mut self) {
         self.should_persist = true;
         self.default_shell_changed = true;
+    }
+
+    fn note_claude_codex_hook_change(&mut self) {
+        self.should_persist = true;
+        self.claude_codex_hook_changed = true;
     }
 
     fn note_launchers_change(&mut self) {
@@ -6378,6 +6543,8 @@ impl AdeApp {
             crossbeam_channel::unbounded();
         let (create_worktree_events_tx, create_worktree_events_rx) = crossbeam_channel::unbounded();
         let (acp_chat_events_tx, acp_chat_events_rx) = crossbeam_channel::unbounded();
+        let (claude_codex_hook_events_tx, claude_codex_hook_events_rx) =
+            crossbeam_channel::unbounded();
         spawn_source_control_worker(source_control_commands_rx, source_control_events_tx.clone());
         spawn_directory_index_worker(
             directory_index_commands_rx,
@@ -6467,6 +6634,9 @@ impl AdeApp {
             foreground_message_popup_draft: String::new(),
             foreground_message_popup_submit_pending: false,
             smart_input_submit_pending: None,
+            claude_codex_hook_sessions: BTreeMap::new(),
+            claude_codex_hook_events_tx,
+            claude_codex_hook_events_rx,
             launcher_draft: LauncherDraftState::default(),
             launcher_icon_textures: BTreeMap::new(),
             launcher_icon_failures: std::collections::BTreeSet::new(),
@@ -6672,6 +6842,10 @@ impl AdeApp {
 
     fn note_default_shell_changed(&mut self) {
         self.pending_config_changes.default_shell = true;
+    }
+
+    fn note_claude_codex_hook_changed(&mut self) {
+        self.pending_config_changes.claude_codex_hook = true;
     }
 
     fn note_launchers_changed(&mut self) {
@@ -7044,6 +7218,7 @@ impl AdeApp {
                 self.reset_factory_droid_hook_inbox(terminal_id);
                 self.clear_codex_state(terminal_id);
                 self.reset_codex_notify_inbox(terminal_id);
+                self.claude_codex_hook_sessions.remove(&terminal_id);
                 if let Some(service) = self.browser_mcp_service.as_ref() {
                     service.revoke_terminal(terminal_id);
                 }
@@ -15448,6 +15623,26 @@ impl AdeApp {
         shortcuts
     }
 
+    fn should_intercept_raw_claude_codex_prompt(terminal: &TerminalEntry, prompt: &str) -> bool {
+        let trimmed = prompt.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('/')
+            || trimmed.starts_with('$')
+            || terminal.exited
+            || terminal.ai_session.tool != Some(AiCliTool::Claude)
+            || !terminal.claude_session_active
+            || terminal.claude_attention_reason.is_some()
+            || matches!(
+                terminal.claude_normalized_status,
+                Some(ClaudeTransportStatus::Working | ClaudeTransportStatus::Permission)
+            )
+        {
+            return false;
+        }
+
+        terminal_title_candidate(trimmed).is_some()
+    }
+
     fn visible_terminal_ids_for_main(&self) -> Vec<u64> {
         if !self.config.ui.multi_terminal_view_enabled {
             return self.single_terminal_id_for_main().into_iter().collect();
@@ -15636,12 +15831,23 @@ impl AdeApp {
         let mut submitted_opencode_non_work_slash = false;
         let mut committed_codex_reply = false;
         let mut cancelled_factory_interactive_prompt = false;
+        let mut claude_codex_raw_prompt = None;
         let mut sent_terminal_input = false;
         // Track ANY terminal interaction separately from sent_terminal_input
         // This ensures pulse clears even for interactions that don't send bytes
         let mut terminal_interaction = false;
         // Collect history data to record after the terminal borrow is released
         let mut history_to_record: Option<(u64, TerminalKind, String)> = None;
+        let claude_codex_raw_hook_available = self.config.claude_code_codex_hook_enabled
+            && !self
+                .claude_codex_hook_sessions
+                .get(&active_terminal_id)
+                .is_some_and(|session| {
+                    !matches!(
+                        session.phase,
+                        ClaudeCodexHookPhase::Done | ClaudeCodexHookPhase::Blocked
+                    )
+                });
         {
             let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
                 return;
@@ -15710,9 +15916,9 @@ impl AdeApp {
 
                         if key == Key::Enter {
                             Self::clear_terminal_selection(terminal);
-                            outbound.push(b'\r');
-                            sent_terminal_input = true;
                             let line = std::mem::take(&mut terminal.pending_line_for_title);
+                            let history_line =
+                                std::mem::take(&mut terminal.pending_input_for_history);
                             let line_stem = Self::launch_command_stem(&line)
                                 .map(|stem| stem.to_ascii_lowercase());
                             // Only detect AI launch commands if terminal is not already owned by any AI.
@@ -15760,6 +15966,30 @@ impl AdeApp {
                             let opencode_non_work_slash_command =
                                 Self::is_opencode_non_work_slash_command(&line);
                             let has_non_empty_raw_line = !line.trim().is_empty();
+                            let raw_prompt_for_hook = history_line
+                                .trim()
+                                .is_empty()
+                                .then(|| line.trim())
+                                .filter(|prompt| !prompt.is_empty())
+                                .unwrap_or_else(|| history_line.trim());
+                            if claude_codex_raw_hook_available
+                                && Self::should_intercept_raw_claude_codex_prompt(
+                                    terminal,
+                                    raw_prompt_for_hook,
+                                )
+                            {
+                                // The user may have typed the prompt directly into the Claude TUI
+                                // over previous frames, so clear Claude's current input line before
+                                // Mergen submits the Codex-plan implementation prompt.
+                                outbound.clear();
+                                outbound.push(0x15); // Ctrl+U: clear current TUI input line.
+                                claude_codex_raw_prompt = Some(raw_prompt_for_hook.to_owned());
+                                terminal.dirty = true;
+                                continue;
+                            }
+
+                            outbound.push(b'\r');
+                            sent_terminal_input = true;
                             let has_non_empty_line = sanitized_line
                                 .as_ref()
                                 .is_some_and(|candidate| !candidate.trim().is_empty());
@@ -15842,8 +16072,6 @@ impl AdeApp {
                             // Record to persistent input history from the raw history buffer.
                             // This preserves multi-line and Unicode content unlike the title buffer.
                             // Store data to record after the borrow is released.
-                            let history_line =
-                                std::mem::take(&mut terminal.pending_input_for_history);
                             if !history_line.trim().is_empty() {
                                 // Track recent inputs for tooltip/rerun history from RAW input
                                 // (not sanitized title) so multi-line prompts are preserved
@@ -15896,6 +16124,32 @@ impl AdeApp {
             }
 
             Self::flush_terminal_outbound(terminal, ctx, &mut outbound);
+        }
+
+        if let Some(prompt) = claude_codex_raw_prompt {
+            let handled = self.try_start_claude_codex_hook_session(
+                ctx,
+                active_terminal_id,
+                &prompt,
+                TerminalPromptSubmitOptions::manual_saved_message(),
+            );
+            if handled != Some(true) {
+                if self.submit_prompt_to_terminal_unhooked(
+                    ctx,
+                    active_terminal_id,
+                    &prompt,
+                    TerminalPromptSubmitOptions::manual_saved_message(),
+                ) {
+                    self.status_line =
+                        "Claude Code Codex hook could not start; sent prompt to Claude normally."
+                            .to_owned();
+                } else {
+                    self.status_line =
+                        "Claude Code Codex hook could not start for the raw prompt.".to_owned();
+                }
+            }
+            ctx.request_repaint();
+            return;
         }
 
         // Record input history after the terminal borrow is released
@@ -16587,6 +16841,7 @@ impl AdeApp {
         self.reset_codex_notify_inbox(terminal_id);
         self.clear_opencode_state(terminal_id);
         self.reset_opencode_notify_inbox(terminal_id);
+        self.claude_codex_hook_sessions.remove(&terminal_id);
         if self
             .smart_input_submit_pending
             .is_some_and(|request| match request {
@@ -17666,6 +17921,568 @@ impl AdeApp {
         }
     }
 
+    fn try_start_claude_codex_hook_session(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        message: &str,
+        options: TerminalPromptSubmitOptions,
+    ) -> Option<bool> {
+        if !self.config.claude_code_codex_hook_enabled || message.trim().is_empty() {
+            return None;
+        }
+
+        let (project_id, terminal_kind) = {
+            let terminal = self.terminals.get(&terminal_id)?;
+            if terminal.exited || terminal.ai_session.tool != Some(AiCliTool::Claude) {
+                return None;
+            }
+            (terminal.project_id, terminal.kind)
+        };
+
+        if self
+            .claude_codex_hook_sessions
+            .get(&terminal_id)
+            .is_some_and(|session| {
+                !matches!(
+                    session.phase,
+                    ClaudeCodexHookPhase::Done | ClaudeCodexHookPhase::Blocked
+                )
+            })
+        {
+            self.status_line =
+                "Claude Code Codex hook is already running for this terminal.".to_owned();
+            return Some(false);
+        }
+
+        let Some(project_path) = self
+            .projects
+            .get(&project_id)
+            .map(|project| project.path.clone())
+        else {
+            self.status_line =
+                "Claude Code Codex hook skipped because the project record is missing.".to_owned();
+            return None;
+        };
+
+        let counter = CLAUDE_CODEX_HOOK_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let session_id = claude_codex_hook::session_id(terminal_id, counter);
+        let plan_path = claude_codex_hook::plan_path(&project_path, &session_id);
+        let session = ClaudeCodexHookSession {
+            terminal_id,
+            project_id,
+            project_path: project_path.clone(),
+            session_id: session_id.clone(),
+            original_prompt: message.trim().to_owned(),
+            plan_path: plan_path.clone(),
+            phase: ClaudeCodexHookPhase::Planning,
+            review_round: 0,
+            plan: None,
+            plan_error: None,
+            test_results: Vec::new(),
+            test_note: None,
+            review_output: None,
+            review_error: None,
+            ui_changed_files: Vec::new(),
+            ui_verification: None,
+            final_note: None,
+        };
+
+        if let Err(err) = claude_codex_hook::write_plan_file(
+            &plan_path,
+            &session.plan_file_content(PlanStatus::Planned),
+        ) {
+            self.status_line = format!(
+                "Claude Code Codex hook could not create plan file (continuing normally): {err}"
+            );
+            return None;
+        }
+
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            if options.set_visible_in_main {
+                terminal.in_main_view = true;
+            }
+            Self::push_recent_input(&mut terminal.recent_inputs, message);
+            terminal.dirty = true;
+        }
+        if options.record_history {
+            self.record_input_history(project_id, terminal_kind, message);
+        }
+        self.bump_layout_epoch();
+        if options.activate_after_send {
+            self.set_active_terminal(ctx, Some(terminal_id));
+        }
+
+        self.claude_codex_hook_sessions.insert(terminal_id, session);
+        self.spawn_claude_codex_plan_worker(
+            ctx,
+            terminal_id,
+            session_id,
+            project_path,
+            message.trim().to_owned(),
+            plan_path,
+        );
+        self.status_line = "Claude Code Codex hook planning with Codex...".to_owned();
+        ctx.request_repaint();
+        Some(true)
+    }
+
+    fn spawn_claude_codex_plan_worker(
+        &self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        session_id: String,
+        project_path: PathBuf,
+        original_prompt: String,
+        plan_path: PathBuf,
+    ) {
+        let tx = self.claude_codex_hook_events_tx.clone();
+        let repaint = ctx.clone();
+        #[cfg(test)]
+        {
+            let _ = original_prompt;
+            let _ = project_path;
+            let _ = plan_path;
+            let _ = tx.send(ClaudeCodexHookEvent::PlanFinished {
+                terminal_id,
+                session_id,
+                result: Ok("Test Codex plan.".to_owned()),
+            });
+            repaint.request_repaint();
+            return;
+        }
+
+        #[cfg(not(test))]
+        std::thread::spawn(move || {
+            let prompt = claude_codex_hook::build_codex_plan_prompt(&original_prompt, &plan_path);
+            let result = claude_codex_hook::run_codex_exec(&project_path, &prompt);
+            let _ = tx.send(ClaudeCodexHookEvent::PlanFinished {
+                terminal_id,
+                session_id,
+                result,
+            });
+            repaint.request_repaint();
+        });
+    }
+
+    fn spawn_claude_codex_tests_worker(
+        &self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        session_id: String,
+        project_path: PathBuf,
+    ) {
+        let tx = self.claude_codex_hook_events_tx.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let commands = claude_codex_hook::discover_test_commands(&project_path);
+            let results = claude_codex_hook::run_test_commands(&project_path, &commands);
+            let ui_changed_files = claude_codex_hook::detect_ui_changed_files(&project_path);
+            let _ = tx.send(ClaudeCodexHookEvent::TestsFinished {
+                terminal_id,
+                session_id,
+                commands,
+                results,
+                ui_changed_files,
+            });
+            repaint.request_repaint();
+        });
+    }
+
+    fn spawn_claude_codex_review_worker(
+        &self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        session_id: String,
+        project_path: PathBuf,
+        plan_path: PathBuf,
+        test_summary: String,
+        review_round: u8,
+    ) {
+        let tx = self.claude_codex_hook_events_tx.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let prompt = claude_codex_hook::build_codex_review_prompt(
+                &plan_path,
+                &test_summary,
+                review_round,
+            );
+            let result = claude_codex_hook::run_codex_exec(&project_path, &prompt);
+            let _ = tx.send(ClaudeCodexHookEvent::ReviewFinished {
+                terminal_id,
+                session_id,
+                result,
+            });
+            repaint.request_repaint();
+        });
+    }
+
+    fn process_claude_codex_hook_events(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.claude_codex_hook_events_rx.try_recv() {
+            match event {
+                ClaudeCodexHookEvent::PlanFinished {
+                    terminal_id,
+                    session_id,
+                    result,
+                } => self.handle_claude_codex_plan_finished(ctx, terminal_id, &session_id, result),
+                ClaudeCodexHookEvent::TestsFinished {
+                    terminal_id,
+                    session_id,
+                    commands,
+                    results,
+                    ui_changed_files,
+                } => self.handle_claude_codex_tests_finished(
+                    ctx,
+                    terminal_id,
+                    &session_id,
+                    commands,
+                    results,
+                    ui_changed_files,
+                ),
+                ClaudeCodexHookEvent::ReviewFinished {
+                    terminal_id,
+                    session_id,
+                    result,
+                } => {
+                    self.handle_claude_codex_review_finished(ctx, terminal_id, &session_id, result)
+                }
+            }
+        }
+    }
+
+    fn handle_claude_codex_plan_finished(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        session_id: &str,
+        result: Result<String, String>,
+    ) {
+        let Some(session) = self.claude_codex_hook_sessions.get_mut(&terminal_id) else {
+            return;
+        };
+        if session.session_id != session_id || session.phase != ClaudeCodexHookPhase::Planning {
+            return;
+        }
+
+        match result {
+            Ok(plan) if !plan.trim().is_empty() => {
+                session.plan = Some(plan);
+                session.plan_error = None;
+            }
+            Ok(_) => {
+                session.plan_error = Some("Codex returned an empty plan.".to_owned());
+            }
+            Err(err) => {
+                session.plan_error = Some(err);
+            }
+        }
+        session.phase = ClaudeCodexHookPhase::AwaitingImplementation;
+        self.persist_claude_codex_plan_for_terminal(terminal_id, PlanStatus::Implementing);
+
+        let prompt = self
+            .claude_codex_hook_sessions
+            .get(&terminal_id)
+            .map(Self::claude_codex_implementation_prompt)
+            .unwrap_or_default();
+        if self.submit_prompt_to_terminal_unhooked(
+            ctx,
+            terminal_id,
+            &prompt,
+            TerminalPromptSubmitOptions::claude_codex_internal(),
+        ) {
+            let plan_path = self
+                .claude_codex_hook_sessions
+                .get(&terminal_id)
+                .map(|session| session.plan_path.display().to_string())
+                .unwrap_or_default();
+            self.status_line = format!("Claude Code implementing Codex plan: {plan_path}");
+        } else {
+            self.block_claude_codex_session(
+                terminal_id,
+                "Claude Code prompt could not be submitted after Codex planning.".to_owned(),
+            );
+        }
+    }
+
+    fn handle_claude_codex_tests_finished(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        session_id: &str,
+        commands: Vec<TestCommand>,
+        results: Vec<TestCommandResult>,
+        ui_changed_files: Vec<String>,
+    ) {
+        let Some(session) = self.claude_codex_hook_sessions.get_mut(&terminal_id) else {
+            return;
+        };
+        if session.session_id != session_id || session.phase != ClaudeCodexHookPhase::Testing {
+            return;
+        }
+
+        session.test_results = results;
+        session.test_note = commands.is_empty().then(|| {
+            "No test/lint/typecheck commands were detected from Cargo.toml or package.json."
+                .to_owned()
+        });
+        session.ui_changed_files = ui_changed_files;
+        session.phase = ClaudeCodexHookPhase::Reviewing;
+        session.review_round = session.review_round.saturating_add(1);
+        session.review_output = None;
+        session.review_error = None;
+
+        let test_summary =
+            claude_codex_hook::test_summary(&session.test_results, session.test_note.as_deref());
+        let review_round = session.review_round;
+        let project_path = session.project_path.clone();
+        let plan_path = session.plan_path.clone();
+        let session_id = session.session_id.clone();
+        self.persist_claude_codex_plan_for_terminal(terminal_id, PlanStatus::Reviewing);
+        self.spawn_claude_codex_review_worker(
+            ctx,
+            terminal_id,
+            session_id,
+            project_path,
+            plan_path,
+            test_summary,
+            review_round,
+        );
+        self.status_line = "Claude Code Codex hook reviewing changes...".to_owned();
+    }
+
+    fn handle_claude_codex_review_finished(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        session_id: &str,
+        result: Result<String, String>,
+    ) {
+        let Some(session) = self.claude_codex_hook_sessions.get_mut(&terminal_id) else {
+            return;
+        };
+        if session.session_id != session_id || session.phase != ClaudeCodexHookPhase::Reviewing {
+            return;
+        }
+
+        match result {
+            Ok(output) => {
+                let has_findings = claude_codex_hook::review_has_actionable_findings(&output);
+                session.review_output = Some(output);
+                session.review_error = None;
+                if has_findings {
+                    let review_round = session.review_round;
+                    if review_round > MAX_REVIEW_FIX_ROUNDS {
+                        self.block_claude_codex_session(
+                            terminal_id,
+                            format!(
+                                "Codex review still reported actionable findings after {} rounds.",
+                                MAX_REVIEW_FIX_ROUNDS
+                            ),
+                        );
+                        return;
+                    }
+
+                    session.phase = ClaudeCodexHookPhase::AwaitingFix;
+                    let fix_prompt = Self::claude_codex_fix_prompt(session);
+                    let status_line = format!(
+                        "Claude Code fixing Codex review findings (round {}/{})",
+                        review_round.min(MAX_REVIEW_FIX_ROUNDS),
+                        MAX_REVIEW_FIX_ROUNDS
+                    );
+                    let _ = session;
+                    self.persist_claude_codex_plan_for_terminal(terminal_id, PlanStatus::Fixing);
+                    if self.submit_prompt_to_terminal_unhooked(
+                        ctx,
+                        terminal_id,
+                        &fix_prompt,
+                        TerminalPromptSubmitOptions::claude_codex_internal(),
+                    ) {
+                        self.status_line = status_line;
+                    } else {
+                        self.block_claude_codex_session(
+                            terminal_id,
+                            "Claude Code fix prompt could not be submitted.".to_owned(),
+                        );
+                    }
+                } else {
+                    self.finish_claude_codex_session(ctx, terminal_id);
+                }
+            }
+            Err(err) => {
+                session.review_error = Some(err);
+                self.block_claude_codex_session(
+                    terminal_id,
+                    "Codex review failed; implementation was left intact.".to_owned(),
+                );
+            }
+        }
+    }
+
+    fn advance_claude_codex_hook_sessions(&mut self, ctx: &egui::Context) {
+        let ready_for_tests = self
+            .claude_codex_hook_sessions
+            .iter()
+            .filter_map(|(terminal_id, session)| {
+                matches!(
+                    session.phase,
+                    ClaudeCodexHookPhase::AwaitingImplementation
+                        | ClaudeCodexHookPhase::AwaitingFix
+                )
+                .then_some((
+                    *terminal_id,
+                    session.session_id.clone(),
+                    session.project_path.clone(),
+                ))
+            })
+            .filter(|(terminal_id, _, _)| {
+                self.terminals.get(terminal_id).is_some_and(|terminal| {
+                    terminal.ai_session.tool == Some(AiCliTool::Claude)
+                        && terminal.claude_session_active
+                        && terminal.claude_normalized_status == Some(ClaudeTransportStatus::Idle)
+                        && terminal.claude_attention_pending
+                        && !Self::is_stale_claude_completion(terminal)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for (terminal_id, session_id, project_path) in ready_for_tests {
+            if let Some(session) = self.claude_codex_hook_sessions.get_mut(&terminal_id) {
+                if session.session_id != session_id {
+                    continue;
+                }
+                session.phase = ClaudeCodexHookPhase::Testing;
+                session.test_results.clear();
+                session.test_note = None;
+            }
+            self.persist_claude_codex_plan_for_terminal(terminal_id, PlanStatus::Testing);
+            self.spawn_claude_codex_tests_worker(ctx, terminal_id, session_id, project_path);
+            self.status_line = "Claude Code Codex hook running detected tests...".to_owned();
+        }
+    }
+
+    fn persist_claude_codex_plan_for_terminal(&mut self, terminal_id: u64, status: PlanStatus) {
+        let Some((path, content)) = self
+            .claude_codex_hook_sessions
+            .get(&terminal_id)
+            .map(|session| (session.plan_path.clone(), session.plan_file_content(status)))
+        else {
+            return;
+        };
+        if let Err(err) = claude_codex_hook::write_plan_file(&path, &content) {
+            self.status_line = format!("Failed to update Claude Code Codex plan: {err}");
+        }
+    }
+
+    fn block_claude_codex_session(&mut self, terminal_id: u64, reason: String) {
+        if let Some(session) = self.claude_codex_hook_sessions.get_mut(&terminal_id) {
+            session.phase = ClaudeCodexHookPhase::Blocked;
+            session.final_note = Some(reason.clone());
+        }
+        self.persist_claude_codex_plan_for_terminal(terminal_id, PlanStatus::Blocked);
+        self.status_line = format!("Claude Code Codex hook blocked: {reason}");
+    }
+
+    fn finish_claude_codex_session(&mut self, ctx: &egui::Context, terminal_id: u64) {
+        let ui_note = self.try_queue_claude_codex_ui_verification(ctx, terminal_id);
+        if let Some(session) = self.claude_codex_hook_sessions.get_mut(&terminal_id) {
+            session.phase = ClaudeCodexHookPhase::Done;
+            session.ui_verification = Some(ui_note);
+            session.final_note =
+                Some("Codex review reported no actionable P0-P3 findings.".to_owned());
+        }
+        self.persist_claude_codex_plan_for_terminal(terminal_id, PlanStatus::Done);
+        if let Some(plan_path) = self
+            .claude_codex_hook_sessions
+            .get(&terminal_id)
+            .map(|session| session.plan_path.display().to_string())
+        {
+            self.status_line = format!("Claude Code Codex hook done: {plan_path}");
+        }
+    }
+
+    fn try_queue_claude_codex_ui_verification(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+    ) -> String {
+        let Some((project_id, changed_files)) = self
+            .claude_codex_hook_sessions
+            .get(&terminal_id)
+            .map(|session| (session.project_id, session.ui_changed_files.clone()))
+        else {
+            return "UI verification unavailable: hook session missing.".to_owned();
+        };
+        if changed_files.is_empty() {
+            return "UI verification skipped: no UI-facing changed files detected.".to_owned();
+        }
+        if self.browser_mcp_service.is_none() {
+            return "UI verification tool unavailable: Browser MCP service is not running."
+                .to_owned();
+        }
+
+        let url = self
+            .active_browser_url_for_project(project_id)
+            .or_else(|| self.browser_last_url_for_project_family(project_id));
+        let Some(url) = url else {
+            return "UI verification tool available, but no browser URL is known for this project."
+                .to_owned();
+        };
+
+        self.submit_browser_url(ctx, project_id, &url);
+        self.queue_browser_screenshot(project_id, false, ctx);
+        "UI verification queued: Browser panel opened and a desktop visible-area screenshot was requested. Mobile viewport screenshot is not supported by the current embedded Browser MCP integration."
+            .to_owned()
+    }
+
+    fn active_browser_url_for_project(&self, project_id: u64) -> Option<String> {
+        let scope = self
+            .browser_panel_visible_scope_by_project
+            .get(&project_id)
+            .copied()
+            .unwrap_or(BrowserScopeKey::Project(project_id));
+        let tab_id = self.active_browser_tab_by_scope.get(&scope).copied()?;
+        self.browser_tabs_by_scope
+            .get(&scope)?
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.url.clone())
+    }
+
+    fn claude_codex_implementation_prompt(session: &ClaudeCodexHookSession) -> String {
+        let mut prompt = format!(
+            "Claude Code Codex hook session: {}\nPlan file: {}\n\nOriginal user prompt:\n{}\n\n",
+            session.session_id,
+            session.plan_path.display(),
+            session.original_prompt
+        );
+        if let Some(plan) = &session.plan {
+            prompt.push_str("Codex read-only implementation plan:\n");
+            prompt.push_str(plan.trim());
+            prompt.push_str(
+                "\n\nApply this plan now. Keep the implementation scoped to the user's request.",
+            );
+        } else if let Some(error) = &session.plan_error {
+            prompt.push_str("Codex planning failed, so continue with the original prompt using your normal implementation flow.\n\nPlanning error:\n");
+            prompt.push_str(error.trim());
+        } else {
+            prompt.push_str(
+                "Codex planning did not produce a plan. Continue with the original prompt.",
+            );
+        }
+        prompt
+    }
+
+    fn claude_codex_fix_prompt(session: &ClaudeCodexHookSession) -> String {
+        format!(
+            "Claude Code Codex hook fix round {}/{}.\nPlan file: {}\n\nCodex review reported actionable findings. Fix only these findings, keep the original scope, and do not start unrelated refactors.\n\nReview output:\n{}\n\nTest summary:\n{}",
+            session.review_round,
+            MAX_REVIEW_FIX_ROUNDS,
+            session.plan_path.display(),
+            session.review_output.as_deref().unwrap_or("No review output captured."),
+            claude_codex_hook::test_summary(&session.test_results, session.test_note.as_deref())
+        )
+    }
+
     fn send_saved_message_to_terminal(
         &mut self,
         ctx: &egui::Context,
@@ -17681,6 +18498,22 @@ impl AdeApp {
     }
 
     fn submit_prompt_to_terminal(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        message: &str,
+        options: TerminalPromptSubmitOptions,
+    ) -> bool {
+        if let Some(handled) =
+            self.try_start_claude_codex_hook_session(ctx, terminal_id, message, options)
+        {
+            return handled;
+        }
+
+        self.submit_prompt_to_terminal_unhooked(ctx, terminal_id, message, options)
+    }
+
+    fn submit_prompt_to_terminal_unhooked(
         &mut self,
         ctx: &egui::Context,
         terminal_id: u64,
@@ -18467,12 +19300,8 @@ impl AdeApp {
     /// Return a sanitized launch command for Claude that bypasses shell
     /// aliases/wrappers and clears stale Anthropic env vars before invoking
     /// the real npm-installed `claude.cmd`.
-    fn sanitized_claude_launch_command(shell: ShellKind, bypass_permissions: bool) -> String {
-        let suffix = if bypass_permissions {
-            " --dangerously-skip-permissions"
-        } else {
-            ""
-        };
+    fn sanitized_claude_launch_command(shell: ShellKind, _bypass_permissions: bool) -> String {
+        let suffix = " --permission-mode bypassPermissions";
         match shell {
             ShellKind::PowerShell => {
                 format!(
@@ -19080,6 +19909,37 @@ impl AdeApp {
 
         show_settings_card(
             ui,
+            AppIcon::Shield,
+            "Claude Code Codex Hook",
+            "Run Codex planning and review around Mergen-submitted Claude Code prompts.",
+            |ui| {
+                let before = self.config.claude_code_codex_hook_enabled;
+                let response = ui.checkbox(
+                    &mut self.config.claude_code_codex_hook_enabled,
+                    "Enable Claude Code Codex hook",
+                );
+                response.on_hover_text(
+                    "When enabled, Mergen creates .claude/plans/<session-id>.md, runs read-only Codex planning/review, then coordinates Claude fixes with a three-round limit.",
+                );
+                ui.add_space(6.0);
+                settings_copyable_label(
+                    ui,
+                    RichText::new(
+                        "Claude Code launches always use bypass permissions; this hook only controls the Codex plan/review pipeline.",
+                    )
+                    .small()
+                    .color(TEXT_MUTED),
+                    "Claude Code launches always use bypass permissions; this hook only controls the Codex plan/review pipeline.",
+                );
+                if self.config.claude_code_codex_hook_enabled != before {
+                    changes.note_claude_codex_hook_change();
+                }
+            },
+        );
+        ui.add_space(12.0);
+
+        show_settings_card(
+            ui,
             AppIcon::List,
             "Layout",
             "Tune how much of the terminal workspace stays visible at once.",
@@ -19268,14 +20128,25 @@ impl AdeApp {
                                     );
                                     row_changed |= enabled_response.changed();
 
-                                    let mut bypass_val = launcher.bypass_permissions.unwrap_or(
-                                        launcher.builtin == Some(BuiltinLauncherKind::Claude),
-                                    );
-                                    let bypass_response = ui.checkbox(
-                                        &mut bypass_val,
-                                        "Bypass permissions",
-                                    );
-                                    if bypass_response.changed() {
+                                    let is_claude =
+                                        launcher.builtin == Some(BuiltinLauncherKind::Claude);
+                                    let mut bypass_val = if is_claude {
+                                        true
+                                    } else {
+                                        launcher.bypass_permissions.unwrap_or(false)
+                                    };
+                                    let bypass_response = if is_claude {
+                                        ui.add_enabled(
+                                            false,
+                                            egui::Checkbox::new(
+                                                &mut bypass_val,
+                                                "Bypass permissions",
+                                            ),
+                                        )
+                                    } else {
+                                        ui.checkbox(&mut bypass_val, "Bypass permissions")
+                                    };
+                                    if bypass_response.changed() && !is_claude {
                                         launcher.bypass_permissions = Some(bypass_val);
                                         row_changed = true;
                                     }
@@ -29169,6 +30040,10 @@ impl AdeApp {
             })
             .unwrap_or_else(|| "Unknown Project".to_owned());
         let is_active = self.active_terminal == Some(terminal_id);
+        let claude_codex_hook_progress = self
+            .claude_codex_hook_sessions
+            .get(&terminal_id)
+            .map(claude_codex_hook_progress_model);
 
         // Frame budget: skip full snapshot for background terminals if budget exhausted
         let visible_in_main =
@@ -29379,6 +30254,18 @@ impl AdeApp {
             );
             if !close_requested {
                 ui.add_space(TERMINAL_HEADER_GAP);
+                let hook_progress_height = claude_codex_hook_progress
+                    .as_ref()
+                    .map(|_| CLAUDE_CODEX_HOOK_PROGRESS_HEIGHT)
+                    .unwrap_or(0.0);
+                let hook_progress_gap = claude_codex_hook_progress
+                    .as_ref()
+                    .map(|_| CLAUDE_CODEX_HOOK_PROGRESS_GAP)
+                    .unwrap_or(0.0);
+                if let Some(progress) = claude_codex_hook_progress.as_ref() {
+                    draw_claude_codex_hook_progress(ui, progress, pane_width);
+                    ui.add_space(CLAUDE_CODEX_HOOK_PROGRESS_GAP);
+                }
 
                 let font_id = terminal_font_id(ui.style());
                 let char_width = terminal_char_width(ui, &font_id);
@@ -29399,6 +30286,8 @@ impl AdeApp {
                 let raw_output_height = (pane_height
                     - TERMINAL_HEADER_HEIGHT
                     - TERMINAL_HEADER_GAP
+                    - hook_progress_height
+                    - hook_progress_gap
                     - resize_handle_height
                     - smart_footer_gap
                     - smart_footer_height)
@@ -30279,6 +31168,9 @@ impl AdeApp {
             }
             if changes.default_shell_changed {
                 self.note_default_shell_changed();
+            }
+            if changes.claude_codex_hook_changed {
+                self.note_claude_codex_hook_changed();
             }
             if changes.launchers_changed {
                 self.note_launchers_changed();
@@ -31527,6 +32419,8 @@ impl eframe::App for AdeApp {
 
         // Phase 3c: Dispatch terminal-scoped Smart Input tasks after OpenCode completes a turn.
         self.process_smart_input_queues(ctx);
+        self.process_claude_codex_hook_events(ctx);
+        self.advance_claude_codex_hook_sessions(ctx);
 
         // Phase 3d: Process pending second Enter presses for terminal shortcuts.
         self.process_pending_second_enters(ctx);
@@ -31664,6 +32558,10 @@ fn recover_config_state(
 
     if pending_config_changes.default_shell {
         config.default_shell = current_config.default_shell;
+    }
+
+    if pending_config_changes.claude_codex_hook {
+        config.claude_code_codex_hook_enabled = current_config.claude_code_codex_hook_enabled;
     }
 
     if pending_config_changes.launchers {
@@ -38734,6 +39632,46 @@ fn force_terminal_pane_width(ui: &mut Ui, pane_width: f32) -> f32 {
     pane_right
 }
 
+fn draw_claude_codex_hook_progress(
+    ui: &mut Ui,
+    progress: &ClaudeCodexHookProgressModel,
+    pane_width: f32,
+) {
+    let row_size = egui::vec2(pane_width.max(0.0), CLAUDE_CODEX_HOOK_PROGRESS_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(row_size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let fill = Color32::from_rgb(23, 24, 26);
+        let border = Color32::from_rgb(43, 43, 46);
+        ui.painter().rect_filled(rect, 0.0, fill);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                rect.left_top(),
+                egui::pos2(rect.left() + 3.0, rect.bottom()),
+            ),
+            0.0,
+            progress.accent,
+        );
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            Stroke::new(1.0, border),
+        );
+
+        let text_rect = rect.shrink2(egui::vec2(10.0, 0.0));
+        let mut text_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        text_ui.set_min_size(text_rect.size());
+        text_ui.add_sized(
+            text_rect.size(),
+            egui::Label::new(RichText::new(&progress.text).size(12.5).color(TEXT_PRIMARY))
+                .truncate(),
+        );
+    }
+    response.on_hover_text(&progress.tooltip);
+}
+
 fn terminal_output_viewport_size(output_size: Vec2) -> Vec2 {
     egui::vec2(output_size.x.max(0.0), output_size.y.max(0.0))
 }
@@ -39445,7 +40383,8 @@ mod tests {
     use super::{
         acp_terminal_manager_badge_visual, ai_badge_tooltip_lines, ai_badge_visual,
         ai_cli_logo_key_for_terminal, average_terminal_cell_width, build_terminal_cursor_overlay,
-        build_terminal_render, collect_source_control_line_totals, collect_source_control_snapshot,
+        build_terminal_render, claude_codex_hook_phase_label, claude_codex_hook_progress_model,
+        collect_source_control_line_totals, collect_source_control_snapshot,
         configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
         deduplicated_recent_inputs, default_app_open_command, design_inspect_delivery_signature,
         design_inspect_should_deliver, detach_terminal_prompt_scroll_anchor_on_manual_scroll,
@@ -39481,17 +40420,18 @@ mod tests {
         update_stable_cursor_row, visible_terminal_cursor, with_minimal_button_chrome,
         with_settings_text_edit_chrome, AcpTerminalManagerAttentionReason, AdeApp, AiBadgeModel,
         AiBadgeVisual, AppIcon, BrowserScopeKey, BrowserTabKind, BrowserVideoEncodeEvent,
-        ClaudeStatusSource, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
-        CtrlCAction, DesignInspectDeliveryState, DirectoryIndexSnapshot,
-        DirectoryIndexTruncationFlags, DirectoryNode, FactoryDroidAttentionReason,
-        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
-        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
-        FactoryDroidTransportDiagnostics, FileEditorState, NativeImagePasteTarget,
-        OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OsNotificationKind,
-        PendingConfigChanges, PendingOsNotification, PendingRerunPhase, PendingTerminalLinkClick,
-        SettingsSection, SmartInputAttachment, SmartInputMode, SmartInputState,
-        SmartInputSubmitRequest, SmartInputTask, SourceControlBadgeState, SourceControlFile,
-        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        ClaudeCodexHookPhase, ClaudeCodexHookSession, ClaudeStatusSource, CodexAttentionReason,
+        CodexCliStatusSource, CodexTransportStatus, CtrlCAction, DesignInspectDeliveryState,
+        DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
+        FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
+        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
+        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
+        NativeImagePasteTarget, OpenCodeAttentionReason, OpenCodeStatusSource,
+        OpenCodeTransportStatus, OsNotificationKind, PendingConfigChanges, PendingOsNotification,
+        PendingRerunPhase, PendingTerminalLinkClick, SettingsSection, SmartInputAttachment,
+        SmartInputMode, SmartInputState, SmartInputSubmitRequest, SmartInputTask,
+        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
         TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT,
@@ -41058,6 +41998,214 @@ mod tests {
         let terminal = app.terminals.get(&1).expect("terminal 1");
         // Slash commands should NOT be added to recent_inputs
         assert!(terminal.recent_inputs.is_empty());
+    }
+
+    #[test]
+    fn raw_claude_prompt_passes_through_when_codex_hook_disabled() {
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_claude_attention_idle(&mut app, 1);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("make chess".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"make chess\r".to_vec());
+        assert!(app.claude_codex_hook_sessions.is_empty());
+    }
+
+    #[test]
+    fn claude_codex_hook_progress_model_reports_visible_phase_and_plan() {
+        let mut session = ClaudeCodexHookSession {
+            terminal_id: 1,
+            project_id: 7,
+            project_path: PathBuf::from("C:/repo"),
+            session_id: "mergen-1-test-1".to_owned(),
+            original_prompt: "make chess".to_owned(),
+            plan_path: PathBuf::from("C:/repo/.claude/plans/mergen-1-test-1.md"),
+            phase: ClaudeCodexHookPhase::Planning,
+            review_round: 0,
+            plan: None,
+            plan_error: None,
+            test_results: Vec::new(),
+            test_note: None,
+            review_output: None,
+            review_error: None,
+            ui_changed_files: Vec::new(),
+            ui_verification: None,
+            final_note: None,
+        };
+
+        let planning = claude_codex_hook_progress_model(&session);
+        assert!(planning.text.contains("Codex planning"));
+        assert!(planning.tooltip.contains("mergen-1-test-1"));
+        assert!(planning.tooltip.contains(".claude"));
+
+        session.phase = ClaudeCodexHookPhase::Reviewing;
+        session.review_round = 2;
+        let reviewing = claude_codex_hook_progress_model(&session);
+        assert!(reviewing.text.contains("Codex reviewing"));
+        assert!(reviewing.text.contains("(2/3)"));
+
+        session.phase = ClaudeCodexHookPhase::Blocked;
+        assert_eq!(
+            claude_codex_hook_phase_label(session.phase),
+            "Codex hook blocked"
+        );
+    }
+
+    #[test]
+    fn raw_claude_prompt_starts_codex_hook_when_enabled() {
+        let ctx = Context::default();
+        let project_root = test_temp_path("mergen-raw-claude-hook", "dir");
+        fs::create_dir_all(&project_root).expect("create project root");
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        app.config.claude_code_codex_hook_enabled = true;
+        app.projects.insert(
+            7,
+            test_project(
+                7,
+                "Hook Test",
+                project_root.to_string_lossy().as_ref(),
+                &[],
+                &[],
+            ),
+        );
+        seed_claude_attention_idle(&mut app, 1);
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("make chess".to_owned())]);
+        capture.drain();
+        assert_eq!(capture.bytes(), b"make chess".to_vec());
+        capture.clear();
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+        capture.drain();
+
+        assert_eq!(
+            capture.bytes(),
+            vec![0x15],
+            "raw Claude prompt Enter should clear the TUI draft instead of submitting it"
+        );
+        let session = app
+            .claude_codex_hook_sessions
+            .get(&1)
+            .expect("hook session");
+        assert_eq!(session.original_prompt, "make chess");
+        assert_eq!(session.phase, ClaudeCodexHookPhase::Planning);
+        assert!(session
+            .plan_path
+            .starts_with(project_root.join(".claude").join("plans")));
+        assert!(session.plan_path.is_file());
+
+        let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[test]
+    fn raw_claude_prompt_falls_back_when_hook_cannot_start() {
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        app.config.claude_code_codex_hook_enabled = true;
+        seed_claude_attention_idle(&mut app, 1);
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("make chess".to_owned())]);
+        capture.drain();
+        capture.clear();
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+        capture.drain();
+
+        let sent = capture.bytes();
+        assert_eq!(
+            sent.first(),
+            Some(&0x15),
+            "Claude TUI draft should be cleared"
+        );
+        assert!(
+            String::from_utf8_lossy(&sent).contains("make chess"),
+            "fallback should send the original prompt to Claude"
+        );
+        assert_eq!(sent.last(), Some(&b'\r'));
+        assert!(app.claude_codex_hook_sessions.is_empty());
+        assert_eq!(
+            app.status_line,
+            "Claude Code Codex hook could not start; sent prompt to Claude normally."
+        );
+    }
+
+    #[test]
+    fn raw_claude_permission_reply_does_not_start_codex_hook() {
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        app.config.claude_code_codex_hook_enabled = true;
+        seed_claude_attention_idle(&mut app, 1);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.claude_normalized_status = Some(ClaudeTransportStatus::Permission);
+            terminal.claude_attention_reason = Some(ClaudeAttentionReason::PermissionAsked);
+        }
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("yes".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"yes\r".to_vec());
+        assert!(app.claude_codex_hook_sessions.is_empty());
     }
 
     #[test]
@@ -50704,6 +51852,8 @@ mod tests {
         let (browser_video_encode_events_tx, browser_video_encode_events_rx) =
             crossbeam_channel::unbounded();
         let (create_worktree_events_tx, create_worktree_events_rx) = crossbeam_channel::unbounded();
+        let (claude_codex_hook_events_tx, claude_codex_hook_events_rx) =
+            crossbeam_channel::unbounded();
 
         AdeApp {
             config_path: test_temp_path("mergen-ade-test-config", "toml"),
@@ -50768,6 +51918,9 @@ mod tests {
             foreground_message_popup_draft: String::new(),
             foreground_message_popup_submit_pending: false,
             smart_input_submit_pending: None,
+            claude_codex_hook_sessions: BTreeMap::new(),
+            claude_codex_hook_events_tx,
+            claude_codex_hook_events_rx,
             launcher_draft: super::LauncherDraftState::default(),
             launcher_icon_textures: BTreeMap::new(),
             launcher_icon_failures: std::collections::BTreeSet::new(),
@@ -54351,6 +55504,10 @@ mod tests {
             cmd.contains("& \"$env:APPDATA\\npm\\claude.cmd\""),
             "PowerShell command should invoke real claude.cmd"
         );
+        assert!(
+            cmd.contains(" --permission-mode bypassPermissions"),
+            "PowerShell command should always append bypass permission mode"
+        );
     }
 
     #[test]
@@ -54364,20 +55521,24 @@ mod tests {
             cmd.contains("\"%APPDATA%\\npm\\claude.cmd\""),
             "CMD command should invoke real claude.cmd"
         );
+        assert!(
+            cmd.contains(" --permission-mode bypassPermissions"),
+            "CMD command should always append bypass permission mode"
+        );
     }
 
     #[test]
-    fn sanitized_claude_launch_command_zsh_keeps_plain_claude() {
+    fn sanitized_claude_launch_command_zsh_always_appends_bypass_flag() {
         let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, false);
-        assert_eq!(cmd, "claude");
+        assert_eq!(cmd, "claude --permission-mode bypassPermissions");
     }
 
     #[test]
     fn sanitized_claude_launch_command_powershell_appends_bypass_flag() {
         let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::PowerShell, true);
         assert!(
-            cmd.contains(" --dangerously-skip-permissions"),
-            "PowerShell command should append bypass flag"
+            cmd.contains(" --permission-mode bypassPermissions"),
+            "PowerShell command should append bypass permission mode"
         );
     }
 
@@ -54385,15 +55546,15 @@ mod tests {
     fn sanitized_claude_launch_command_cmd_appends_bypass_flag() {
         let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Cmd, true);
         assert!(
-            cmd.contains(" --dangerously-skip-permissions"),
-            "CMD command should append bypass flag"
+            cmd.contains(" --permission-mode bypassPermissions"),
+            "CMD command should append bypass permission mode"
         );
     }
 
     #[test]
     fn sanitized_claude_launch_command_zsh_appends_bypass_flag() {
         let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, true);
-        assert_eq!(cmd, "claude --dangerously-skip-permissions");
+        assert_eq!(cmd, "claude --permission-mode bypassPermissions");
     }
 
     #[test]
