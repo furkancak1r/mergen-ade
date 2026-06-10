@@ -7386,6 +7386,9 @@ impl AdeApp {
                         .unwrap_or(None);
                     let _ = self.mark_opencode_launch_pending(terminal_id, baseline);
                 }
+                Some(BuiltinLauncherKind::Claude) => {
+                    let _ = self.mark_claude_launch_pending(terminal_id);
+                }
                 _ => {}
             }
 
@@ -8983,6 +8986,7 @@ impl AdeApp {
         entry.claude_last_title_idle_at = None;
         entry.claude_last_permission_at = None;
         entry.claude_prompt_submit_since = None;
+        entry.claude_attention_pending = false;
         entry.dirty = true;
         changed
     }
@@ -9023,6 +9027,8 @@ impl AdeApp {
         entry.claude_last_title_working_at = None;
         entry.claude_last_title_idle_at = None;
         entry.claude_last_permission_at = None;
+        entry.claude_attention_pending = false;
+        entry.claude_prompt_submit_since = None;
         entry.dirty = true;
         changed
     }
@@ -9644,15 +9650,19 @@ impl AdeApp {
             }
         }
 
-        // Trigger pending attention on working->idle/permission transition
-        if previous_normalized_status == Some(ClaudeTransportStatus::Working) {
-            if let Some(ClaudeTransportStatus::Idle | ClaudeTransportStatus::Permission) =
-                entry.claude_normalized_status
+        // Trigger pending attention on any transition to Idle/Permission
+        // except Idle -> Idle (which is a no-op). This covers Working -> Idle,
+        // Permission -> Idle, and None -> Idle (fresh session detection).
+        if let Some(ClaudeTransportStatus::Idle | ClaudeTransportStatus::Permission) =
+            entry.claude_normalized_status
+        {
+            let was_idle = previous_normalized_status == Some(ClaudeTransportStatus::Idle);
+            if !was_idle
+                && !entry.claude_attention_pending
+                && !Self::is_stale_claude_completion(entry)
             {
-                if !entry.claude_attention_pending && !Self::is_stale_claude_completion(entry) {
-                    entry.claude_attention_pending = true;
-                    changed = true;
-                }
+                entry.claude_attention_pending = true;
+                changed = true;
             }
         }
 
@@ -12345,6 +12355,28 @@ impl AdeApp {
     fn handle_acp_error_event(&mut self, chat_id: u64, message: String) -> bool {
         if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
             if Self::suppress_acp_cancel_error_if_needed(session, &message) {
+                return true;
+            }
+        }
+
+        let is_fatal = message.contains("ACP JSON parse error");
+
+        if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+            // Treat stderr lines as non-fatal when the session already has a
+            // session_id or is still starting up. Only JSON parse errors on the
+            // RPC stream are considered fatal. This keeps the queue alive so
+            // SessionCreated or PromptResponse can still flush it later.
+            if !is_fatal
+                && (session.session_id.is_some()
+                    || session.status == crate::opencode_acp::AcpChatStatus::Starting)
+            {
+                session
+                    .messages
+                    .push(crate::opencode_acp::AcpChatMessage::System {
+                        text: format!("Error: {message}"),
+                    });
+                session.updated_at = Instant::now();
+                self.status_line = format!("OpenCode ACP {chat_id} warning: {message}");
                 return true;
             }
         }
@@ -39449,17 +39481,17 @@ mod tests {
         update_stable_cursor_row, visible_terminal_cursor, with_minimal_button_chrome,
         with_settings_text_edit_chrome, AcpTerminalManagerAttentionReason, AdeApp, AiBadgeModel,
         AiBadgeVisual, AppIcon, BrowserScopeKey, BrowserTabKind, BrowserVideoEncodeEvent,
-        CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus, CtrlCAction,
-        DesignInspectDeliveryState, DirectoryIndexSnapshot, DirectoryIndexTruncationFlags,
-        DirectoryNode, FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
-        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
-        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
-        NativeImagePasteTarget, OpenCodeAttentionReason, OpenCodeStatusSource,
-        OpenCodeTransportStatus, OsNotificationKind, PendingConfigChanges, PendingOsNotification,
-        PendingRerunPhase, PendingTerminalLinkClick, SettingsSection, SmartInputAttachment,
-        SmartInputMode, SmartInputState, SmartInputSubmitRequest, SmartInputTask,
-        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
-        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        ClaudeStatusSource, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
+        CtrlCAction, DesignInspectDeliveryState, DirectoryIndexSnapshot,
+        DirectoryIndexTruncationFlags, DirectoryNode, FactoryDroidAttentionReason,
+        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
+        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
+        FactoryDroidTransportDiagnostics, FileEditorState, NativeImagePasteTarget,
+        OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OsNotificationKind,
+        PendingConfigChanges, PendingOsNotification, PendingRerunPhase, PendingTerminalLinkClick,
+        SettingsSection, SmartInputAttachment, SmartInputMode, SmartInputState,
+        SmartInputSubmitRequest, SmartInputTask, SourceControlBadgeState, SourceControlFile,
+        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
         TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT,
@@ -54364,6 +54396,51 @@ mod tests {
         assert_eq!(cmd, "claude --dangerously-skip-permissions");
     }
 
+    #[test]
+    fn spawn_terminal_for_project_claude_launcher_sets_tool_and_pending() {
+        let mut app = test_app_with_ai_hooks(vec![], None);
+        let project = ProjectRecord {
+            id: 1,
+            name: "Test".to_owned(),
+            path: std::path::PathBuf::from("C:\\test"),
+            saved_messages: vec![],
+            ai_config: ProjectAiConfig::default(),
+            checklist: vec![],
+            browser_last_url: None,
+            foreground_saved_messages: vec![],
+            repo_root: None,
+            is_worktree: false,
+        };
+        app.projects.insert(1, project);
+        app.selected_project = Some(1);
+        app.config.launchers = crate::models::default_launchers();
+        let claude_launcher = app.config.launchers[3].clone();
+        assert_eq!(claude_launcher.builtin, Some(BuiltinLauncherKind::Claude));
+
+        let ctx = egui::Context::default();
+        let expected_terminal_id = app.next_terminal_id;
+        let spawned = app.spawn_terminal_for_project(
+            &ctx,
+            1,
+            TerminalKind::Foreground,
+            Some(&claude_launcher.id),
+        );
+        assert!(spawned, "terminal should spawn");
+        let entry = app
+            .terminals
+            .get(&expected_terminal_id)
+            .expect("terminal should exist in map");
+        assert_eq!(
+            entry.ai_session.tool,
+            Some(AiCliTool::Claude),
+            "Claude launcher should set ai_session.tool to Claude"
+        );
+        assert!(
+            entry.claude_launch_pending_since.is_some(),
+            "Claude launcher should set claude_launch_pending_since"
+        );
+    }
+
     // Tests for ai_cli_logo_key_for_terminal - logo visibility based on session liveness
 
     #[test]
@@ -65409,6 +65486,65 @@ mod tests {
     }
 
     #[test]
+    fn apply_claude_status_sets_attention_pending_on_none_to_idle() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).unwrap();
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_normalized_status = None;
+        terminal.claude_attention_pending = false;
+        app.apply_claude_status(
+            1,
+            AiCliStatus::Attention,
+            ClaudeStatusSource::TerminalTitle,
+            None,
+        );
+        let terminal = app.terminals.get(&1).unwrap();
+        assert!(terminal.claude_attention_pending);
+        assert_eq!(
+            terminal.claude_normalized_status,
+            Some(ClaudeTransportStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn apply_claude_status_sets_attention_pending_on_permission_to_idle() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).unwrap();
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_normalized_status = Some(ClaudeTransportStatus::Permission);
+        terminal.claude_attention_pending = false;
+        app.apply_claude_status(
+            1,
+            AiCliStatus::Attention,
+            ClaudeStatusSource::TerminalTitle,
+            None,
+        );
+        let terminal = app.terminals.get(&1).unwrap();
+        assert!(terminal.claude_attention_pending);
+        assert_eq!(
+            terminal.claude_normalized_status,
+            Some(ClaudeTransportStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn apply_claude_status_skips_attention_pending_on_idle_to_idle() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).unwrap();
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_normalized_status = Some(ClaudeTransportStatus::Idle);
+        terminal.claude_attention_pending = false;
+        app.apply_claude_status(
+            1,
+            AiCliStatus::Attention,
+            ClaudeStatusSource::TerminalTitle,
+            None,
+        );
+        let terminal = app.terminals.get(&1).unwrap();
+        assert!(!terminal.claude_attention_pending);
+    }
+
+    #[test]
     fn smart_input_dispatches_one_task_on_claude_idle() {
         let ctx = egui::Context::default();
         let (runtime, capture) = test_terminal_runtime_with_capture();
@@ -65780,6 +65916,30 @@ mod tests {
         terminal.claude_prompt_submit_since = Some(Instant::now());
         app.clear_claude_state(1);
         let terminal = app.terminals.get(&1).unwrap();
+        assert!(terminal.claude_prompt_submit_since.is_none());
+    }
+
+    #[test]
+    fn clear_claude_state_clears_attention_pending() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).unwrap();
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_attention_pending = true;
+        app.clear_claude_state(1);
+        let terminal = app.terminals.get(&1).unwrap();
+        assert!(!terminal.claude_attention_pending);
+    }
+
+    #[test]
+    fn mark_claude_launch_pending_clears_attention_pending_and_prompt_submit_since() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).unwrap();
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_attention_pending = true;
+        terminal.claude_prompt_submit_since = Some(Instant::now());
+        app.mark_claude_launch_pending(1);
+        let terminal = app.terminals.get(&1).unwrap();
+        assert!(!terminal.claude_attention_pending);
         assert!(terminal.claude_prompt_submit_since.is_none());
     }
 
@@ -68672,7 +68832,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_error_event_still_surfaces_regular_stderr_errors() {
+    fn acp_error_event_treats_stderr_as_warning_when_session_exists() {
         let mut app = test_app(vec![], None);
         let (session, _rx) =
             crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
@@ -68681,10 +68841,33 @@ mod tests {
         assert!(app.handle_acp_error_event(42, "Authentication failed".to_owned()));
 
         let session = app.acp_chat_sessions.get(&42).unwrap();
-        assert!(matches!(
-            session.status,
-            crate::opencode_acp::AcpChatStatus::Error
-        ));
+        // Non-fatal stderr when session_id exists is treated as a warning, not Error
+        assert!(
+            !matches!(session.status, crate::opencode_acp::AcpChatStatus::Error),
+            "stderr with active session should be treated as transient warning"
+        );
+        assert!(session.messages.iter().any(|message| matches!(
+            message,
+            crate::opencode_acp::AcpChatMessage::System { text }
+                if text == "Error: Authentication failed"
+        )));
+    }
+
+    #[test]
+    fn acp_error_event_treats_warning_when_starting_without_session_id() {
+        let mut app = test_app(vec![], None);
+        let (session, _rx) = crate::opencode_acp::test_session_for_app(42, 7, None);
+        app.acp_chat_sessions.insert(42, session);
+
+        assert!(app.handle_acp_error_event(42, "Authentication failed".to_owned()));
+
+        let session = app.acp_chat_sessions.get(&42).unwrap();
+        // Starting sessions without session_id should still be treated as warnings
+        // so SessionCreated can still arrive and flush the queue.
+        assert!(
+            !matches!(session.status, crate::opencode_acp::AcpChatStatus::Error),
+            "Starting session stderr should be treated as transient warning"
+        );
         assert!(session.messages.iter().any(|message| matches!(
             message,
             crate::opencode_acp::AcpChatMessage::System { text }

@@ -2,6 +2,42 @@
   
 ---
 
+#### Smart Input queue stuck on ACP stderr error and Claude fresh session not dispatching {#smart-input-queue-acp-claude-dispatch}
+- Date: 2026-06-10
+- Context: User reported that Smart Input queued prompts were never sent when OpenCode ACP emitted a `SessionStart:startup hook error` on stderr, and that Claude Code Smart Input auto-dispatch never worked for fresh sessions.
+- Error signature:
+  1. `stderr_thread` in `src/opencode_acp.rs` sends ALL stderr lines as `AcpChatEvent::Error`.
+  2. `handle_acp_error_event` unconditionally set `session.status = AcpChatStatus::Error` for any `Error` event, killing the session before `SessionCreated` could arrive and flush the queue.
+  3. `apply_claude_status` only set `claude_attention_pending = true` on `Working -> Idle` transition (`previous_normalized_status == Some(Working)`). For fresh Claude sessions, `previous_normalized_status` is `None` on the first `Idle` detection, so `claude_attention_pending` was never set.
+  4. `smart_input_auto_dispatch_ready` for Claude requires `claude_attention_pending == true`, so fresh sessions could never auto-dispatch.
+  5. `clear_claude_state` and `mark_claude_launch_pending` did NOT reset `claude_attention_pending`, leaving stale state across session restarts.
+- Symptoms/Impact:
+  1. After submitting a Smart Input `After Done` task, if OpenCode ACP printed any stderr line, the queue got stuck forever because the session status became `Error`.
+  2. Claude Code Smart Input `After Done` tasks never auto-dispatched for new terminals; the queue grew indefinitely.
+- Root cause:
+  - `handle_acp_error_event` treated all stderr as fatal.
+  - `apply_claude_status` had an asymmetric `claude_attention_pending` transition that only covered `Working -> Idle`, not `None -> Idle` or `Permission -> Idle`.
+- Resolution:
+  - Changed `handle_acp_error_event` to treat non-fatal stderr as transient warnings when the session has `session_id` or is `Starting` (only "ACP JSON parse error" remains fatal). The session stays alive so `SessionCreated` or `PromptResponse` can still flush the queue.
+  - Changed `apply_claude_status` to trigger `claude_attention_pending` on any transition to `Idle`/`Permission` except `Idle -> Idle`, covering `None -> Idle`, `Working -> Idle`, and `Permission -> Idle`.
+  - Added `claude_attention_pending = false` to `clear_claude_state` and `mark_claude_launch_pending` to prevent stale state.
+  - Added `claude_prompt_submit_since = None` to `mark_claude_launch_pending`.
+  - Added 7 regression tests:
+    - `acp_error_event_treats_stderr_as_warning_when_session_exists`
+    - `acp_error_event_treats_warning_when_starting_without_session_id`
+    - `apply_claude_status_sets_attention_pending_on_none_to_idle`
+    - `apply_claude_status_sets_attention_pending_on_permission_to_idle`
+    - `apply_claude_status_skips_attention_pending_on_idle_to_idle`
+    - `clear_claude_state_clears_attention_pending`
+    - `mark_claude_launch_pending_clears_attention_pending_and_prompt_submit_since`
+- Prevent recurrence:
+  - Updated AGENTS.md with the "ACP `session/new` must include `cwd` and `mcpServers`" and related ACP standby guidelines.
+  - Recorded this entry in KNOWN_ISSUES.md.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: `/implement-plan` request 2026-06-10
+
+---
+
 #### Clipboard image paste cross-app leakage and accidental Smart Input attachment {#clipboard-image-paste-leakage}
 - Date: 2026-06-09
 - Context: User reported that pressing Ctrl+V in another application while Mergen was running in the background caused image paste to leak into the active terminal, and that auto-focused Smart Input was creating accidental image attachments.
