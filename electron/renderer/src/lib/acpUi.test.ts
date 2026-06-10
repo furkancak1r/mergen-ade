@@ -4,6 +4,8 @@ import {
   hasConfigSelectorOptions,
   nextAcpActivityState,
   shouldShowAcpWelcome,
+  slashCommandHint,
+  slashCommandHints,
 } from './acpUi';
 
 describe('acpUi', () => {
@@ -38,5 +40,29 @@ describe('acpUi', () => {
     expect(actionControlsEnabled(null)).toBe(false);
     expect(actionControlsEnabled({ sessionId: undefined })).toBe(false);
     expect(actionControlsEnabled({ sessionId: 'sess-1' })).toBe(true);
+  });
+
+  it('normalizes slash command hints from id or name', () => {
+    expect(slashCommandHint({ id: 'init', name: 'Initialize' })).toBe('/init');
+    expect(slashCommandHint({ name: 'plan' })).toBe('/plan');
+    expect(slashCommandHint({ id: '/build' })).toBe('/build');
+  });
+
+  it('drops malformed slash commands instead of throwing', () => {
+    expect(slashCommandHint({ id: undefined, name: undefined })).toBeUndefined();
+    expect(slashCommandHint({ name: 'two words' })).toBeUndefined();
+    expect(slashCommandHints(undefined, '')).toEqual([]);
+    expect(slashCommandHints([null, {}, { id: 7 }, { name: 'run' }], '')).toEqual(['/run']);
+  });
+
+  it('filters slash command hints by id or name without requiring id', () => {
+    const commands = [
+      { name: 'init' },
+      { id: 'apply', name: 'Build Apply' },
+      { id: 'review', name: 'Review' },
+    ];
+    expect(slashCommandHints(commands, '')).toEqual(['/init', '/apply', '/review']);
+    expect(slashCommandHints(commands, 'bu')).toEqual(['/apply']);
+    expect(slashCommandHints(commands, 're')).toEqual(['/review']);
   });
 });

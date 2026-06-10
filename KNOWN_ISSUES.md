@@ -3557,6 +3557,29 @@
 
 ---
 
+#### Electron ACP slash komutu yazinca siyah ekran {#electron-acp-slash-command-black-screen}
+- Date: 2026-06-10
+- Context: User reported that typing `/` into the OpenCode ACP input made the screen go black.
+- Error signature:
+  1. `AcpChatPanel` assumed every available command had string `id` and `name` fields.
+  2. The slash-filter effect called `c.id.toLowerCase()` and `c.name.toLowerCase()` directly.
+  3. ACP command fixtures and real ACP payloads may provide only `name`, malformed entries, or non-array command data.
+- Symptoms/Impact:
+  - Typing `/` could throw a renderer exception and blank the Electron UI.
+  - Slash suggestions could render `/undefined` when command events lacked `id`.
+- Root cause:
+  - Slash command hint generation was not normalized or defensive at the UI boundary.
+- Resolution:
+  - Added `slashCommandHint()` and `slashCommandHints()` helpers that accept unknown command payloads, use `id` or `name`, strip leading `/`, reject malformed entries, deduplicate hints, and filter by query without throwing.
+  - Routed both `commands` events and `session.availableCommands` filtering through the shared helper.
+- Prevent recurrence:
+  - Added regression tests for id-only, name-only, malformed, non-array, deduplicated, and query-filtered slash command payloads.
+  - Verified with `npx tsc --noEmit`, `npx vitest run --reporter=dot`, and `npx vite build`.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/dist/*`, `KNOWN_ISSUES.md`
+- References: User request 2026-06-10
+
+---
+
 #### OpenCode ACP queued mesajı küçük ve ESC stop kısayolu eksikti {#acp-queued-row-escape-stop}
 - Date: 2026-06-04
 - Context: User reported that locally queued ACP messages looked absurdly tiny in the chat area, and requested that pressing `Esc` stop the AI response.

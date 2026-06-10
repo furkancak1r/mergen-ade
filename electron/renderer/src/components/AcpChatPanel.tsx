@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import type { AcpChatSession, AcpChatMessage, ProjectRecord, AcpConfigOption, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
 import { defaultAppConfig } from '../../../shared/types';
 import { removeMentionFromInput } from '../lib/acpParser';
-import { actionControlsEnabled, hasConfigSelectorOptions, optionValues, shouldShowAcpWelcome } from '../lib/acpUi';
+import { actionControlsEnabled, hasConfigSelectorOptions, optionValues, shouldShowAcpWelcome, slashCommandHints } from '../lib/acpUi';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -36,7 +36,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   useEffect(() => {
     refreshSession();
-    const unsub = api.on('acp:event', (eventChatId: string, event: { type: string; text?: string; role?: string; options?: OpenCodeQuestion['options']; multiple?: boolean; custom?: boolean; requestId?: string; sessionId?: string; message?: string; header?: string; question?: string; count?: number; modeId?: string; commands?: { id: string; name: string }[]; toolCallId?: string; title?: string; kind?: string; status?: string }) => {
+    const unsub = api.on('acp:event', (eventChatId: string, event: { type: string; text?: string; role?: string; options?: OpenCodeQuestion['options']; multiple?: boolean; custom?: boolean; requestId?: string; sessionId?: string; message?: string; header?: string; question?: string; count?: number; modeId?: string; commands?: unknown; toolCallId?: string; title?: string; kind?: string; status?: string }) => {
       if (eventChatId !== chatId) return;
 
       // Handle high-frequency message chunks locally without re-fetching session
@@ -84,7 +84,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         setCustomAnswer('');
       }
       if (event.type === 'commands' && event.commands) {
-        setSlashHints(event.commands.map((c) => `/${c.id}`));
+        setSlashHints(slashCommandHints(event.commands, ''));
         return;
       }
     });
@@ -109,11 +109,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     }
     const availableCommands = session?.availableCommands ?? [];
     const query = input.slice(1).toLowerCase();
-    const matches = availableCommands
-      .filter((c) => c.id.toLowerCase().startsWith(query) || c.name.toLowerCase().startsWith(query))
-      .map((c) => `/${c.id}`)
-      .slice(0, 6);
-    setSlashHints(matches);
+    setSlashHints(slashCommandHints(availableCommands, query));
   }, [input, session?.availableCommands]);
 
   useEffect(() => {

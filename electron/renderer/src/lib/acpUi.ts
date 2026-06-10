@@ -12,6 +12,11 @@ export interface AcpActivityState {
   hasQueuedPrompts: boolean;
 }
 
+export interface AcpCommandLike {
+  id?: unknown;
+  name?: unknown;
+}
+
 export function isAcpRunningStatus(status: AcpChatSession['status'] | undefined): boolean {
   return status === 'running' || status === 'permission';
 }
@@ -46,4 +51,42 @@ export function hasConfigSelectorOptions(modelOptions: AcpConfigOption | undefin
 
 export function actionControlsEnabled(session: Pick<AcpChatSession, 'sessionId'> | null | undefined): boolean {
   return Boolean(session?.sessionId);
+}
+
+function commandText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+export function slashCommandHint(command: AcpCommandLike): string | undefined {
+  const raw = commandText(command.id) || commandText(command.name);
+  const token = raw.replace(/^\/+/, '').trim();
+  if (!token || /\s/.test(token)) return undefined;
+  return `/${token}`;
+}
+
+export function slashCommandHints(commands: unknown, query: string, limit = 6): string[] {
+  if (!Array.isArray(commands)) return [];
+  const normalizedQuery = query.trim().replace(/^\/+/, '').toLowerCase();
+  const hints: string[] = [];
+  const seen = new Set<string>();
+
+  for (const command of commands) {
+    if (!command || typeof command !== 'object') continue;
+    const candidate = command as AcpCommandLike;
+    const hint = slashCommandHint(candidate);
+    if (!hint) continue;
+
+    const idText = hint.slice(1).toLowerCase();
+    const nameText = commandText(candidate.name).replace(/^\/+/, '').toLowerCase();
+    if (normalizedQuery && !idText.startsWith(normalizedQuery) && !nameText.startsWith(normalizedQuery)) {
+      continue;
+    }
+    if (seen.has(hint)) continue;
+
+    seen.add(hint);
+    hints.push(hint);
+    if (hints.length >= limit) break;
+  }
+
+  return hints;
 }
