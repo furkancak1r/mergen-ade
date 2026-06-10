@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { loadConfig, saveConfig, loadHistory, saveHistory, repairMojibakePath } from './config';
 import { createTerminal, writeTerminal, resizeTerminal, killTerminal, getTerminalState } from './pty';
-import { discoverWorktrees, createWorktree, removeWorktree, getGitStatus } from './worktree';
+import { discoverWorktrees, createWorktree, removeWorktree, getGitStatus, getGitDiffSummary } from './worktree';
 import { spawnAcpChat, sendAcpPrompt, cancelAcpPrompt, setAcpConfigOption, sendAcpPermissionResponse, sendAcpQuestionResponse, getAcpSession, killAcpChat, warmAcpStandby, getAcpStandby, clearAcpStandby, promoteAcpStandby, clearAllAcpStandby } from './acpService';
 import { submitAnswer } from './hookService';
 import {
@@ -37,6 +37,7 @@ import {
   getBrowserMcpCommandArray,
 } from './browserMcpService';
 import { generateOpencodeTerminalConfig, generateOpencodeRuntimeConfig } from './opencode';
+import { getAppDiagnostics } from './diagnostics';
 
 export function registerIpcHandlers() {
   // Config
@@ -44,6 +45,7 @@ export function registerIpcHandlers() {
   ipcMain.handle('config:save', (_event, config) => saveConfig(config));
   ipcMain.handle('history:load', () => loadHistory());
   ipcMain.handle('history:save', (_event, history) => saveHistory(history));
+  ipcMain.handle('diagnostics:get', () => getAppDiagnostics());
 
   // PTY
   ipcMain.handle('pty:create', (_event, opts) => createTerminal(opts));
@@ -191,6 +193,9 @@ export function registerIpcHandlers() {
   });
 
   // Git / Worktree
+  ipcMain.handle('git:diffSummary', async (_event, repoPath: string) => {
+    return getGitDiffSummary(repoPath);
+  });
   ipcMain.handle('git:status', async (_event, repoPath: string) => {
     return getGitStatus(repoPath);
   });

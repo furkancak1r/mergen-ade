@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import type {
   AppConfig,
   TerminalShortcutEntry,
@@ -9,6 +9,7 @@ import type {
   AcpStartupMode,
   MainVisibilityMode,
   LauncherEntry,
+  AppDiagnostics,
 } from '../../../shared/types';
 import {
   AcpStartupModeLabel,
@@ -26,14 +27,22 @@ import {
   savedMessageOwnerProjectId,
   updateSavedMessage,
 } from '../lib/savedMessages';
+import {
+  diagnosticsColor,
+  runtimeOverview,
+  type ActiveTerminalDiagnostics,
+} from '../lib/diagnostics';
+
+const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).mergenApi;
 
 interface SettingsPopupProps {
   config: AppConfig;
+  activeTerminal?: ActiveTerminalDiagnostics;
   onSave: (config: AppConfig) => void;
   onClose: () => void;
 }
 
-type SettingsTab = 'general' | 'launchers' | 'opencode' | 'saved' | 'shortcuts' | 'notifications';
+type SettingsTab = 'general' | 'launchers' | 'opencode' | 'saved' | 'shortcuts' | 'notifications' | 'diagnostics';
 
 const tabs: { id: SettingsTab; label: string }[] = [
   { id: 'general', label: 'General' },
@@ -42,19 +51,39 @@ const tabs: { id: SettingsTab; label: string }[] = [
   { id: 'saved', label: 'Saved Messages' },
   { id: 'shortcuts', label: 'Shortcuts' },
   { id: 'notifications', label: 'Notifications' },
+  { id: 'diagnostics', label: 'Diagnostics' },
 ];
 
-export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, onSave, onClose }) => {
+export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerminal, onSave, onClose }) => {
   const [activeTab, setActiveTab] = useState<SettingsTab>('general');
   const [draft, setDraft] = useState<AppConfig>({ ...config });
   const [recordingShortcutIndex, setRecordingShortcutIndex] = useState<number | null>(null);
   const [recordingAcpShortcut, setRecordingAcpShortcut] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<AppDiagnostics | undefined>();
+  const [diagnosticsError, setDiagnosticsError] = useState<string | undefined>();
+  const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
   const [launcherDraft, setLauncherDraft] = useState({
     displayName: '',
     launchCommand: '',
     iconKey: LauncherIconKey.Terminal,
   });
   const [savedMessageDrafts, setSavedMessageDrafts] = useState<Record<number, string>>({});
+
+  useEffect(() => {
+    if (activeTab !== 'diagnostics') return;
+    let cancelled = false;
+    setDiagnosticsError(undefined);
+    api.invoke('diagnostics:get')
+      .then((value) => {
+        if (!cancelled) setDiagnostics(value as AppDiagnostics);
+      })
+      .catch((error) => {
+        if (!cancelled) setDiagnosticsError(error instanceof Error ? error.message : String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab]);
 
   const updateUi = useCallback((partial: Partial<AppConfig['ui']>) => {
     setDraft((prev) => ({ ...prev, ui: { ...prev.ui, ...partial } }));
@@ -851,6 +880,109 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, onSave, on
               </div>
             </div>
           )}
+
+          {activeTab === 'diagnostics' && (() => {
+            const overview = runtimeOverview(diagnostics, activeTerminal);
+            const overviewColor = diagnosticsColor(overview.severity);
+            const hookStatus = diagnostics
+              ? diagnostics.hookServicePort > 0
+                ? `Listening on 127.0.0.1:${diagnostics.hookServicePort}`
+                : 'Not listening'
+              : 'Loading';
+            const codexHooksStatus = diagnostics
+              ? diagnostics.codexHooksInstalled ? 'Installed' : 'Not installed'
+              : 'Loading';
+            const browserMcpStatus = diagnostics
+              ? `${diagnostics.browserMcpSessionCount} active session${diagnostics.browserMcpSessionCount === 1 ? '' : 's'}`
+              : 'Loading';
+            return (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <DiagnosticsCard
+                  title="Runtime Overview"
+                  subtitle="Get a quick read on integration health before opening the verbose diagnostics."
+                >
+                  <DiagnosticValue value={overview.title} color={overviewColor} strong />
+                  <DiagnosticValue value={diagnosticsError || overview.message} color={diagnosticsError ? '#dcaa3c' : '#888'} />
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: 12, marginTop: 10 }}>
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: '#eee', marginBottom: 6 }}>Hook Bridge</div>
+                      <DiagnosticRow label="Inbox" value={diagnostics?.hookInboxDir ?? 'Loading'} color={diagnostics?.hookInboxDir ? '#64c38c' : '#888'} />
+                      <DiagnosticRow label="Service" value={hookStatus} color={diagnostics && diagnostics.hookServicePort > 0 ? '#64c38c' : '#dcaa3c'} />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: '#eee', marginBottom: 6 }}>Codex CLI</div>
+                      <DiagnosticRow label="Inbox" value={diagnostics?.codexInboxDir ?? 'Loading'} color={diagnostics?.codexInboxDir ? '#64c38c' : '#888'} />
+                      <DiagnosticRow label="Hooks" value={codexHooksStatus} color={diagnostics?.codexHooksInstalled ? '#64c38c' : '#dcaa3c'} />
+                    </div>
+                  </div>
+                </DiagnosticsCard>
+
+                <DiagnosticsCard
+                  title="Session State"
+                  subtitle="Inspect the currently selected terminal and browser bridge status."
+                >
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: 12 }}>
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: '#eee', marginBottom: 6 }}>Active Terminal</div>
+                      <DiagnosticRow label="Terminal" value={activeTerminal ? `#${activeTerminal.id} ${activeTerminal.title || ''}`.trim() : 'No active terminal'} />
+                      <DiagnosticRow label="Kind" value={activeTerminal?.kind ?? 'None'} />
+                      <DiagnosticRow label="AI Tool" value={activeTerminal?.aiTool ?? 'None'} />
+                      <DiagnosticRow label="AI Status" value={activeTerminal?.aiStatus ?? 'Inactive'} />
+                      <DiagnosticRow label="OpenCode" value={activeTerminal?.opencodeTransportStatus ?? (activeTerminal?.opencodeSessionActive ? 'Active' : 'Inactive')} />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: '#eee', marginBottom: 6 }}>Browser MCP</div>
+                      <DiagnosticRow label="Status" value={browserMcpStatus} color={diagnostics && diagnostics.browserMcpSessionCount > 0 ? '#64c38c' : '#888'} />
+                      <DiagnosticRow label="Command" value={diagnostics?.browserMcpCommand.join(' ') ?? 'Loading'} />
+                      <DiagnosticRow label="Bridge" value={diagnostics?.codexBridgeInstalled ? 'Installed' : diagnostics ? 'Not installed' : 'Loading'} color={diagnostics?.codexBridgeInstalled ? '#64c38c' : '#888'} />
+                    </div>
+                  </div>
+                </DiagnosticsCard>
+
+                <div style={{ background: '#1a1a1a', border: '1px solid #262626', borderRadius: 6, overflow: 'hidden' }}>
+                  <button
+                    onClick={() => setDiagnosticsExpanded((value) => !value)}
+                    style={{
+                      width: '100%',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '10px 12px',
+                      background: 'transparent',
+                      border: 'none',
+                      color: '#eee',
+                      cursor: 'pointer',
+                      fontSize: 12,
+                      fontWeight: 600,
+                    }}
+                  >
+                    <span>Technical Details</span>
+                    <span style={{ color: '#888', fontSize: 11 }}>{diagnosticsExpanded ? 'Hide' : 'Show'}</span>
+                  </button>
+                  {diagnosticsExpanded && (
+                    <div style={{ borderTop: '1px solid #262626', padding: 12, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <DiagnosticRow label="App Version" value={diagnostics?.appVersion ?? 'Loading'} />
+                      <DiagnosticRow label="Platform" value={diagnostics ? `${diagnostics.platform} ${diagnostics.arch}` : 'Loading'} />
+                      <DiagnosticRow label="Electron" value={diagnostics?.electronVersion ?? 'Loading'} />
+                      <DiagnosticRow label="Chrome" value={diagnostics?.chromeVersion ?? 'Loading'} />
+                      <DiagnosticRow label="Node" value={diagnostics?.nodeVersion ?? 'Loading'} />
+                      <DiagnosticRow label="Executable Path" value={diagnostics?.execPath ?? 'Loading'} />
+                      <DiagnosticRow label="Working Directory" value={diagnostics?.cwd ?? 'Loading'} />
+                      <DiagnosticRow label="Config Path" value={diagnostics?.configPath ?? 'Loading'} />
+                      <DiagnosticRow label="Legacy Config Path" value={diagnostics?.legacyConfigPath ?? 'Loading'} />
+                      <DiagnosticRow label="History Path" value={diagnostics?.historyPath ?? 'Loading'} />
+                      <DiagnosticRow label="Hook Inbox" value={diagnostics?.hookInboxDir ?? 'Loading'} />
+                      <DiagnosticRow label="Codex Inbox" value={diagnostics?.codexInboxDir ?? 'Loading'} />
+                      <DiagnosticRow label="Codex Hooks Path" value={diagnostics?.codexHooksPath ?? 'Loading'} />
+                      <DiagnosticRow label="Codex Bridge Path" value={diagnostics?.codexBridgePath ?? 'Loading'} />
+                      <DiagnosticRow label="Active Terminal CWD" value={activeTerminal?.cwd ?? 'No active terminal'} />
+                      <DiagnosticRow label="Active Terminal Reason" value={activeTerminal?.opencodeAttentionReason || activeTerminal?.aiStatusReason || 'None'} />
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
         </div>
 
         {/* Footer */}
@@ -866,6 +998,73 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, onSave, on
     </div>
   );
 };
+
+function DiagnosticsCard({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) {
+  return (
+    <div style={{ padding: 12, background: '#1a1a1a', border: '1px solid #262626', borderRadius: 6 }}>
+      <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>{title}</div>
+      <div style={{ fontSize: 11, color: '#888', marginBottom: 10 }}>{subtitle}</div>
+      {children}
+    </div>
+  );
+}
+
+function DiagnosticValue({ value, color = '#ccc', strong = false }: { value: string; color?: string; strong?: boolean }) {
+  return (
+    <div
+      title={value}
+      style={{
+        fontSize: strong ? 12 : 11,
+        fontWeight: strong ? 600 : 400,
+        color,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {value}
+    </div>
+  );
+}
+
+function DiagnosticRow({ label, value, color = '#ccc' }: { label: string; value: string; color?: string }) {
+  const copy = useCallback(() => {
+    api.invoke('clipboard:writeText', value).catch(() => {});
+  }, [value]);
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '132px minmax(0, 1fr) auto', gap: 8, alignItems: 'center', minHeight: 24 }}>
+      <span style={{ fontSize: 11, color: '#888' }}>{label}</span>
+      <span
+        title={value}
+        style={{
+          fontSize: 11,
+          color,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {value}
+      </span>
+      <button
+        onClick={copy}
+        disabled={!value || value === 'Loading'}
+        style={{
+          padding: '2px 7px',
+          fontSize: 10,
+          background: '#0c0c0c',
+          border: '1px solid #333',
+          color: '#888',
+          borderRadius: 4,
+          cursor: value && value !== 'Loading' ? 'pointer' : 'not-allowed',
+        }}
+      >
+        Copy
+      </button>
+    </div>
+  );
+}
 
 function nextCustomLauncherId(launchers: LauncherEntry[]): string {
   let suffix = launchers.length + 1;

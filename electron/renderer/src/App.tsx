@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import type { AppConfig, ShellKind, TerminalKind, ProjectRecord, LeftSidebarTab, BrowserScopeKey, SmartInputState, SmartInputAttachment, AiHookEvent, AiCliAttentionKind, TerminalShortcutEntry, BrowserTab } from '../../shared/types';
+import type { AppConfig, ShellKind, TerminalKind, ProjectRecord, LeftSidebarTab, BrowserScopeKey, SmartInputState, SmartInputAttachment, AiHookEvent, AiCliAttentionKind, TerminalShortcutEntry, BrowserTab, InputHistoryFilter, TerminalManagerFilter, AppHistory } from '../../shared/types';
 import { BrowserScopeKeyType } from '../../shared/types';
-import { LeftSidebarTab as LeftSidebarTabEnum, defaultAppConfig } from '../../shared/types';
+import { LeftSidebarTab as LeftSidebarTabEnum, defaultAppConfig, defaultAppHistory } from '../../shared/types';
 import { MainArea } from './components/MainArea';
 import { ProjectExplorer } from './components/ProjectExplorer';
 import { TerminalManager } from './components/TerminalManager';
@@ -17,11 +17,19 @@ import { activeBrowserScope as resolveActiveBrowserScope, scopeKeyString } from 
 import { nextAcpActivityState, type AcpEventLike } from './lib/acpUi';
 import type { SmartInputModeId } from './lib/smartInputMode';
 import { terminalWheelEnabled } from './lib/terminalWheel';
+import {
+  normalizeTerminalManagerStartupState,
+  withTerminalManagerFilter,
+  withTerminalManagerOpened,
+  withToggledTerminalManagerHideInactive,
+} from './lib/terminalManagerState';
+import { recordInputHistory } from './lib/inputHistory';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
 function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [history, setHistory] = useState<AppHistory>(defaultAppHistory());
   const [activeTab, setActiveTab] = useState<LeftSidebarTab>(LeftSidebarTabEnum.Directory);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
   const [activeTerminalId, setActiveTerminalId] = useState<number | null>(null);
@@ -63,10 +71,12 @@ function App() {
 
   const pty = usePty();
   const suppressAcpRestoreRef = useRef(false);
+  const historyLoadedRef = useRef(false);
+  const terminalHistorySignatureRef = useRef<Map<number, string>>(new Map());
 
   useEffect(() => {
     api.invoke('config:load').then((cfg) => {
-      const loaded = cfg as AppConfig;
+      const loaded = normalizeTerminalManagerStartupState(cfg as AppConfig);
       setConfig(loaded);
       setActiveTab(loaded.ui.leftSidebarTab);
       setSidebarWidth(loaded.ui.projectExplorerWidth);
@@ -78,6 +88,21 @@ function App() {
       }
     });
   }, []);
+
+  useEffect(() => {
+    api.invoke('history:load').then((loadedHistory) => {
+      setHistory(loadedHistory as AppHistory);
+      historyLoadedRef.current = true;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!historyLoadedRef.current) return;
+    const timer = setTimeout(() => {
+      api.invoke('history:save', history);
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [history]);
 
   useEffect(() => {
     if (!config) return;
@@ -114,6 +139,37 @@ function App() {
     });
     return () => { unsub(); };
   }, [pty]);
+
+  useEffect(() => {
+    if (!config || !historyLoadedRef.current) return;
+    const liveTerminalIds = new Set(terminals.map((terminal) => terminal.id));
+    for (const terminalId of terminalHistorySignatureRef.current.keys()) {
+      if (!liveTerminalIds.has(terminalId)) {
+        terminalHistorySignatureRef.current.delete(terminalId);
+      }
+    }
+
+    setHistory((prev) => {
+      let next = prev;
+      for (const terminal of terminals) {
+        const signature = terminal.recentInputs.join('\0');
+        if (terminalHistorySignatureRef.current.get(terminal.id) === signature) continue;
+        terminalHistorySignatureRef.current.set(terminal.id, signature);
+
+        const latestInput = terminal.recentInputs[0];
+        if (!latestInput) continue;
+        const project = config.projects.find((candidate) => candidate.id === terminal.projectId);
+        next = recordInputHistory(
+          next,
+          project,
+          terminal.kind,
+          latestInput,
+          Math.floor(Date.now() / 1000),
+        );
+      }
+      return next;
+    });
+  }, [config, terminals]);
 
   useEffect(() => {
     const unsub = (window as unknown as { mergenApi: { on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi.on('window:closeRequest', () => {
@@ -427,6 +483,7 @@ function App() {
   }, [isResizingBrowser]);
 
   const selectedProject = config?.projects.find((p) => p.id === selectedProjectId) ?? null;
+  const activeTerminalForSettings = terminals.find((t) => t.id === activeTerminalId);
 
   const isBrowserOpen = selectedProjectId !== null && browserOpenProjects.has(selectedProjectId);
 
@@ -707,7 +764,10 @@ function App() {
         </button>
         <button
           className={`rail-btn ${activeTab === LeftSidebarTabEnum.TerminalManager ? 'active' : ''}`}
-          onClick={() => setActiveTab(LeftSidebarTabEnum.TerminalManager)}
+          onClick={() => {
+            setActiveTab(LeftSidebarTabEnum.TerminalManager);
+            setConfig((prev) => prev ? withTerminalManagerOpened(prev) : prev);
+          }}
           title="Terminal Manager"
         >
           Terminals
@@ -828,6 +888,12 @@ function App() {
             onRemoveAcpChat={removeAcpChatForProject}
             onOpenAcpChat={openAcpChat}
             onOverlayOpenChange={setTerminalManagerOverlayOpen}
+            onUpdateFilter={(terminalManagerFilter: TerminalManagerFilter) => {
+              setConfig((prev) => prev ? withTerminalManagerFilter(prev, terminalManagerFilter) : prev);
+            }}
+            onToggleHideInactiveProjects={() => {
+              setConfig((prev) => prev ? withToggledTerminalManagerHideInactive(prev) : prev);
+            }}
           />
         )}
         {activeTab === LeftSidebarTabEnum.SourceControl && selectedProject && config && (
@@ -918,9 +984,11 @@ function App() {
         {activeTab === LeftSidebarTabEnum.InputHistory && config && (
           <InputHistory
             config={config}
-            terminals={terminals}
-            activeTerminalId={activeTerminalId}
-            onActivateTerminal={activateTerminal}
+            history={history}
+            selectedProjectId={selectedProjectId}
+            onUpdateFilter={(inputHistoryFilter: InputHistoryFilter) => {
+              setConfig((prev) => prev ? { ...prev, ui: { ...prev.ui, inputHistoryFilter } } : prev);
+            }}
           />
         )}
       </div>
@@ -1036,6 +1104,19 @@ function App() {
       {settingsOpen && config && (
         <SettingsPopup
           config={config}
+          activeTerminal={activeTerminalForSettings ? {
+            id: activeTerminalForSettings.id,
+            title: activeTerminalForSettings.title,
+            cwd: activeTerminalForSettings.cwd,
+            kind: activeTerminalForSettings.kind,
+            aiTool: activeTerminalForSettings.aiTool,
+            aiStatus: activeTerminalForSettings.aiStatus,
+            aiStatusReason: activeTerminalForSettings.aiStatusReason,
+            opencodeSessionActive: activeTerminalForSettings.opencodeSessionActive,
+            opencodeTransportStatus: activeTerminalForSettings.opencodeTransportStatus,
+            opencodeAttentionReason: activeTerminalForSettings.opencodeAttentionReason,
+            exited: activeTerminalForSettings.exited,
+          } : undefined}
           onSave={(newConfig) => setConfig(newConfig)}
           onClose={() => setSettingsOpen(false)}
         />

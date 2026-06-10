@@ -1,6 +1,8 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry } from '../../../shared/types';
 import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalManagerFilterEnum, BuiltinLauncherKind, activeBuildModel } from '../../../shared/types';
+import type { GitDiffSummary } from '../../../shared/gitDiffSummary';
+import { gitDiffSummaryLabel } from '../../../shared/gitDiffSummary';
 import type { TerminalInstance } from '../hooks/usePty';
 import { effectiveLauncherCommand } from '../lib/launcher';
 
@@ -70,6 +72,8 @@ interface TerminalManagerProps {
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number) => void;
   onOverlayOpenChange?: (open: boolean) => void;
+  onUpdateFilter?: (filter: TerminalManagerFilter) => void;
+  onToggleHideInactiveProjects?: () => void;
 }
 
 export const TerminalManager: React.FC<TerminalManagerProps> = ({
@@ -89,12 +93,15 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onRemoveAcpChat,
   onOpenAcpChat,
   onOverlayOpenChange,
+  onUpdateFilter,
+  onToggleHideInactiveProjects,
 }) => {
-  const [filter, setFilter] = useState<TerminalManagerFilter>(config.ui.terminalManagerFilter ?? TerminalManagerFilterEnum.Foreground);
   const [expandedProjects, setExpandedProjects] = useState<Set<number>>(new Set(config.projects.map((p) => p.id)));
   const [showSavedMessages, setShowSavedMessages] = useState<number | null>(null);
   const [showFgMessages, setShowFgMessages] = useState<number | null>(null);
   const [showLauncherMenu, setShowLauncherMenu] = useState<number | null>(null);
+  const [diffSummaries, setDiffSummaries] = useState<Map<number, GitDiffSummary>>(new Map());
+  const [diffSummaryLoading, setDiffSummaryLoading] = useState<Set<number>>(new Set());
   const [fgMessagePopupProject, setFgMessagePopupProject] = useState<number | null>(null);
   const [fgMessagePopupText, setFgMessagePopupText] = useState('');
   const [fgMessageEditIndex, setFgMessageEditIndex] = useState<number | null>(null);
@@ -113,6 +120,51 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
     return () => onOverlayOpenChange?.(false);
   }, [overlayOpen, onOverlayOpenChange]);
 
+  const projectDiffKey = config.projects.map((p) => `${p.id}:${p.path}`).join('\0');
+
+  useEffect(() => {
+    let cancelled = false;
+    const projects = config.projects;
+    setDiffSummaryLoading(new Set(projects.map((p) => p.id)));
+    setDiffSummaries((prev) => {
+      const next = new Map<number, GitDiffSummary>();
+      for (const project of projects) {
+        const existing = prev.get(project.id);
+        if (existing) next.set(project.id, existing);
+      }
+      return next;
+    });
+
+    for (const project of projects) {
+      api.invoke('git:diffSummary', project.path)
+        .then((value) => {
+          if (cancelled) return;
+          setDiffSummaries((prev) => new Map(prev).set(project.id, value as GitDiffSummary));
+        })
+        .catch((error) => {
+          if (cancelled) return;
+          setDiffSummaries((prev) => new Map(prev).set(project.id, {
+            status: 'error',
+            addedLines: 0,
+            removedLines: 0,
+            error: error instanceof Error ? error.message : String(error),
+          }));
+        })
+        .finally(() => {
+          if (cancelled) return;
+          setDiffSummaryLoading((prev) => {
+            const next = new Set(prev);
+            next.delete(project.id);
+            return next;
+          });
+        });
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectDiffKey]);
+
   const toggleProject = useCallback((projectId: number) => {
     setExpandedProjects((prev) => {
       const next = new Set(prev);
@@ -124,6 +176,9 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
       return next;
     });
   }, []);
+
+  const filter = config.ui.terminalManagerFilter ?? TerminalManagerFilterEnum.Foreground;
+  const hideInactive = config.ui.terminalManagerHideInactiveProjects;
 
   const filteredTerminals = terminals.filter((t) => {
     if (filter === TerminalManagerFilterEnum.Foreground) return t.kind === TerminalKindEnum.Foreground;
@@ -163,8 +218,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
       }
     }
   }
-
-  const hideInactive = config.ui.terminalManagerHideInactiveProjects;
 
   // Close history popup when clicking outside
   useEffect(() => {
@@ -211,7 +264,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
           return (
             <div
               key={f}
-              onClick={() => setFilter(f)}
+              onClick={() => onUpdateFilter?.(f)}
               style={{
                 flex: 1,
                 display: 'flex',
@@ -234,6 +287,25 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
             </div>
           );
         })}
+        <button
+          onClick={onToggleHideInactiveProjects}
+          title={hideInactive ? 'Show projects without live terminals' : 'Hide projects without live terminals'}
+          style={{
+            width: 28,
+            height: 24,
+            alignSelf: 'center',
+            marginLeft: 4,
+            borderRadius: 4,
+            border: `1px solid ${hideInactive ? BTN_ICON_ACTIVE : BORDER_COLOR}`,
+            background: hideInactive ? withAlpha(BTN_ICON_ACTIVE, 170) : BTN_ICON,
+            color: hideInactive ? TEXT_PRIMARY : TEXT_MUTED,
+            cursor: 'pointer',
+            fontSize: 12,
+            lineHeight: 1,
+          }}
+        >
+          {hideInactive ? '◉' : '○'}
+        </button>
       </div>
 
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 0' }}>
@@ -256,6 +328,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
               <ProjectGroup
                 project={project}
                 terminals={getProjectTerminals(project.id)}
+                diffSummary={diffSummaries.get(project.id)}
+                diffSummaryLoading={diffSummaryLoading.has(project.id)}
                 filter={filter}
                 expanded={expanded}
                 onToggle={() => toggleProject(project.id)}
@@ -303,6 +377,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                   <ProjectGroup
                     project={worktree}
                     terminals={getProjectTerminals(worktree.id)}
+                    diffSummary={diffSummaries.get(worktree.id)}
+                    diffSummaryLoading={diffSummaryLoading.has(worktree.id)}
                     filter={filter}
                     expanded={expandedProjects.has(worktree.id)}
                     onToggle={() => toggleProject(worktree.id)}
@@ -497,6 +573,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
 interface ProjectGroupProps {
   project: ProjectRecord;
   terminals: TerminalInstance[];
+  diffSummary?: GitDiffSummary;
+  diffSummaryLoading: boolean;
   filter: TerminalManagerFilter;
   expanded: boolean;
   onToggle: () => void;
@@ -532,6 +610,8 @@ interface ProjectGroupProps {
 const ProjectGroup: React.FC<ProjectGroupProps> = ({
   project,
   terminals,
+  diffSummary,
+  diffSummaryLoading,
   filter,
   expanded,
   onToggle,
@@ -571,6 +651,16 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   const hasLiveTerminals = terminals.length > 0;
   const isSelected = activeTerminalId !== null && terminals.some((t) => t.id === activeTerminalId);
   const hasLiveTerminal = terminals.some((t) => !t.exited);
+  const diffLabel = gitDiffSummaryLabel(diffSummary, diffSummaryLoading);
+  const showReadyDiff = Boolean(
+    diffSummary
+      && diffSummary.status === 'ready'
+      && !diffSummaryLoading
+      && (diffSummary.addedLines > 0 || diffSummary.removedLines > 0),
+  );
+  const diffTooltip = diffSummary?.status === 'error'
+    ? diffSummary.error || 'Git diff summary unavailable'
+    : 'Changed lines in this worktree';
 
   // Project header text color: bright only when has live terminal
   const headerTextColor = hasLiveTerminal ? TEXT_PRIMARY : withAlpha(TEXT_MUTED, 180);
@@ -617,6 +707,39 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
         }}>
           {project.name}
         </span>
+        {showReadyDiff ? (
+          <span
+            title={diffTooltip}
+            style={{
+              display: 'inline-flex',
+              gap: 4,
+              alignItems: 'center',
+              fontSize: 10,
+              fontWeight: 600,
+              zIndex: 1,
+              marginLeft: 6,
+              flexShrink: 0,
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          >
+            <span style={{ color: '#64c38c' }}>+{diffSummary!.addedLines}</span>
+            <span style={{ color: '#d47a7a' }}>-{diffSummary!.removedLines}</span>
+          </span>
+        ) : diffLabel ? (
+          <span
+            title={diffTooltip}
+            style={{
+              fontSize: 10,
+              color: withAlpha(TEXT_MUTED, 150),
+              zIndex: 1,
+              marginLeft: 6,
+              flexShrink: 0,
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          >
+            {diffLabel}
+          </span>
+        ) : null}
         {isWorktree && (
           <span style={{ fontSize: 10, color: withAlpha(ACCENT, 200), zIndex: 1, marginLeft: 4 }}>🌿</span>
         )}

@@ -2,6 +2,8 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import type { GitWorktreeInfo } from '../shared/types';
+import type { GitDiffSummary } from '../shared/gitDiffSummary';
+import { parseGitNumstatTotals } from '../shared/gitDiffSummary';
 
 export function parseGitWorktreeList(output: string): GitWorktreeInfo[] {
   const worktrees: GitWorktreeInfo[] = [];
@@ -183,5 +185,69 @@ export function getGitStatus(repoPath: string): Promise<{ files: { path: string;
     proc.on('error', () => {
       resolve({ files: [], branch: '' });
     });
+  });
+}
+
+export async function getGitDiffSummary(repoPath: string): Promise<GitDiffSummary> {
+  try {
+    const base = await resolveGitDiffBase(repoPath);
+    const output = await runGitCommand(repoPath, ['diff', base, '--numstat']);
+    if (output.code !== 0) {
+      return {
+        status: 'error',
+        addedLines: 0,
+        removedLines: 0,
+        error: output.stderr.trim() || 'git diff --numstat failed',
+      };
+    }
+
+    const totals = parseGitNumstatTotals(output.stdout);
+    return {
+      status: 'ready',
+      addedLines: totals.addedLines,
+      removedLines: totals.removedLines,
+    };
+  } catch (error) {
+    return {
+      status: 'error',
+      addedLines: 0,
+      removedLines: 0,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function resolveGitDiffBase(repoPath: string): Promise<string> {
+  const head = await runGitCommand(repoPath, ['rev-parse', '--verify', 'HEAD']);
+  if (head.code === 0) return 'HEAD';
+
+  const emptyTree = await runGitCommand(repoPath, ['hash-object', '-t', 'tree', '--stdin'], '');
+  if (emptyTree.code !== 0) {
+    throw new Error(emptyTree.stderr.trim() || 'git hash-object failed');
+  }
+
+  const oid = emptyTree.stdout.trim();
+  if (!oid) throw new Error('git hash-object returned an empty tree id');
+  return oid;
+}
+
+function runGitCommand(
+  repoPath: string,
+  args: string[],
+  input?: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', args, { cwd: repoPath, windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout?.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr?.on('data', (data) => { stderr += data.toString(); });
+    proc.on('close', (code) => resolve({ code: code ?? 0, stdout, stderr }));
+    proc.on('error', reject);
+
+    if (input !== undefined) {
+      proc.stdin?.end(input);
+    }
   });
 }

@@ -1,117 +1,158 @@
-import React, { useState } from 'react';
-import type { TerminalKind, TerminalInputHistoryFilter, ProjectRecord } from '../../../shared/types';
-import { TerminalInputHistoryFilter as TerminalInputHistoryFilterEnum } from '../../../shared/types';
-import type { TerminalInstance } from '../hooks/usePty';
+import React, { useEffect, useState } from 'react';
+import type { AppConfig, AppHistory, InputHistoryFilter } from '../../../shared/types';
+import { InputHistoryFilter as InputHistoryFilterEnum, InputHistoryFilterLabel, TerminalKindLabel } from '../../../shared/types';
+import { collectInputHistoryEntries, formatHistoryRelativeTime } from '../lib/inputHistory';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).mergenApi;
 
 interface InputHistoryProps {
-  config: {
-    projects: ProjectRecord[];
-  };
-  terminals: TerminalInstance[];
-  activeTerminalId: number | null;
-  onActivateTerminal: (id: number) => void;
+  config: AppConfig;
+  history: AppHistory;
+  selectedProjectId: number | null;
+  onUpdateFilter: (filter: InputHistoryFilter) => void;
 }
 
-function formatTime(ts: number): string {
-  const d = new Date(ts);
-  return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
-}
+export const InputHistory: React.FC<InputHistoryProps> = ({
+  config,
+  history,
+  selectedProjectId,
+  onUpdateFilter,
+}) => {
+  const [historyProjectId, setHistoryProjectId] = useState<number | null>(
+    selectedProjectId ?? config.ui.lastSelectedProjectId ?? config.projects[0]?.id ?? null,
+  );
+  const [searchQuery, setSearchQuery] = useState('');
+  const filter = config.ui.inputHistoryFilter;
 
-export const InputHistory: React.FC<InputHistoryProps> = ({ config, terminals, activeTerminalId, onActivateTerminal }) => {
-  const [filter, setFilter] = useState<TerminalInputHistoryFilter>(TerminalInputHistoryFilterEnum.Foreground);
+  useEffect(() => {
+    if (historyProjectId !== null && config.projects.some((project) => project.id === historyProjectId)) return;
+    setHistoryProjectId(selectedProjectId ?? config.projects[0]?.id ?? null);
+  }, [config.projects, historyProjectId, selectedProjectId]);
 
-  const filteredTerminals = terminals.filter((t) => {
-    if (filter === TerminalInputHistoryFilterEnum.Foreground) return t.kind === 'foreground';
-    if (filter === TerminalInputHistoryFilterEnum.Background) return t.kind === 'background';
-    return true;
-  });
-
-  // Collect recent inputs with metadata
-  const entries: { text: string; terminalId: number; projectId: number; projectName: string; kind: TerminalKind; timestamp: number }[] = [];
-  for (const t of filteredTerminals) {
-    const project = config.projects.find((p) => p.id === t.projectId);
-    const projectName = project?.name || 'Unknown';
-    for (const text of t.recentInputs) {
-      entries.push({ text, terminalId: t.id, projectId: t.projectId, projectName, kind: t.kind, timestamp: Date.now() });
-    }
-  }
-
-  // For foreground filter, limit to 5 most recent entries
-  const displayEntries = filter === TerminalInputHistoryFilterEnum.Foreground
-    ? entries.slice(0, 5)
-    : entries;
+  const selectedProject = historyProjectId === null
+    ? undefined
+    : config.projects.find((project) => project.id === historyProjectId);
+  const result = collectInputHistoryEntries(
+    history,
+    config.projects,
+    historyProjectId,
+    filter,
+    searchQuery,
+  );
 
   return (
     <div className="input-history" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <div style={{ display: 'flex', gap: 2, padding: '6px 8px', borderBottom: '1px solid #222' }}>
-        {([TerminalInputHistoryFilterEnum.Foreground, TerminalInputHistoryFilterEnum.Background] as TerminalInputHistoryFilter[]).map((f) => (
-          <button
-            key={f}
-            onClick={() => setFilter(f)}
+      <div style={{ padding: '8px 8px 6px', borderBottom: '1px solid #222', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div>
+          <div style={{ fontSize: 10, color: '#888', marginBottom: 4 }}>Project</div>
+          <select
+            value={historyProjectId ?? ''}
+            onChange={(e) => setHistoryProjectId(e.target.value ? Number(e.target.value) : null)}
             style={{
-              flex: 1,
-              padding: '4px 8px',
-              fontSize: 11,
-              background: filter === f ? '#1f3a4c' : 'transparent',
-              color: filter === f ? '#7ec0ee' : '#888',
-              border: '1px solid ' + (filter === f ? '#1f3a4c' : '#333'),
+              width: '100%',
+              height: 28,
+              background: '#181818',
+              border: '1px solid #333',
+              color: '#ccc',
               borderRadius: 4,
-              cursor: 'pointer',
+              fontSize: 12,
+              padding: '0 8px',
             }}
           >
-            {f === TerminalInputHistoryFilterEnum.Foreground ? 'FG' : 'BG'}
-          </button>
-        ))}
-        <button
-          onClick={() => setFilter(TerminalInputHistoryFilterEnum.Foreground)}
+            {config.projects.length === 0 && <option value="">No project selected</option>}
+            {config.projects.map((project) => (
+              <option key={project.id} value={project.id}>{project.name}</option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ display: 'flex', gap: 2 }}>
+          {([InputHistoryFilterEnum.All, InputHistoryFilterEnum.Foreground, InputHistoryFilterEnum.Background] as InputHistoryFilter[]).map((candidate) => {
+            const selected = filter === candidate;
+            return (
+              <button
+                key={candidate}
+                onClick={() => onUpdateFilter(candidate)}
+                style={{
+                  flex: 1,
+                  padding: '4px 8px',
+                  fontSize: 11,
+                  background: selected ? '#1f3a4c' : 'transparent',
+                  color: selected ? '#7ec0ee' : '#888',
+                  border: '1px solid ' + (selected ? '#1f3a4c' : '#333'),
+                  borderRadius: 4,
+                  cursor: 'pointer',
+                }}
+              >
+                {candidate === InputHistoryFilterEnum.Foreground
+                  ? 'FG'
+                  : candidate === InputHistoryFilterEnum.Background
+                    ? 'BG'
+                    : InputHistoryFilterLabel[candidate]}
+              </button>
+            );
+          })}
+        </div>
+
+        <input
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          placeholder="Search history..."
           style={{
-            flex: 1,
-            padding: '4px 8px',
-            fontSize: 11,
-            background: filter !== TerminalInputHistoryFilterEnum.Foreground && filter !== TerminalInputHistoryFilterEnum.Background ? '#1f3a4c' : 'transparent',
-            color: filter !== TerminalInputHistoryFilterEnum.Foreground && filter !== TerminalInputHistoryFilterEnum.Background ? '#7ec0ee' : '#888',
-            border: '1px solid ' + (filter !== TerminalInputHistoryFilterEnum.Foreground && filter !== TerminalInputHistoryFilterEnum.Background ? '#1f3a4c' : '#333'),
+            height: 28,
+            background: '#0c0c0c',
+            border: '1px solid #333',
+            color: '#ccc',
             borderRadius: 4,
-            cursor: 'pointer',
+            fontSize: 12,
+            padding: '0 8px',
+            outline: 'none',
           }}
-        >
-          All
-        </button>
+        />
       </div>
-      <div style={{ flex: 1, overflow: 'auto', padding: '4px 0' }}>
-        {displayEntries.length === 0 && (
-          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>No input history.</div>
-        )}
-        {displayEntries.map((entry, i) => (
-          <div
-            key={i}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 4,
-              padding: '3px 8px',
-              cursor: 'pointer',
-              borderRadius: 3,
-              background: entry.terminalId === activeTerminalId ? 'rgba(0,120,212,0.2)' : 'transparent',
-            }}
-            onClick={() => {
-              onActivateTerminal(entry.terminalId);
-              // Send the command to the terminal with bracketed paste
-              setTimeout(() => {
-                api.invoke('pty:write', entry.terminalId, `\x1b[200~${entry.text}\x1b[201~`);
-                api.invoke('pty:write', entry.terminalId, '\r');
-              }, 100);
-            }}
-            title={`${entry.projectName} — ${entry.kind}`}
-          >
-            <span style={{ fontSize: 10, color: '#666', flexShrink: 0 }}>{entry.projectName}</span>
-            <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {entry.text}
-            </span>
+
+      <div style={{ flex: 1, overflow: 'auto', padding: '6px 0' }}>
+        {historyProjectId === null || !selectedProject ? (
+          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>Select a project to view history.</div>
+        ) : result.entries.length === 0 ? (
+          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>
+            {searchQuery.trim() ? 'No matching entries.' : 'No history entries for this project yet.'}
           </div>
-        ))}
+        ) : (
+          <>
+            <div style={{ padding: '0 8px 4px', color: '#888', fontSize: 11 }}>
+              {result.totalMatching} {result.totalMatching === 1 ? 'entry' : 'entries'}
+            </div>
+            {result.entries.map((entry, i) => (
+              <div
+                key={`${entry.recordedAt}-${i}-${entry.text}`}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  padding: '4px 8px',
+                  cursor: 'pointer',
+                  borderRadius: 3,
+                  background: 'transparent',
+                }}
+                onClick={() => {
+                  api.invoke('clipboard:writeText', entry.text);
+                }}
+                title={`${entry.projectName} - ${TerminalKindLabel[entry.kind]}`}
+              >
+                <span style={{ fontSize: 10, color: '#666', flexShrink: 0, width: 20 }}>
+                  {entry.kind === 'foreground' ? 'FG' : 'BG'}
+                </span>
+                <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {entry.text}
+                </span>
+                <span style={{ fontSize: 10, color: '#666', flexShrink: 0 }}>
+                  {formatHistoryRelativeTime(entry.recordedAt)}
+                </span>
+              </div>
+            ))}
+          </>
+        )}
       </div>
     </div>
   );

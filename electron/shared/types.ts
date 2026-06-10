@@ -1,3 +1,5 @@
+import type { GitDiffSummary } from './gitDiffSummary';
+
 export enum ShellKind {
   PowerShell = 'powershell',
   Cmd = 'cmd',
@@ -802,12 +804,36 @@ export interface OsNotificationPayload {
   body: string;
 }
 
+export interface AppDiagnostics {
+  appVersion: string;
+  platform: string;
+  arch: string;
+  electronVersion: string;
+  chromeVersion: string;
+  nodeVersion: string;
+  execPath: string;
+  cwd: string;
+  configPath: string;
+  legacyConfigPath: string;
+  historyPath: string;
+  hookInboxDir: string;
+  hookServicePort: number;
+  codexInboxDir: string;
+  codexHooksPath: string;
+  codexHooksInstalled: boolean;
+  codexBridgePath: string;
+  codexBridgeInstalled: boolean;
+  browserMcpCommand: string[];
+  browserMcpSessionCount: number;
+}
+
 export interface IpcChannels {
   // Config
   'config:load': () => Promise<AppConfig>;
   'config:save': (config: AppConfig) => Promise<void>;
   'history:load': () => Promise<AppHistory>;
   'history:save': (history: AppHistory) => Promise<void>;
+  'diagnostics:get': () => Promise<AppDiagnostics>;
 
   // PTY
   'pty:create': (opts: { shell: ShellKind; cwd: string; cols: number; rows: number; env?: Record<string, string>; terminalId?: number; projectId: number; kind: TerminalKind }) => Promise<number>;
@@ -824,6 +850,14 @@ export interface IpcChannels {
   'fs:writeFile': (path: string, text: string) => Promise<void>;
   'fs:exists': (path: string) => Promise<boolean>;
   'fs:stat': (path: string) => Promise<{ isDirectory: boolean; isFile: boolean; size: number; mtimeMs: number }>;
+
+  // Git / Worktree
+  'git:diffSummary': (repoPath: string) => Promise<GitDiffSummary>;
+  'git:status': (repoPath: string) => Promise<{ files: SourceControlFile[]; branch: string }>;
+  'git:discoverWorktrees': (repoPath: string) => Promise<GitWorktreeInfo[]>;
+  'git:createWorktree': (repoPath: string, branch: string, worktreePath: string, baseBranch?: string) => Promise<boolean>;
+  'git:removeWorktree': (repoPath: string, worktreePath: string) => Promise<boolean>;
+  'git:copyEnvFiles': (sourcePath: string, targetPath: string) => Promise<boolean>;
 
   // Hooks
   'hook:status': (event: AiHookEvent) => void;
@@ -916,7 +950,7 @@ export interface BrowserMcpAuthScope {
   sessionId: string;
 }
 
-export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'acp:spawn' | 'acp:send' | 'acp:cancel' | 'acp:setConfigOption' | 'acp:permissionResponse' | 'acp:questionResponse' | 'acp:getSession' | 'acp:kill' | 'acp:standby:warm' | 'acp:standby:get' | 'acp:standby:clear' | 'acp:standby:promote' | 'acp:standby:clearAll' | 'hook:answer' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'notify:show' | 'window:confirmClose'>;
+export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'diagnostics:get' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'git:diffSummary' | 'git:status' | 'git:discoverWorktrees' | 'git:createWorktree' | 'git:removeWorktree' | 'git:copyEnvFiles' | 'acp:spawn' | 'acp:send' | 'acp:cancel' | 'acp:setConfigOption' | 'acp:permissionResponse' | 'acp:questionResponse' | 'acp:getSession' | 'acp:kill' | 'acp:standby:warm' | 'acp:standby:get' | 'acp:standby:clear' | 'acp:standby:promote' | 'acp:standby:clearAll' | 'hook:answer' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'notify:show' | 'window:confirmClose'>;
 
 export type IpcSendChannel = keyof Pick<IpcChannels, 'pty:data' | 'pty:exit' | 'hook:status' | 'acp:event' | 'browser:urlChanged' | 'browser:designElementClicked' | 'window:closeRequest' | 'window:focused'>;
 

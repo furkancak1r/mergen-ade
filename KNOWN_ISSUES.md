@@ -3549,6 +3549,117 @@
 
 ---
 
+#### Electron port Settings Diagnostics bolumu eksikti {#electron-settings-diagnostics-missing}
+- Date: 2026-06-10
+- Context: Electron port is being brought closer to the original Rust Mergen ADE feature set and visual structure.
+- Error signature:
+  1. Original Settings had a `Diagnostics` section with runtime overview and technical detail rows.
+  2. Electron Settings stopped at General/Launchers/OpenCode/Saved Messages/Shortcuts/Notifications.
+- Symptoms/Impact:
+  - Electron users could not inspect hook bridge, Codex, config path, Browser MCP, and active terminal state from Settings.
+  - Troubleshooting AI CLI integration required source inspection or logs instead of the app UI.
+- Root cause:
+  - The Electron Settings port had not implemented the original Diagnostics navigation section or a diagnostics IPC payload.
+- Resolution:
+  - Added a read-only `diagnostics:get` IPC and `Settings > Diagnostics` UI with runtime overview, session state, and expandable technical details.
+  - Added regression coverage for the diagnostics runtime overview decision logic.
+- Prevent recurrence:
+  - Keep Settings section parity checked whenever original `SettingsSection::ALL` changes.
+- Files/Commands touched: `electron/shared/types.ts`, `electron/main/diagnostics.ts`, `electron/main/ipcHandlers.ts`, `electron/renderer/src/App.tsx`, `electron/renderer/src/components/SettingsPopup.tsx`, `electron/renderer/src/lib/diagnostics.ts`
+- References: Electron parity goal, 2026-06-10
+
+---
+
+#### Electron Terminal Manager git diff satir ozeti eksikti {#electron-terminal-manager-diff-summary}
+- Date: 2026-06-10
+- Context: Original Rust Terminal Manager shows source-control line totals next to project/worktree headers.
+- Error signature:
+  1. Rust `TerminalManagerDiffSummaryModel` renders `+N -M`, `...`, `--`, or blank clean state from git numstat totals.
+  2. Electron Terminal Manager project headers showed only the project name, worktree marker, and terminal count.
+- Symptoms/Impact:
+  - Users could not scan changed-line volume from Terminal Manager without switching to Source Control.
+  - Electron visual hierarchy drifted from the original Terminal Manager header composition.
+- Root cause:
+  - The Electron port lacked a read-only `git diff --numstat` summary IPC and header badge renderer.
+- Resolution:
+  - Added `git:diffSummary` IPC, shared numstat parser/label helper, and Terminal Manager project/worktree header badges.
+  - Added regression coverage for binary numstat rows, malformed rows, and loading/error/clean/changed labels.
+- Prevent recurrence:
+  - Keep Terminal Manager header parity checked when original source-control summary behavior changes.
+- Files/Commands touched: `electron/shared/gitDiffSummary.ts`, `electron/shared/types.ts`, `electron/main/worktree.ts`, `electron/main/ipcHandlers.ts`, `electron/renderer/src/components/TerminalManager.tsx`
+- References: Electron parity goal, 2026-06-10
+
+---
+
+#### Electron Input History filtresi config'e bagli degildi {#electron-input-history-filter-parity}
+- Date: 2026-06-10
+- Context: Original Rust Input History has a project selector, persisted All/Foreground/Background filter tabs, and a search field.
+- Error signature:
+  1. Electron Input History kept its filter in local component state instead of `config.ui.inputHistoryFilter`.
+  2. The visible `All` button set the filter back to Foreground, so All could not actually be selected.
+  3. Electron lacked the original project selector and search input in the Input History panel.
+- Symptoms/Impact:
+  - Input History opened with a different default than the original app.
+  - Users could not persist the filter choice or reliably view all foreground/background history together.
+  - Finding a prior command required manual scanning.
+- Root cause:
+  - The Electron component used a separate local `TerminalInputHistoryFilter` path instead of the persisted `InputHistoryFilter` config field.
+- Resolution:
+  - Reworked Electron Input History to use `config.ui.inputHistoryFilter`, added project selection and search, and fixed All/FG/BG filtering.
+  - Added helper tests for selected-project filtering, All behavior, foreground limiting, and search matching.
+- Prevent recurrence:
+  - Keep Input History UI state tied to persisted UI config when porting original panel behavior.
+- Files/Commands touched: `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/inputHistory.ts`
+- References: Electron parity goal, 2026-06-10
+
+---
+
+#### Electron Terminal Manager filtre durumu config'e yazilmiyordu {#electron-terminal-manager-filter-config}
+- Date: 2026-06-10
+- Context: Original Rust Terminal Manager stores the Foreground/Background filter and hide-inactive-projects toggle in UI config.
+- Error signature:
+  1. Electron Terminal Manager initialized its filter from `config.ui.terminalManagerFilter` but then kept changes only in local React state.
+  2. `terminalManagerHideInactiveProjects` existed in config and filtering logic, but there was no visible toggle in the Terminal Manager UI.
+- Symptoms/Impact:
+  - Terminal Manager filter changes were lost across rerenders/restarts instead of following the persisted UI config path.
+  - Users could not toggle inactive project hiding from the Terminal Manager panel as in the original app.
+- Root cause:
+  - The Electron component owned filter state locally and did not expose config update callbacks for filter/hide state.
+- Resolution:
+  - Bound Terminal Manager filter directly to `config.ui.terminalManagerFilter` and added App-level update callbacks.
+  - Added a compact hide-inactive toggle to the filter row and config helper tests for both state updates.
+  - Matched original reset behavior: opening Terminal Manager from the rail selects Foreground, and startup clears inactive-project hiding while normalizing Terminal Manager's saved active filter.
+- Prevent recurrence:
+  - Avoid duplicating persisted UI state as local component state unless there is a deliberate draft/edit lifecycle.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/terminalManagerState.ts`
+- References: Electron parity goal, 2026-06-10
+
+---
+
+#### Electron Input History kalici gecmisi kullanmiyordu {#electron-input-history-persistent-history}
+- Date: 2026-06-10
+- Context: Original Rust app records foreground terminal input into project-scoped persistent `AppHistory` and the Input History panel reads from that store.
+- Error signature:
+  1. Electron exposed `history:load` / `history:save` IPC but the renderer never loaded or saved `AppHistory`.
+  2. Input History rendered only live terminal `recentInputs`, so entries disappeared when terminals were gone or the app restarted.
+  3. Row click behavior resent the command to a terminal, while the original row click copies the command to the clipboard.
+- Symptoms/Impact:
+  - Input History was runtime-only instead of project history.
+  - The panel could not inspect older commands after terminal cleanup or restart.
+  - Clicking a history row could unexpectedly execute a command instead of copying it.
+- Root cause:
+  - The Electron port reused terminal runtime recent-input state and left the persistent history API unintegrated.
+- Resolution:
+  - Added renderer `AppHistory` load/save, foreground-only recording from terminal recent input changes, and project-scoped display from persistent history.
+  - Changed Input History row click to copy text to clipboard and added relative timestamp display.
+  - Added tests for persistent recording, background/slash/empty skips, zero-limit migration, project/filter/search display, and relative time labels.
+- Prevent recurrence:
+  - Treat terminal `recentInputs` as runtime convenience only; project history panels should read `AppHistory`.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/lib/inputHistory.ts`
+- References: Electron parity goal, 2026-06-10
+
+---
+
 #### Electron Claude launcher bypass permission modu eksikti {#electron-claude-launcher-bypass-permissions}
 - Date: 2026-06-10
 - Context: During original-vs-Electron parity work, the Rust app had Claude launcher handling that preserved configured aliases while forcing bypass permission mode, but the Electron port sent the raw launcher command.
