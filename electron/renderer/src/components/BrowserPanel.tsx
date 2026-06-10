@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useCallback } from 'react';
 import { BrowserScopeKeyType } from '../../../shared/types';
 import type { BrowserScopeKey, ProjectRecord, BrowserTab } from '../../../shared/types';
 import { normalizeBrowserUrl } from '../lib/urlNormalize';
-import { browserToolbarCanClearUrl, clearBrowserActiveTabUrl } from '../lib/browserToolbar';
+import { browserAddTabTooltip, browserCanAddTab, browserScreenshotButtonMeta, browserTabTitle, browserToolbarButtonMeta, browserToolbarCanClearUrl, clearBrowserActiveTabUrl } from '../lib/browserToolbar';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -104,6 +104,7 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const hasAutoCreatedRef = useRef(false);
+  const [screenshotPendingCount, setScreenshotPendingCount] = React.useState(0);
 
   const terminalScope = activeTerminalId ? { type: BrowserScopeKeyType.Terminal, projectId: project.id, terminalId: activeTerminalId } : null;
   const terminalScopeHasTabs = terminalScope && (tabsByScope.get(scopeKeyString(terminalScope)) ?? []).length > 0;
@@ -117,6 +118,14 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
   const designInspect = designInspectByScope.get(scopeKey) ?? false;
   const activeTab = tabs.find((tab) => tab.id === activeTabId);
   const canClearUrl = browserToolbarCanClearUrl(urlDraft, activeTab);
+  const screenshotPending = screenshotPendingCount > 0;
+  const fullPageScreenshot = browserScreenshotButtonMeta('fullPage', screenshotPending);
+  const visibleAreaScreenshot = browserScreenshotButtonMeta('visibleArea', screenshotPending);
+  const canAddTab = browserCanAddTab(tabs.length);
+  const addTabTooltip = browserAddTabTooltip(tabs.length);
+  const refreshButton = browserToolbarButtonMeta('refresh');
+  const clearButton = browserToolbarButtonMeta('clearUrl');
+  const inspectButton = browserToolbarButtonMeta('designInspect', designInspect);
 
   const setTabs = useCallback((next: BrowserTab[] | ((prev: BrowserTab[]) => BrowserTab[])) => {
     onTabsChange((prev) => {
@@ -234,11 +243,12 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
   }, [project.browserLastUrl, tabs.length, scope, setTabs, setActiveTabId, setUrlDraft, hidden]);
 
   const addTab = useCallback(async () => {
+    if (!browserCanAddTab(tabs.length)) return;
     const tabId = await api.invoke('browser:addTab', scope) as string;
     setTabs((prev) => [...prev, { id: tabId, url: '' }]);
     setActiveTabId(tabId);
     setUrlDraft('');
-  }, [scope, setTabs, setActiveTabId, setUrlDraft]);
+  }, [scope, tabs.length, setTabs, setActiveTabId, setUrlDraft]);
 
   const closeTab = useCallback((tabId: string) => {
     api.invoke('browser:closeTab', { scope, tabId });
@@ -291,83 +301,101 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
   }, [designInspect, scope, setDesignInspect]);
 
   const takeScreenshot = useCallback(async (fullPage: boolean) => {
-    const dataUrl = await api.invoke('browser:screenshot', { scope, fullPage }) as string;
-    if (dataUrl) {
-      // Open screenshot in a new window or save
-      const link = document.createElement('a');
-      link.href = dataUrl;
-      link.download = `screenshot-${Date.now()}.png`;
-      link.click();
+    setScreenshotPendingCount((count) => count + 1);
+    try {
+      const dataUrl = await api.invoke('browser:screenshot', { scope, fullPage }) as string;
+      if (dataUrl) {
+        const link = document.createElement('a');
+        link.href = dataUrl;
+        link.download = `screenshot-${Date.now()}.png`;
+        link.click();
+      }
+    } finally {
+      setScreenshotPendingCount((count) => Math.max(0, count - 1));
     }
   }, [scope]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#0c0c0c' }}>
-      <div style={{ display: 'flex', gap: 4, padding: '4px 8px', borderBottom: '1px solid #222', overflowX: 'auto', alignItems: 'center' }}>
-        {tabs.map((tab) => (
-          <div
-            key={tab.id}
-            onClick={() => switchTab(tab.id)}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 4,
-              padding: '2px 8px',
-              borderRadius: 4,
-              background: activeTabId === tab.id ? '#1a1a1a' : 'transparent',
-              border: '1px solid #333',
-              cursor: 'pointer',
-              fontSize: 11,
-              color: '#ccc',
-              whiteSpace: 'nowrap',
-              height: 22,
-            }}
+      <div className="browser-tab-strip">
+        {tabs.map((tab) => {
+          const title = browserTabTitle(tab);
+          return (
+            <TooltipAbove key={tab.id} text={title}>
+              <div
+                onClick={() => switchTab(tab.id)}
+                className={`browser-tab ${activeTabId === tab.id ? 'active' : ''}`}
+                role="button"
+                tabIndex={0}
+                aria-label={`Select browser tab: ${title}`}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    switchTab(tab.id);
+                  }
+                }}
+              >
+                <span className="browser-tab-title">{title}</span>
+                <button
+                  onClick={(e) => { e.stopPropagation(); closeTab(tab.id); }}
+                  className="browser-tab-close"
+                  type="button"
+                  aria-label={`Close browser tab: ${title}`}
+                >
+                  ✕
+                </button>
+              </div>
+            </TooltipAbove>
+          );
+        })}
+        <TooltipAbove text={addTabTooltip}>
+          <button
+            onClick={addTab}
+            className="browser-add-tab-btn"
+            type="button"
+            disabled={!canAddTab}
+            aria-label={addTabTooltip}
           >
-            <span>{tab.title || tab.url || 'New Tab'}</span>
-            <button
-              onClick={(e) => { e.stopPropagation(); closeTab(tab.id); }}
-              style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10, width: 16, height: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-            >
-              ✕
-            </button>
-          </div>
-        ))}
-        <button
-          onClick={addTab}
-          style={{ background: 'transparent', border: '1px solid #333', color: '#ccc', cursor: 'pointer', fontSize: 14, width: 22, height: 22, borderRadius: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
-        >
-          +
-        </button>
+            +
+          </button>
+        </TooltipAbove>
       </div>
 
       <div style={{ display: 'flex', gap: 4, padding: '4px 8px', borderBottom: '1px solid #222', alignItems: 'center' }}>
-        <TooltipAbove text="Refresh">
-          <button onClick={refresh} className="browser-toolbar-btn" type="button">↻</button>
+        <TooltipAbove text={refreshButton.tooltip}>
+          <button onClick={refresh} className="browser-toolbar-btn" type="button" aria-label={refreshButton.ariaLabel}>
+            {refreshButton.icon}
+          </button>
         </TooltipAbove>
         <input
           value={urlDraft}
           onChange={(e) => setUrlDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') go(); }}
+          onDoubleClick={(e) => e.currentTarget.select()}
           placeholder="Enter URL..."
           style={{ flex: 1, background: '#1a1a1a', border: '1px solid #333', borderRadius: 4, padding: '4px 8px', color: '#ccc', fontSize: 12, outline: 'none', minWidth: 100 }}
         />
-        <TooltipAbove text="Navigate to URL">
-          <button onClick={go} className="browser-toolbar-btn text" type="button">Go</button>
-        </TooltipAbove>
-        <TooltipAbove text="Clear URL">
-          <button onClick={clearUrl} className="browser-toolbar-btn" type="button" disabled={!canClearUrl}>×</button>
-        </TooltipAbove>
-        <TooltipAbove text={designInspect ? 'Disable Design Inspect' : 'Enable Design Inspect'}>
-          <button onClick={toggleDesignInspect} className={`browser-toolbar-btn text ${designInspect ? 'active' : ''}`} type="button">
-            Inspect
+        <TooltipAbove text={clearButton.tooltip}>
+          <button onClick={clearUrl} className="browser-toolbar-btn" type="button" disabled={!canClearUrl} aria-label={clearButton.ariaLabel}>
+            {clearButton.icon}
           </button>
         </TooltipAbove>
-        <div style={{ display: 'flex', border: '1px solid #333', borderRadius: 3, overflow: 'hidden' }}>
-          <TooltipAbove text="Full page screenshot">
-            <button onClick={() => takeScreenshot(true)} style={{ background: 'transparent', border: 'none', borderRight: '1px solid #333', color: '#ccc', cursor: 'pointer', fontSize: 10, padding: '2px 6px' }}>Full</button>
+        <TooltipAbove text={inspectButton.tooltip}>
+          <button onClick={toggleDesignInspect} className={`browser-toolbar-btn ${inspectButton.selected ? 'active' : ''}`} type="button" aria-label={inspectButton.ariaLabel}>
+            {inspectButton.icon}
+          </button>
+        </TooltipAbove>
+        <div className="browser-screenshot-group" role="group" aria-label="Browser screenshot controls">
+          <TooltipAbove text={fullPageScreenshot.tooltip}>
+            <button onClick={() => takeScreenshot(fullPageScreenshot.fullPage)} className="browser-screenshot-btn" type="button" aria-label={fullPageScreenshot.ariaLabel}>
+              {fullPageScreenshot.icon}
+            </button>
           </TooltipAbove>
-          <TooltipAbove text="Visible area screenshot">
-            <button onClick={() => takeScreenshot(false)} style={{ background: 'transparent', border: 'none', color: '#ccc', cursor: 'pointer', fontSize: 10, padding: '2px 6px' }}>Visible</button>
+          <span className="browser-screenshot-divider" aria-hidden="true" />
+          <TooltipAbove text={visibleAreaScreenshot.tooltip}>
+            <button onClick={() => takeScreenshot(visibleAreaScreenshot.fullPage)} className="browser-screenshot-btn" type="button" aria-label={visibleAreaScreenshot.ariaLabel}>
+              {visibleAreaScreenshot.icon}
+            </button>
           </TooltipAbove>
         </div>
         {onClose && (

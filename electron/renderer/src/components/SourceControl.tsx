@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import type { ProjectRecord, GitWorktreeInfo, SourceControlSnapshot, SourceControlStatus } from '../../../shared/types';
-import { sourceControlBranchLine, sourceControlFileAbsolutePath, sourceControlSnapshotHasDisplayData, sourceControlStatusLabel, sourceControlWorktreeLabel } from '../../../shared/sourceControl';
+import { sourceControlFileAbsolutePath, sourceControlFileMenuActionMeta, sourceControlMenuLabel, sourceControlNoMatchesMessage, sourceControlSnapshotHasDisplayData, sourceControlStatusLabel, sourceControlToolbarButtonMeta, sourceControlWorktreeLabel, sourceControlWorktreeRowModel } from '../../../shared/sourceControl';
 import { repairMojibakeDisplay } from '../lib/mojibake';
 import { defaultWorktreePathForBranch } from '../lib/worktree';
 
@@ -140,7 +140,6 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
     const q = query.toLowerCase();
     return sourceControlWorktreeLabel(w).toLowerCase().includes(q) || w.path.toLowerCase().includes(q);
   });
-  const branchLine = sourceControlBranchLine(snapshot);
   const hasDisplayData = sourceControlSnapshotHasDisplayData(snapshot);
   const createWorktreePath = createBranch.trim()
     ? defaultWorktreePathForBranch(project.path, createBranch.trim())
@@ -152,6 +151,12 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
     setCreateError(null);
     setShowCreateModal(true);
   }, [snapshot.branch]);
+  const refreshButton = sourceControlToolbarButtonMeta('refreshStatus');
+  const fetchButton = sourceControlToolbarButtonMeta('fetchAndRefresh');
+  const folderButton = sourceControlToolbarButtonMeta('openProjectFolder');
+  const createButton = sourceControlToolbarButtonMeta('createWorktree');
+  const openFileFolderAction = sourceControlFileMenuActionMeta('openInFolder');
+  const copyRelativePathAction = sourceControlFileMenuActionMeta('copyRelativePath');
 
   useEffect(() => {
     if (autoOpenCreateRequestId === undefined) return;
@@ -163,100 +168,68 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', position: 'relative' }}>
-      <div style={{ padding: '8px 12px', borderBottom: '1px solid #222', display: 'flex', alignItems: 'center', gap: 8 }}>
-        {projects && projects.length > 0 && onSelectProject ? (
-          <select
-            className="source-control-project-select"
-            value={selectedProjectId ?? project.id}
-            title={project.path}
-            onChange={(event) => onSelectProject(Number(event.target.value))}
+      <div className="source-control-header">
+        <div className="source-control-header-label">Project</div>
+        <div className="source-control-header-row">
+          {projects && projects.length > 0 && onSelectProject ? (
+            <select
+              className="source-control-project-select"
+              value={selectedProjectId ?? project.id}
+              title={project.path}
+              onChange={(event) => onSelectProject(Number(event.target.value))}
+            >
+              {projects.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {repairMojibakeDisplay(item.name)}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <span className="source-control-project-name" title={project.path}>
+              {repairMojibakeDisplay(project.name)}
+            </span>
+          )}
+          <button
+            onClick={() => refresh(true)}
+            className="source-control-toolbar-btn"
+            type="button"
+            title={refreshButton.tooltip}
+            aria-label={refreshButton.ariaLabel}
           >
-            {projects.map((item) => (
-              <option key={item.id} value={item.id}>
-                {repairMojibakeDisplay(item.name)}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <span style={{ fontSize: 12, fontWeight: 600, color: '#eee', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {repairMojibakeDisplay(project.name)}
-          </span>
-        )}
-        <span style={{ fontSize: 11, color: '#888' }}>
-          {snapshot.files.length > 0 ? `${snapshot.files.length} changes` : 'Clean'}
-        </span>
-        {branchLine && (
-          <span style={{ fontSize: 11, color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {repairMojibakeDisplay(branchLine)}
-          </span>
-        )}
-        <button
-          onClick={() => refresh(true)}
-          style={{
-            marginLeft: 'auto',
-            padding: '2px 8px',
-            fontSize: 11,
-            background: '#1a1a1a',
-            border: '1px solid #333',
-            color: '#ccc',
-            borderRadius: 3,
-            cursor: 'pointer',
-            marginRight: 4,
-          }}
-          title="Refresh Status"
-        >
-          ↻
-        </button>
-        <button
-          onClick={() => refresh(true, true)}
-          style={{
-            padding: '2px 8px',
-            fontSize: 11,
-            background: '#1a1a1a',
-            border: '1px solid #333',
-            color: '#ccc',
-            borderRadius: 3,
-            cursor: 'pointer',
-            marginRight: 4,
-          }}
-          title="Fetch and Refresh"
-        >
-          ↓
-        </button>
-        <button
-          onClick={() => {
-            api.invoke('shell:showItemInFolder', project.path)
-              .then(() => showFeedback('Opened project folder'))
-              .catch((error) => showFeedback(`Open folder failed: ${error instanceof Error ? error.message : String(error)}`));
-          }}
-          style={{
-            padding: '2px 8px',
-            fontSize: 11,
-            background: '#1a1a1a',
-            border: '1px solid #333',
-            color: '#ccc',
-            borderRadius: 3,
-            cursor: 'pointer',
-            marginRight: 4,
-          }}
-          title="Open Project Folder"
-        >
-          📁
-        </button>
-        <button
-          onClick={openCreateWorktreeModal}
-          style={{
-            padding: '2px 8px',
-            fontSize: 11,
-            background: '#1a1a1a',
-            border: '1px solid #333',
-            color: '#ccc',
-            borderRadius: 3,
-            cursor: 'pointer',
-          }}
-        >
-          + Worktree
-        </button>
+            {refreshButton.icon}
+          </button>
+          <button
+            onClick={() => refresh(true, true)}
+            className="source-control-toolbar-btn"
+            type="button"
+            title={fetchButton.tooltip}
+            aria-label={fetchButton.ariaLabel}
+          >
+            {fetchButton.icon}
+          </button>
+          <button
+            onClick={() => {
+              api.invoke('shell:showItemInFolder', project.path)
+                .then(() => showFeedback('Opened project folder'))
+                .catch((error) => showFeedback(`Open folder failed: ${error instanceof Error ? error.message : String(error)}`));
+            }}
+            className="source-control-toolbar-btn"
+            type="button"
+            title={folderButton.tooltip}
+            aria-label={folderButton.ariaLabel}
+          >
+            {folderButton.icon}
+          </button>
+          <button
+            onClick={openCreateWorktreeModal}
+            className={`source-control-toolbar-btn ${createButton.accent ? 'accent' : ''}`}
+            type="button"
+            title={createButton.tooltip}
+            aria-label={createButton.ariaLabel}
+          >
+            {createButton.icon}
+          </button>
+        </div>
       </div>
       <div style={{ padding: '6px 12px', borderBottom: '1px solid #222' }}>
         <input
@@ -284,58 +257,28 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
           <div style={{ marginBottom: 8 }}>
             <div style={{ padding: '4px 12px', fontSize: 11, color: '#888', fontWeight: 600 }}>Worktrees</div>
             {filteredWorktrees.map((w) => {
-              const worktreeLabel = sourceControlWorktreeLabel(w);
+              const worktreeRow = sourceControlWorktreeRowModel(w, project.path, registeredWorktreePaths ?? []);
               return (
               <div
                 key={w.path}
-                style={{ padding: '3px 12px', display: 'flex', alignItems: 'center', gap: 6, cursor: 'context-menu' }}
+                className={`source-control-worktree-row ${worktreeRow.isCurrent ? 'current' : ''} ${worktreeRow.canAdd ? 'clickable' : ''}`}
+                title={worktreeRow.tooltip}
+                onClick={() => {
+                  if (!worktreeRow.canAdd) return;
+                  onAddWorktree?.(w);
+                  showFeedback(`Added worktree '${worktreeRow.label}' as project`);
+                }}
                 onContextMenu={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
                   setFileContextMenu(null);
-                  setWorktreeContextMenu({ x: event.clientX, y: event.clientY, branchName: worktreeLabel });
+                  setWorktreeContextMenu({ x: event.clientX, y: event.clientY, branchName: worktreeRow.branchNameForCopy });
                 }}
               >
-                <span style={{ fontSize: 10 }}>🌿</span>
-                <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {repairMojibakeDisplay(worktreeLabel)}
+                <span className="source-control-worktree-icon">⑂</span>
+                <span className="source-control-worktree-label">
+                  {repairMojibakeDisplay(worktreeRow.label)}
                 </span>
-                <span style={{ fontSize: 10, color: '#666' }}>{repairMojibakeDisplay(w.path)}</span>
-                {registeredWorktreePaths?.includes(w.path) ? (
-                  <button
-                    onClick={() => onRemoveWorktree?.(w)}
-                    style={{ fontSize: 10, padding: '2px 6px', background: '#1a1a1a', border: '1px solid #333', color: '#ccc', borderRadius: 3, cursor: 'pointer' }}
-                  >
-                    Remove from Mergen
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => onAddWorktree?.(w)}
-                    style={{ fontSize: 10, padding: '2px 6px', background: '#1a1a1a', border: '1px solid #333', color: '#ccc', borderRadius: 3, cursor: 'pointer' }}
-                  >
-                    Add to Mergen
-                  </button>
-                )}
-                <button
-                  onClick={async () => {
-                    if (hasLiveTerminals?.(w.path)) {
-                      alert('Cannot delete: worktree has live terminals.');
-                      return;
-                    }
-                    // Check worktree-specific uncommitted changes
-                    const worktreeStatus = await api.invoke('git:status', w.path) as SourceControlStatus;
-                    if (worktreeStatus.files.length > 0) {
-                      alert('Cannot delete: worktree has uncommitted changes.');
-                      return;
-                    }
-                    if (window.confirm(`Delete git worktree at ${w.path}? This will remove the worktree from disk.`)) {
-                      onDeleteGitWorktree?.(w);
-                    }
-                  }}
-                  style={{ fontSize: 10, padding: '2px 6px', background: '#1a1a1a', border: '1px solid #333', color: '#c44', borderRadius: 3, cursor: 'pointer' }}
-                >
-                  Delete Git Worktree
-                </button>
               </div>
               );
             })}
@@ -350,8 +293,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
         )}
 
         {filteredFiles.length > 0 && (
-          <div>
-            <div style={{ padding: '4px 12px', fontSize: 11, color: '#888', fontWeight: 600 }}>Changed Files</div>
+          <>
             {filteredFiles.map((f) => {
               const filePath = sourceControlFileAbsolutePath(project.path, f.path);
               return (
@@ -381,11 +323,11 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
               </div>
               );
             })}
-          </div>
+          </>
         )}
 
         {query && filteredFiles.length === 0 && filteredWorktrees.length === 0 && (
-          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>No matching files or worktrees.</div>
+          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>{sourceControlNoMatchesMessage()}</div>
         )}
       </div>
 
@@ -410,7 +352,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
               setFileContextMenu(null);
             }}
           >
-            Open in Folder
+            {sourceControlMenuLabel(openFileFolderAction)}
           </button>
           <button
             type="button"
@@ -420,7 +362,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
               setFileContextMenu(null);
             }}
           >
-            Copy Relative Path
+            {sourceControlMenuLabel(copyRelativePathAction)}
           </button>
         </div>
       )}

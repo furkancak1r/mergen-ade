@@ -313,25 +313,128 @@ body {
   border-color: #555;
 }
 
-.browser-toolbar-btn {
+.source-control-header {
+  border-bottom: 1px solid #222;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 8px 6px;
+}
+
+.source-control-header-label {
+  color: #888;
+  font-size: 11px;
+  line-height: 14px;
+}
+
+.source-control-header-row {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+
+.source-control-project-name {
+  color: #eee;
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-control-toolbar-btn {
   align-items: center;
   background: transparent;
-  border: 1px solid #333;
-  border-radius: 3px;
-  color: #ccc;
+  border: none;
+  border-radius: 6px;
+  color: #c8c8c8;
   cursor: pointer;
   display: inline-flex;
-  font-size: 12px;
+  flex-shrink: 0;
+  font-size: 14px;
   height: 24px;
   justify-content: center;
   line-height: 1;
-  min-width: 24px;
-  padding: 2px 6px;
+  padding: 0;
+  width: 26px;
 }
 
-.browser-toolbar-btn.text {
+.source-control-toolbar-btn:hover {
+  background: #2d2d2d;
+  color: #f4f4f4;
+}
+
+.source-control-toolbar-btn.accent {
+  color: #7fd6d0;
+}
+
+.source-control-toolbar-btn.accent:hover {
+  background: #173f3c;
+  color: #c6fffb;
+}
+
+.source-control-worktree-row {
+  align-items: center;
+  border-radius: 8px;
+  color: #f4f4f4;
+  display: flex;
+  gap: 6px;
+  margin: 1px 6px;
+  min-width: 0;
+  padding: 4px 8px;
+}
+
+.source-control-worktree-row.clickable {
+  cursor: pointer;
+}
+
+.source-control-worktree-row:not(.clickable) {
+  cursor: context-menu;
+}
+
+.source-control-worktree-row:hover {
+  background: #1a1a1a;
+}
+
+.source-control-worktree-row.current {
+  color: #7fd6d0;
+}
+
+.source-control-worktree-icon {
+  color: #888;
+  flex-shrink: 0;
   font-size: 10px;
-  min-width: 30px;
+  line-height: 1;
+  text-align: center;
+  width: 14px;
+}
+
+.source-control-worktree-label {
+  flex: 1;
+  font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-toolbar-btn {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  color: #ccc;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 15px;
+  height: 24px;
+  justify-content: center;
+  line-height: 1;
+  padding: 0;
+  width: 24px;
 }
 
 .browser-toolbar-btn:hover:not(:disabled),
@@ -344,6 +447,137 @@ body {
   color: #666;
   cursor: not-allowed;
   opacity: 0.7;
+}
+
+.browser-tab-strip {
+  align-items: center;
+  border-bottom: 1px solid #222;
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 4px 8px;
+}
+
+.browser-tab {
+  align-items: center;
+  background: transparent;
+  border: 1px solid rgb(200 200 200 / 24%);
+  border-radius: 4px;
+  color: #888;
+  cursor: pointer;
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 11px;
+  gap: 3px;
+  height: 22px;
+  min-width: 0;
+  padding: 0 3px 0 8px;
+  width: 126px;
+}
+
+.browser-tab:hover {
+  background: rgb(31 58 76 / 34%);
+}
+
+.browser-tab.active {
+  background: rgb(31 58 76 / 51%);
+  border-color: rgb(244 244 244 / 24%);
+  color: #f4f4f4;
+}
+
+.browser-tab-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-tab-close {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  color: #888;
+  cursor: pointer;
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 10px;
+  height: 16px;
+  justify-content: center;
+  line-height: 1;
+  padding: 0;
+  width: 16px;
+}
+
+.browser-tab-close:hover {
+  background: rgb(31 58 76 / 45%);
+  color: #f4f4f4;
+}
+
+.browser-add-tab-btn {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: #f4f4f4;
+  cursor: pointer;
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 14px;
+  height: 22px;
+  justify-content: center;
+  line-height: 1;
+  width: 28px;
+}
+
+.browser-add-tab-btn:hover:not(:disabled) {
+  background: rgb(31 58 76 / 34%);
+}
+
+.browser-add-tab-btn:disabled {
+  color: #888;
+  cursor: default;
+}
+
+.browser-screenshot-group {
+  align-items: center;
+  background: #0f0f0f;
+  border: 1px solid #333;
+  border-radius: 6px;
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: 3px;
+  height: 24px;
+  padding: 2px 4px;
+}
+
+.browser-screenshot-btn {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  color: #ccc;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 14px;
+  height: 18px;
+  justify-content: center;
+  line-height: 1;
+  padding: 0;
+  width: 20px;
+}
+
+.browser-screenshot-btn:hover {
+  background: #1f3a4c;
+  color: #f4f4f4;
+}
+
+.browser-screenshot-divider {
+  background: #333;
+  display: inline-block;
+  height: 14px;
+  width: 1px;
 }
 
 .terminal-manager {
@@ -395,6 +629,25 @@ body {
 
 .input-history-row:hover {
   background: rgba(45, 45, 45, 0.31);
+}
+
+.input-history-kind-icon {
+  flex-shrink: 0;
+  font-size: 12px;
+  line-height: 1;
+  text-align: center;
+  width: 22px;
+}
+
+.input-history-kind-icon.foreground {
+  color: #7fd6d0;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.input-history-kind-icon.background {
+  color: #8a8a8a;
 }
 
 .input-history-copy-toast {

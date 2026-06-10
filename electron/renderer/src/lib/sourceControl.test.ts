@@ -3,9 +3,14 @@ import {
   parseBranchHeader,
   parseSourceControlStatusLine,
   sourceControlFileAbsolutePath,
+  sourceControlFileMenuActionMeta,
   sourceControlBranchLine,
   sourceControlSnapshotHasDisplayData,
   sourceControlStatusLabel,
+  sourceControlNoMatchesMessage,
+  sourceControlMenuLabel,
+  sourceControlToolbarButtonMeta,
+  sourceControlWorktreeRowModel,
   sourceControlWorktreeLabel,
 } from '../../../shared/sourceControl';
 
@@ -89,5 +94,82 @@ describe('sourceControl helpers', () => {
       branch: '',
       detached: false,
     })).toBe('fallback');
+  });
+
+  it('uses Rust source control toolbar icon metadata', () => {
+    expect(sourceControlToolbarButtonMeta('refreshStatus')).toMatchObject({
+      icon: '↻',
+      tooltip: 'Refresh Status',
+      ariaLabel: 'Refresh Status',
+      accent: false,
+    });
+    expect(sourceControlToolbarButtonMeta('fetchAndRefresh')).toMatchObject({
+      icon: '↓',
+      tooltip: 'Fetch and Refresh',
+      ariaLabel: 'Fetch and Refresh',
+      accent: false,
+    });
+    expect(sourceControlToolbarButtonMeta('openProjectFolder')).toMatchObject({
+      icon: '📂',
+      tooltip: 'Open Project Folder',
+      ariaLabel: 'Open Project Folder',
+      accent: false,
+    });
+    expect(sourceControlToolbarButtonMeta('createWorktree')).toMatchObject({
+      icon: '+',
+      tooltip: 'Create Worktree',
+      ariaLabel: 'Create Worktree',
+      accent: true,
+    });
+  });
+
+  it('uses Rust source control no-match copy without a trailing period', () => {
+    expect(sourceControlNoMatchesMessage()).toBe('No matching files or worktrees');
+  });
+
+  it('builds Rust-style worktree row state for clickable unregistered rows', () => {
+    const model = sourceControlWorktreeRowModel({
+      path: 'C:\\repo\\worktrees\\feature',
+      branch: 'refs/heads/feature/foo',
+      head: 'abc',
+      detached: false,
+    }, 'C:\\repo', []);
+    expect(model).toEqual({
+      label: 'feature/foo',
+      tooltip: 'feature/foo\nC:\\repo\\worktrees\\feature',
+      branchNameForCopy: 'feature/foo',
+      isCurrent: false,
+      alreadyAdded: false,
+      canAdd: true,
+    });
+  });
+
+  it('marks registered or current worktree rows as non-clickable like Rust', () => {
+    expect(sourceControlWorktreeRowModel({
+      path: '/repo/wt',
+      branch: 'refs/heads/wt',
+      detached: false,
+    }, '/repo', ['/repo/wt'])).toMatchObject({
+      alreadyAdded: true,
+      canAdd: false,
+      isCurrent: false,
+    });
+    expect(sourceControlWorktreeRowModel({
+      path: '/repo',
+      branch: 'refs/heads/main',
+      detached: false,
+    }, '/repo', [])).toMatchObject({
+      tooltip: 'main ●\n/repo',
+      alreadyAdded: true,
+      canAdd: false,
+      isCurrent: true,
+    });
+  });
+
+  it('uses icon-prefixed file context menu labels like Rust', () => {
+    const open = sourceControlFileMenuActionMeta('openInFolder');
+    const copy = sourceControlFileMenuActionMeta('copyRelativePath');
+    expect(sourceControlMenuLabel(open)).toBe('📂 Open in Folder');
+    expect(sourceControlMenuLabel(copy)).toBe('⧉ Copy Relative Path');
   });
 });

@@ -1,6 +1,6 @@
 import { BrowserView, BrowserWindow } from 'electron';
 import type { BrowserScopeKey } from '../shared/types';
-import { BrowserScopeKeyType } from '../shared/types';
+import { BROWSER_MAX_TABS_PER_SCOPE, BrowserScopeKeyType } from '../shared/types';
 import path from 'path';
 import fs from 'fs';
 
@@ -312,6 +312,9 @@ export function browserDesignInspect(scope: BrowserScopeKey, enabled: boolean): 
 
 export function browserAddTab(scope: BrowserScopeKey, url?: string): string {
   const instance = getBrowserInstance(scope) ?? createBrowserView(scope);
+  if (instance.tabs.length >= BROWSER_MAX_TABS_PER_SCOPE) {
+    throw new Error(`Browser tab limit reached (${BROWSER_MAX_TABS_PER_SCOPE}). Close an existing tab before opening a new one.`);
+  }
   const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const normalized = url ? normalizeBrowserUrl(url) : '';
   instance.tabs.push({ id: tabId, url: normalized });

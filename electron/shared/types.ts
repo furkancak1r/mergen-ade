@@ -693,6 +693,8 @@ export interface BrowserTab {
   title?: string;
 }
 
+export const BROWSER_MAX_TABS_PER_SCOPE = 5;
+
 export enum BrowserScopeKeyType {
   Project = 'project',
   Terminal = 'terminal',

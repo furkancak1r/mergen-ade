@@ -4607,3 +4607,161 @@
   - Keep Browser empty-scope lifecycle covered in `browserToolbar.test.ts`.
 - Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `KNOWN_ISSUES.md`
 - References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser screenshot butonlari metin agirlikliydi {#electron-browser-screenshot-icon-parity}
+- Date: 2026-06-10
+- Context: Rust renders the Browser screenshot controls as two compact icon buttons in a single bordered frame (`Full page` scan icon and `Visible area` scan-line icon). Electron still used visible `Full` and `Visible` text buttons.
+- Error signature:
+  1. Browser toolbar screenshot controls consumed extra horizontal space.
+  2. The visible labels did not match the icon-first Rust toolbar style.
+  3. Screenshot pending state was not reflected in the tooltip text.
+- Symptoms/Impact:
+  - The Electron Browser panel looked less like the Rust reference and became tighter at narrow widths.
+- Root cause:
+  - The Electron port used temporary text buttons instead of a shared toolbar metadata helper and grouped icon styling.
+- Resolution:
+  - Added tested screenshot button metadata for icon, tooltip, aria label, and full-page mapping.
+  - Replaced `Full` / `Visible` text buttons with two compact icon buttons in a bordered split group.
+  - Tracked screenshot requests in flight so tooltips can show the same pending copy as Rust.
+- Prevent recurrence:
+  - Keep Browser screenshot control labels covered in `browserToolbar.test.ts` before changing Browser toolbar JSX.
+- Files/Commands touched: `electron/renderer/src/components/BrowserPanel.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control header'i Rust ikon barindan sapmisti {#electron-source-control-header-icon-parity}
+- Date: 2026-06-10
+- Context: Rust's Source Control panel renders a compact `Project` label, a project selector, and four icon-only actions: Refresh Status, Fetch and Refresh, Open Project Folder, and Create Worktree. Electron kept status/branch text in the header and used a wide `+ Worktree` text button.
+- Error signature:
+  1. Source Control header consumed horizontal space with `Clean`/change count and branch text.
+  2. Create Worktree rendered as `+ Worktree` instead of an icon-only action.
+  3. Header action styling used bordered text-button chrome rather than Rust's lightweight icon controls.
+  4. Empty search text had a trailing period (`No matching files or worktrees.`) unlike Rust.
+- Symptoms/Impact:
+  - The Source Control panel looked denser and less like the Rust reference, especially in narrow sidebars.
+- Root cause:
+  - The Electron port carried an early operational header layout instead of the Rust sidebar toolbar pattern.
+- Resolution:
+  - Added tested Source Control toolbar metadata for the four Rust actions.
+  - Rebuilt the header as `Project` label + selector/name + icon-only action buttons.
+  - Added lightweight CSS for Source Control toolbar buttons, including the teal Create Worktree accent.
+  - Aligned no-match copy with Rust by removing the trailing period.
+- Prevent recurrence:
+  - Keep Source Control toolbar metadata and empty-search copy covered in `sourceControl.test.ts` when changing the panel header.
+- Files/Commands touched: `electron/renderer/src/components/SourceControl.tsx`, `electron/shared/sourceControl.ts`, `electron/renderer/src/lib/sourceControl.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control dosya listesi fazladan baslik ve ikonsuz menu kullaniyordu {#electron-source-control-file-row-menu-parity}
+- Date: 2026-06-10
+- Context: Rust lists matching changed files directly after the Source Control status/empty-state area and uses icon-prefixed context menu entries (`Open in Folder`, `Copy Relative Path`). Electron inserted a `Changed Files` header and rendered plain text context menu actions.
+- Error signature:
+  1. Electron displayed a `Changed Files` section header that Rust does not render.
+  2. Source Control file context menu actions lacked the leading folder/copy icons used in Rust.
+- Symptoms/Impact:
+  - The Source Control panel had extra vertical chrome and context menus looked less consistent with the Rust sidebar menus.
+- Root cause:
+  - The Electron port grouped changed files under a React-specific section heading and did not model Rust menu label metadata.
+- Resolution:
+  - Added tested metadata for Source Control file context menu labels.
+  - Removed the extra `Changed Files` heading so file rows appear directly like Rust.
+  - Rendered icon-prefixed file context menu labels.
+- Prevent recurrence:
+  - Keep Source Control file menu labels covered in `sourceControl.test.ts` before changing file row context menus.
+- Files/Commands touched: `electron/renderer/src/components/SourceControl.tsx`, `electron/shared/sourceControl.ts`, `electron/renderer/src/lib/sourceControl.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Input History satirlari FG/BG metni kullaniyordu {#electron-input-history-row-icon-parity}
+- Date: 2026-06-10
+- Context: Rust's Input History rows use icon-first terminal kind indicators (`Terminal` for foreground, `List` for background) and an icon-prefixed `Copy` context menu action. Electron used literal `FG` / `BG` labels and a plain `Copy` menu item.
+- Error signature:
+  1. Foreground/background kind was shown as text abbreviations instead of icons.
+  2. The context menu copy action did not include the Rust-style copy icon.
+- Symptoms/Impact:
+  - Input History looked less consistent with the Rust sidebar icon language.
+- Root cause:
+  - The Electron port rendered terminal kind as explicit text labels rather than carrying over Rust's row icon model.
+- Resolution:
+  - Added tested Input History row visual metadata for foreground/background icons.
+  - Swapped `FG` / `BG` labels for compact icon indicators.
+  - Added icon-prefixed copy context menu text.
+- Prevent recurrence:
+  - Keep Input History row visual helpers covered in `inputHistory.test.ts` when changing row rendering.
+- Files/Commands touched: `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/lib/inputHistory.ts`, `electron/renderer/src/lib/inputHistory.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control worktree satirlari agir aksiyon butonlari gosteriyordu {#electron-source-control-worktree-row-parity}
+- Date: 2026-06-10
+- Context: Rust's Source Control worktree rows are lightweight sidebar rows: branch icon, label, path in tooltip, click-to-add only for worktrees not already registered, and a context menu for copying the branch name. Electron rendered inline `Add to Mergen`, `Remove from Mergen`, and `Delete Git Worktree` buttons inside every worktree row.
+- Error signature:
+  1. Worktree rows consumed much more horizontal space than Rust rows.
+  2. Registered and unregistered rows exposed different inline buttons instead of using Rust's simple click behavior.
+  3. Worktree paths were rendered inline instead of being kept in the row tooltip.
+- Symptoms/Impact:
+  - Source Control looked cluttered in the narrow sidebar and diverged from Rust's scan-friendly tree/list style.
+- Root cause:
+  - The Electron port exposed management actions directly in the row instead of modeling Rust's sidebar row behavior.
+- Resolution:
+  - Added tested worktree row model metadata for label, tooltip, current/registered state, branch copy name, and clickability.
+  - Replaced inline worktree action buttons with compact row rendering.
+  - Preserved unregistered worktree add behavior by making the row itself clickable.
+  - Kept branch-copy context menu behavior.
+- Prevent recurrence:
+  - Keep worktree row state covered in `sourceControl.test.ts` when changing Source Control worktree UI.
+- Files/Commands touched: `electron/renderer/src/components/SourceControl.tsx`, `electron/shared/sourceControl.ts`, `electron/renderer/src/lib/sourceControl.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser sekme limiti ve seridi Rust'tan sapmisti {#electron-browser-tab-strip-limit-parity}
+- Date: 2026-06-10
+- Context: Rust caps Browser tabs at 5 per scope and renders compact fixed-width tabs (`126x22`) with an icon-only `+` add button that becomes inactive at the limit. Electron allowed unlimited tabs and each tab widened to its full title.
+- Error signature:
+  1. `BrowserPanel.addTab()` always invoked `browser:addTab`.
+  2. `browserViewManager.browserAddTab()` had no max-tab guard.
+  3. Browser tab rows used inline flexible sizing instead of Rust's fixed compact tab metrics.
+- Symptoms/Impact:
+  - Users could create more Browser tabs than Rust supports.
+  - Long tab titles pushed the add button away and made the Browser toolbar visually unlike the Rust reference.
+- Root cause:
+  - The Electron port did not carry over `BROWSER_MAX_TABS_PER_PROJECT` semantics or tab strip geometry.
+- Resolution:
+  - Added a shared `BROWSER_MAX_TABS_PER_SCOPE = 5` constant and enforced it in the main Browser tab creation path.
+  - Added tested toolbar helpers for add-tab enabled state, tooltip text, and tab title fallback.
+  - Updated the Browser tab strip to fixed compact tab sizing with ellipsis labels and a disabled add button at the tab limit.
+- Prevent recurrence:
+  - Keep Browser add-tab limit and title fallback covered by `browserToolbar.test.ts` when changing Browser tab behavior.
+- Files/Commands touched: `electron/shared/types.ts`, `electron/main/browserViewManager.ts`, `electron/renderer/src/components/BrowserPanel.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser URL toolbar'i metinli aksiyonlar kullaniyordu {#electron-browser-url-toolbar-icon-parity}
+- Date: 2026-06-10
+- Context: Rust's Browser URL toolbar uses compact icon-only controls: Refresh, URL input with Enter submit and double-click select-all, Clear URL, Design Inspect, and screenshot buttons. Electron still had a visible `Go` text button plus text-heavy `Inspect` and a close-style `x` Clear URL button.
+- Error signature:
+  1. Browser URL toolbar rendered a separate `Go` button that Rust does not have.
+  2. Clear URL used an `x` glyph rather than a distinct clear/trash-style icon action.
+  3. Design Inspect used visible text instead of an icon-only toggle with ON/OFF tooltip copy.
+  4. URL double-click did not select the whole field like Rust.
+- Symptoms/Impact:
+  - The Electron toolbar consumed extra horizontal space and did not visually match Rust's browser chrome.
+- Root cause:
+  - The Electron port kept early temporary text buttons instead of carrying over Rust's icon-only Browser toolbar semantics.
+- Resolution:
+  - Added tested toolbar metadata for Refresh, Clear URL, and Design Inspect icon/tooltip/aria state.
+  - Removed the `Go` button; Enter remains the submit path, matching Rust.
+  - Converted Clear URL and Design Inspect to compact icon-only controls.
+  - Added URL input double-click select-all behavior.
+- Prevent recurrence:
+  - Keep Browser toolbar metadata covered in `browserToolbar.test.ts` before changing URL toolbar controls.
+- Files/Commands touched: `electron/renderer/src/components/BrowserPanel.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10

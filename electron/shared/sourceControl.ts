@@ -1,5 +1,31 @@
 import type { GitWorktreeInfo, SourceControlFile, SourceControlSnapshot } from './types';
 
+export type SourceControlToolbarAction = 'refreshStatus' | 'fetchAndRefresh' | 'openProjectFolder' | 'createWorktree';
+export type SourceControlFileMenuAction = 'openInFolder' | 'copyRelativePath';
+
+export interface SourceControlToolbarButtonMeta {
+  action: SourceControlToolbarAction;
+  icon: string;
+  tooltip: string;
+  ariaLabel: string;
+  accent: boolean;
+}
+
+export interface SourceControlWorktreeRowModel {
+  label: string;
+  tooltip: string;
+  branchNameForCopy: string;
+  isCurrent: boolean;
+  alreadyAdded: boolean;
+  canAdd: boolean;
+}
+
+export interface SourceControlFileMenuActionMeta {
+  action: SourceControlFileMenuAction;
+  icon: string;
+  label: string;
+}
+
 export interface BranchStatus {
   branch: string;
   ahead: number;
@@ -116,4 +142,85 @@ export function sourceControlWorktreeLabel(worktree: Pick<GitWorktreeInfo, 'path
     return `detached@${short}`;
   }
   return worktree.path.split(/[\\/]/).filter(Boolean).at(-1) || worktree.path;
+}
+
+export function sourceControlToolbarButtonMeta(action: SourceControlToolbarAction): SourceControlToolbarButtonMeta {
+  switch (action) {
+    case 'refreshStatus':
+      return {
+        action,
+        icon: '↻',
+        tooltip: 'Refresh Status',
+        ariaLabel: 'Refresh Status',
+        accent: false,
+      };
+    case 'fetchAndRefresh':
+      return {
+        action,
+        icon: '↓',
+        tooltip: 'Fetch and Refresh',
+        ariaLabel: 'Fetch and Refresh',
+        accent: false,
+      };
+    case 'openProjectFolder':
+      return {
+        action,
+        icon: '📂',
+        tooltip: 'Open Project Folder',
+        ariaLabel: 'Open Project Folder',
+        accent: false,
+      };
+    case 'createWorktree':
+      return {
+        action,
+        icon: '+',
+        tooltip: 'Create Worktree',
+        ariaLabel: 'Create Worktree',
+        accent: true,
+      };
+  }
+}
+
+export function sourceControlNoMatchesMessage(): string {
+  return 'No matching files or worktrees';
+}
+
+export function sourceControlWorktreeRowModel(
+  worktree: Pick<GitWorktreeInfo, 'path' | 'branch' | 'head' | 'detached'>,
+  currentProjectPath: string,
+  registeredWorktreePaths: readonly string[] = [],
+): SourceControlWorktreeRowModel {
+  const label = sourceControlWorktreeLabel(worktree);
+  const isCurrent = worktree.path === currentProjectPath;
+  const alreadyAdded = registeredWorktreePaths.includes(worktree.path) || isCurrent;
+  const currentMarker = isCurrent ? ' ●' : '';
+  return {
+    label,
+    tooltip: `${label}${currentMarker}\n${worktree.path}`,
+    branchNameForCopy: worktree.branch.replace(/^refs\/heads\//, '').trim() || label,
+    isCurrent,
+    alreadyAdded,
+    canAdd: !alreadyAdded,
+  };
+}
+
+export function sourceControlFileMenuActionMeta(action: SourceControlFileMenuAction): SourceControlFileMenuActionMeta {
+  switch (action) {
+    case 'openInFolder':
+      return {
+        action,
+        icon: '📂',
+        label: 'Open in Folder',
+      };
+    case 'copyRelativePath':
+      return {
+        action,
+        icon: '⧉',
+        label: 'Copy Relative Path',
+      };
+  }
+}
+
+export function sourceControlMenuLabel(meta: Pick<SourceControlFileMenuActionMeta, 'icon' | 'label'>): string {
+  return `${meta.icon} ${meta.label}`;
 }

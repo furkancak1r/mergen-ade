@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppConfig, AppHistory, InputHistoryFilter } from '../../../shared/types';
 import { InputHistoryFilter as InputHistoryFilterEnum, InputHistoryFilterLabel, TerminalKindLabel } from '../../../shared/types';
-import { collectInputHistoryEntries, formatHistoryRelativeTime, inputHistoryCountLabel, inputHistoryEmptyMessage } from '../lib/inputHistory';
+import { collectInputHistoryEntries, formatHistoryRelativeTime, inputHistoryCopyMenuLabel, inputHistoryCountLabel, inputHistoryEmptyMessage, inputHistoryKindVisual } from '../lib/inputHistory';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).mergenApi;
 
@@ -146,31 +146,34 @@ export const InputHistory: React.FC<InputHistoryProps> = ({
             <div style={{ padding: '0 8px 4px', color: '#888', fontSize: 11 }}>
               {inputHistoryCountLabel(result.totalMatching)}
             </div>
-            {result.entries.map((entry, i) => (
-              <div
-                key={`${entry.recordedAt}-${i}-${entry.text}`}
-                className="input-history-row"
-                onClick={() => {
-                  copyHistoryText(entry.text);
-                }}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  setContextMenu({ x: event.clientX, y: event.clientY, text: entry.text });
-                }}
-                title={`${entry.projectName} - ${TerminalKindLabel[entry.kind]}`}
-              >
-                <span style={{ fontSize: 11, color: entry.kind === 'foreground' ? '#aaaaaa' : '#8a8a8a', flexShrink: 0, width: 22 }}>
-                  {entry.kind === 'foreground' ? 'FG' : 'BG'}
-                </span>
-                <span style={{ fontSize: 13, color: '#f4f4f4', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {entry.text}
-                </span>
-                <span style={{ fontSize: 11, color: '#8a8a8a', flexShrink: 0 }}>
-                  {formatHistoryRelativeTime(entry.recordedAt)}
-                </span>
-              </div>
-            ))}
+            {result.entries.map((entry, i) => {
+              const kindVisual = inputHistoryKindVisual(entry.kind);
+              return (
+                <div
+                  key={`${entry.recordedAt}-${i}-${entry.text}`}
+                  className="input-history-row"
+                  onClick={() => {
+                    copyHistoryText(entry.text);
+                  }}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setContextMenu({ x: event.clientX, y: event.clientY, text: entry.text });
+                  }}
+                  title={`${entry.projectName} - ${TerminalKindLabel[entry.kind]}`}
+                >
+                  <span className={`input-history-kind-icon ${kindVisual.className}`} title={kindVisual.title} aria-hidden="true">
+                    {kindVisual.icon}
+                  </span>
+                  <span style={{ fontSize: 13, color: '#f4f4f4', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {entry.text}
+                  </span>
+                  <span style={{ fontSize: 11, color: '#8a8a8a', flexShrink: 0 }}>
+                    {formatHistoryRelativeTime(entry.recordedAt)}
+                  </span>
+                </div>
+              );
+            })}
           </>
         )}
       </div>
@@ -194,7 +197,7 @@ export const InputHistory: React.FC<InputHistoryProps> = ({
               setContextMenu(null);
             }}
           >
-            Copy
+            {inputHistoryCopyMenuLabel()}
           </button>
         </div>
       )}

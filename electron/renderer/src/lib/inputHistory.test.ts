@@ -4,9 +4,11 @@ import { defaultAppHistory, InputHistoryFilter, TerminalKind } from '../../../sh
 import {
   collectInputHistoryEntries,
   formatHistoryRelativeTime,
+  inputHistoryCopyMenuLabel,
   inputHistoryCountLabel,
   inputHistoryEmptyMessage,
   inputHistoryFilterMatchesKind,
+  inputHistoryKindVisual,
   removeProjectInputHistory,
   removeProjectsInputHistory,
   recordInputHistory,
@@ -62,6 +64,20 @@ describe('inputHistory', () => {
     expect(inputHistoryFilterMatchesKind(InputHistoryFilter.Foreground, TerminalKind.Foreground)).toBe(true);
     expect(inputHistoryFilterMatchesKind(InputHistoryFilter.Foreground, TerminalKind.Background)).toBe(false);
     expect(inputHistoryFilterMatchesKind(InputHistoryFilter.Background, TerminalKind.Background)).toBe(true);
+  });
+
+  it('uses icon-first row kind visuals and copy menu text like the Rust panel', () => {
+    expect(inputHistoryKindVisual(TerminalKind.Foreground)).toEqual({
+      icon: '>_',
+      title: 'Foreground',
+      className: 'foreground',
+    });
+    expect(inputHistoryKindVisual(TerminalKind.Background)).toEqual({
+      icon: '☰',
+      title: 'Background',
+      className: 'background',
+    });
+    expect(inputHistoryCopyMenuLabel()).toBe('⧉ Copy');
   });
 
   it('collects only selected project entries and includes both kinds for All', () => {

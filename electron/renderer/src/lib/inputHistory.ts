@@ -21,12 +21,29 @@ export interface InputHistoryResult {
   totalMatching: number;
 }
 
+export interface InputHistoryKindVisual {
+  icon: string;
+  title: string;
+  className: 'foreground' | 'background';
+}
+
 export function inputHistoryEmptyMessage(hasSearchQuery: boolean): string {
   return hasSearchQuery ? 'No matching entries' : 'No history entries for this project yet';
 }
 
 export function inputHistoryCountLabel(totalMatching: number): string {
   return `${totalMatching} entries`;
+}
+
+export function inputHistoryKindVisual(kind: TerminalKind): InputHistoryKindVisual {
+  if (kind === TerminalKindEnum.Foreground) {
+    return { icon: '>_', title: 'Foreground', className: 'foreground' };
+  }
+  return { icon: '☰', title: 'Background', className: 'background' };
+}
+
+export function inputHistoryCopyMenuLabel(): string {
+  return '⧉ Copy';
 }
 
 export function inputHistoryFilterMatchesKind(filter: InputHistoryFilter, kind: TerminalKind): boolean {
