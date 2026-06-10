@@ -493,6 +493,28 @@ function App() {
     setFileEditorOpen(false);
   }, []);
 
+  const handleAddProject = useCallback(async () => {
+    const result = await api.invoke('dialog:showOpen', { properties: ['openDirectory'] }) as string[] | undefined;
+    if (!result || result.length === 0) return;
+    const selectedPath = result[0];
+    const folderName = selectedPath.split(/[\\/]/).pop() || 'project';
+    const newProject: ProjectRecord = {
+      id: Date.now(),
+      name: folderName,
+      path: selectedPath,
+      savedMessages: [],
+      aiConfig: {},
+      checklist: [],
+      foregroundSavedMessages: [],
+      isWorktree: false,
+    };
+    setConfig((prev) => {
+      if (!prev) return prev;
+      return { ...prev, projects: [...prev.projects, newProject] };
+    });
+    setSelectedProjectId(newProject.id);
+  }, []);
+
   const openAcpChat = useCallback(async (projectId: number) => {
     if (!config) return;
     const project = config.projects.find((p) => p.id === projectId);
@@ -672,6 +694,25 @@ function App() {
             selectedPath={selectedProject.path}
             onOpenFile={openFile}
           />
+        )}
+        {activeTab === LeftSidebarTabEnum.Directory && !selectedProject && (
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', padding: 24, gap: 16 }}>
+            <span style={{ fontSize: 14, color: '#888' }}>No projects yet.</span>
+            <button
+              onClick={handleAddProject}
+              style={{
+                padding: '8px 16px',
+                background: '#0078d4',
+                border: 'none',
+                borderRadius: 4,
+                color: '#fff',
+                fontSize: 13,
+                cursor: 'pointer',
+              }}
+            >
+              Add Project
+            </button>
+          </div>
         )}
         {activeTab === LeftSidebarTabEnum.TerminalManager && config && (
           <TerminalManager

@@ -5,17 +5,28 @@ import electron from 'vite-plugin-electron';
 export default defineConfig({
   plugins: [
     react(),
-    electron({
-      entry: {
-        main: '../main/index.ts',
-        preload: '../preload/index.ts',
+    electron([
+      {
+        entry: '../main/index.ts',
+        onstart({ startup }) {
+          startup();
+        },
+        vite: {
+          build: {
+            rollupOptions: {
+              external: ['node-pty'],
+            },
+          },
+        },
       },
-    }),
+      {
+        entry: '../preload/index.ts',
+      },
+    ]),
   ],
+  root: 'renderer',
   build: {
     outDir: 'dist',
     emptyOutDir: true,
   },
-  root: 'renderer',
-  publicDir: 'renderer/public',
 });
