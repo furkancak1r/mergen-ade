@@ -201,11 +201,14 @@ export function registerIpcHandlers() {
     return removeWorktree(repoPath, worktreePath);
   });
   ipcMain.handle('git:copyEnvFiles', async (_event, sourcePath: string, targetPath: string) => {
+    if (!sourcePath || typeof sourcePath !== 'string' || !targetPath || typeof targetPath !== 'string') {
+      return false;
+    }
     try {
       const entries = await fs.promises.readdir(sourcePath);
       const envFiles = entries.filter((e) => e.startsWith('.env'));
       for (const file of envFiles) {
-        await fs.promises.copyFile(path.join(sourcePath, file), path.join(targetPath, file));
+        await fs.promises.copyFile(sourcePath + path.sep + file, targetPath + path.sep + file);
       }
       return true;
     } catch {

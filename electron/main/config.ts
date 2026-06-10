@@ -36,21 +36,30 @@ export function historyPath(): string {
 
 export function runtimeDir(sub: string): string {
   const { base } = getProjectDirs();
-  const dir = path.join(base, sub);
+  const safeSub = String(sub).replace(/[^a-zA-Z0-9_\-/\\]/g, '');
+  const dir = path.join(base, safeSub);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
 
 export function browserUserDataDir(projectId: number): string {
   const { dataDir } = getProjectDirs();
-  const dir = path.join(dataDir, 'webview2', 'projects', String(projectId));
+  const safeId = Math.abs(Math.floor(Number(projectId)));
+  if (!Number.isFinite(safeId)) {
+    throw new Error('Invalid projectId for browser user data dir');
+  }
+  const dir = [dataDir, 'webview2', 'projects', String(safeId)].join(path.sep);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
 
 export function browserRecordingsDir(projectId: number): string {
   const { dataDir } = getProjectDirs();
-  const dir = path.join(dataDir, 'browser-recordings', 'projects', String(projectId));
+  const safeId = Math.abs(Math.floor(Number(projectId)));
+  if (!Number.isFinite(safeId)) {
+    throw new Error('Invalid projectId for browser recordings dir');
+  }
+  const dir = [dataDir, 'browser-recordings', 'projects', String(safeId)].join(path.sep);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }

@@ -99,12 +99,15 @@ export function createWorktree(repoPath: string, branch: string, wtPath: string,
 }
 
 function copyEnvFiles(fromDir: string, toDir: string): void {
+  if (!fromDir || typeof fromDir !== 'string' || !toDir || typeof toDir !== 'string') {
+    return;
+  }
   try {
     const entries = fs.readdirSync(fromDir);
     for (const entry of entries) {
       if (entry.startsWith('.env')) {
-        const src = path.join(fromDir, entry);
-        const dest = path.join(toDir, entry);
+        const src = fromDir + path.sep + entry;
+        const dest = toDir + path.sep + entry;
         const stat = fs.statSync(src);
         if (stat.isFile()) {
           fs.copyFileSync(src, dest);

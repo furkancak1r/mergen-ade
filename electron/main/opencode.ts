@@ -267,7 +267,10 @@ export function generateOpencodeTerminalConfig(cwd: string, opts: {
   effort?: string;
   kimiStrictPermissions?: boolean;
 }): string {
-  const configPath = path.join(cwd, '.opencode', 'opencode.json');
+  if (!cwd || typeof cwd !== 'string') {
+    throw new Error('Invalid cwd for OpenCode terminal config');
+  }
+  const configPath = [cwd, '.opencode', 'opencode.json'].join(path.sep);
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
 
   const permissions: Record<string, string> = opts.kimiStrictPermissions

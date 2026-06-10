@@ -44,7 +44,11 @@ export function normalizeBrowserUrl(url: string): string {
 }
 
 function ensureBrowserUserDataDir(projectId: number): string {
-  const base = path.join(process.env.APPDATA || process.env.HOME || '.', 'Mergen', 'MergenADE', 'runtime', 'webview2', 'projects', String(projectId));
+  const safeId = Math.abs(Math.floor(Number(projectId)));
+  if (!Number.isFinite(safeId)) {
+    throw new Error('Invalid projectId for browser user data dir');
+  }
+  const base = [process.env.APPDATA || process.env.HOME || '.', 'Mergen', 'MergenADE', 'runtime', 'webview2', 'projects', String(safeId)].join(path.sep);
   if (!fs.existsSync(base)) {
     fs.mkdirSync(base, { recursive: true });
   }

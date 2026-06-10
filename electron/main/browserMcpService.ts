@@ -66,7 +66,7 @@ export function spawnBrowserMcpSession(sessionId: string, scope: BrowserScopeKey
   });
 
   proc.stderr?.on('data', (data) => {
-    console.error(`Browser MCP stderr [${sessionId}]:`, data.toString());
+    console.error('Browser MCP stderr [%s]: %s', sessionId, data.toString());
   });
 
   proc.on('exit', (code) => {
@@ -116,9 +116,9 @@ function handleMcpResponse(session: BrowserMcpSession, line: string): void {
     const msg = JSON.parse(line) as Record<string, unknown>;
     if (msg.result) {
       // Response to a request
-      console.log(`Browser MCP response [${session.sessionId}]:`, msg.result);
+      console.log('Browser MCP response [%s]:', session.sessionId, msg.result);
     } else if (msg.error) {
-      console.error(`Browser MCP error [${session.sessionId}]:`, msg.error);
+      console.error('Browser MCP error [%s]:', session.sessionId, msg.error);
     }
   } catch {
     // ignore non-JSON
