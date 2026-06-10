@@ -36,7 +36,6 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
-    mainWindow?.webContents.openDevTools();
   });
 
   mainWindow.on('close', (e) => {
@@ -171,7 +170,7 @@ app.whenReady().then(() => {
     confirmClose(confirmed);
   });
 
-  ipcMain.on('notify:show', (_event, payload) => {
+  ipcMain.handle('notify:show', (_event, payload) => {
     showNotification(payload);
   });
 

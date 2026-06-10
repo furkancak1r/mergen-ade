@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import type { AcpChatSession, AcpChatMessage, ProjectRecord, AcpConfigOption, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
-import { AcpStartupMode as AcpStartupModeEnum, defaultAppConfig } from '../../../shared/types';
-import { buildAcpPromptText, removeMentionFromInput } from '../lib/acpParser';
+import { defaultAppConfig } from '../../../shared/types';
+import { removeMentionFromInput } from '../lib/acpParser';
+import { actionControlsEnabled, hasConfigSelectorOptions, optionValues, shouldShowAcpWelcome } from '../lib/acpUi';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -84,6 +85,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       }
       if (event.type === 'commands' && event.commands) {
         setSlashHints(event.commands.map((c) => `/${c.id}`));
+        return;
       }
     });
     return () => { unsub(); };
@@ -178,6 +180,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const hasDraft = input.trim().length > 0 || attachments.length > 0;
   const showStop = isRunning && !hasDraft;
   const canSend = hasDraft;
+  const controlsEnabled = actionControlsEnabled(session);
   const currentMode = session?.currentModeId || 'build';
   const currentModel = session?.currentModel || 'Unknown';
   const currentEffort = session?.currentEffort || '';
@@ -203,6 +206,11 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const filteredModelOptions = effectiveModelOptions && favoriteModels.length > 0
     ? { ...effectiveModelOptions, options: effectiveModelOptions.options.filter((o) => favoriteModels.includes(o.value)) }
     : effectiveModelOptions;
+  const filteredModelOptionValues = optionValues(filteredModelOptions);
+  const effortOptionValues = optionValues(effortOptions);
+  const configSelectorHasOptions = hasConfigSelectorOptions(filteredModelOptions, effortOptions);
+  const filteredModelCurrentValue = filteredModelOptions?.currentValue ?? '';
+  const effortCurrentValue = effortOptions?.currentValue ?? '';
 
   const setModel = (value: string) => {
     api.invoke('acp:setConfigOption', { chatId, configId: 'model', value });
@@ -214,8 +222,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   const branchNameDisplay = branchName || 'main';
 
-  const hasMessages = (session?.messages.length ?? 0) > 0;
-  const isWelcome = !hasMessages && (session?.queuedPrompts.length ?? 0) === 0;
+  const isWelcome = shouldShowAcpWelcome(session?.messages, session?.queuedPrompts);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', background: '#0c0c0c' }}>
@@ -247,17 +254,19 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
             {session?.messages.map((msg, i) => (
               <MessageBubble key={i} message={msg} />
             ))}
-            {session?.queuedPrompts && session.queuedPrompts.length > 0 && (
-              <div style={{ marginTop: 8 }}>
-                {session.queuedPrompts.map((qp, i) => (
-                  <QueuedPromptRow key={i} prompt={qp} />
-                ))}
-              </div>
-            )}
           </>
         )}
         <div ref={messagesEndRef} />
       </div>
+
+      {/* Queued prompts — pinned above input */}
+      {session?.queuedPrompts && session.queuedPrompts?.length > 0 && (
+        <div style={{ padding: '4px 12px', flexShrink: 0 }}>
+          {session.queuedPrompts.map((qp, i) => (
+            <QueuedPromptRow key={i} prompt={qp} />
+          ))}
+        </div>
+      )}
 
       {/* Status row */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 12px', fontSize: 11, color: '#666', flexShrink: 0 }}>
@@ -363,6 +372,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', background: '#1b1b1b', borderRadius: 12, padding: '8px 12px' }}>
           <button
             onClick={async () => {
+              if (!controlsEnabled) return;
               const paths = await api.invoke('dialog:showOpen', { properties: ['openFile', 'multiSelections'] }) as string[] | undefined;
               if (paths) {
                 setAttachments((prev) => [...prev, ...paths]);
@@ -370,6 +380,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
                 setInput((prev) => prev ? `${prev} ${mentions}` : mentions);
               }
             }}
+            disabled={!controlsEnabled}
             style={{
               width: 28,
               height: 28,
@@ -377,7 +388,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               background: '#1a1a1a',
               border: '1px solid #333',
               color: '#ccc',
-              cursor: 'pointer',
+              cursor: controlsEnabled ? 'pointer' : 'not-allowed',
               fontSize: 14,
               display: 'flex',
               alignItems: 'center',
@@ -401,45 +412,46 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
           {/* Model + effort selector */}
           <div style={{ position: 'relative', flexShrink: 0 }} ref={modeDropdownRef}>
             <button
-              onClick={() => setModeDropdownOpen((v) => !v)}
-              style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: '1px solid #333', background: 'transparent', color: '#ccc', cursor: 'pointer', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+              onClick={() => {
+                if (!controlsEnabled || !configSelectorHasOptions) return;
+                setModeDropdownOpen((v) => !v);
+              }}
+              disabled={!controlsEnabled || !configSelectorHasOptions}
+              style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: '1px solid #333', background: 'transparent', color: '#ccc', cursor: controlsEnabled && configSelectorHasOptions ? 'pointer' : 'not-allowed', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: controlsEnabled && configSelectorHasOptions ? 1 : 0.55 }}
             >
               {modelLabel}
             </button>
             {modeDropdownOpen && (
               <div style={{ position: 'absolute', bottom: '100%', left: 0, marginBottom: 4, background: '#1a1a1a', border: '1px solid #333', borderRadius: 6, padding: 8, minWidth: 200, zIndex: 10 }}>
-                {filteredModelOptions && (
+                {filteredModelOptionValues.length > 0 && (
                   <div style={{ marginBottom: 8 }}>
                     <div style={{ fontSize: 10, color: '#888', marginBottom: 4 }}>Model</div>
-                    {filteredModelOptions.options.map((opt) => (
+                    {filteredModelOptionValues.map((opt) => (
                       <button
                         key={opt.value}
                         onClick={() => { setModel(opt.value); setModeDropdownOpen(false); }}
-                        style={{ display: 'block', width: '100%', textAlign: 'left', fontSize: 11, padding: '4px 8px', background: filteredModelOptions.currentValue === opt.value ? '#1f3a4c' : 'transparent', border: 'none', color: '#ccc', cursor: 'pointer', borderRadius: 3 }}
+                        style={{ display: 'block', width: '100%', textAlign: 'left', fontSize: 11, padding: '4px 8px', background: filteredModelCurrentValue === opt.value ? '#1f3a4c' : 'transparent', border: 'none', color: '#ccc', cursor: 'pointer', borderRadius: 3 }}
                       >
                         {opt.label}
                       </button>
                     ))}
-                    {filteredModelOptions.options.length === 0 && (
-                      <div style={{ fontSize: 11, color: '#888' }}>No favorite models. Add favorites in Settings &gt; OpenCode.</div>
-                    )}
                   </div>
                 )}
-                {effortOptions && (
+                {effortOptionValues.length > 0 && (
                   <div>
                     <div style={{ fontSize: 10, color: '#888', marginBottom: 4 }}>Effort</div>
-                    {effortOptions.options.map((opt) => (
+                    {effortOptionValues.map((opt) => (
                       <button
                         key={opt.value}
                         onClick={() => { setEffort(opt.value); setModeDropdownOpen(false); }}
-                        style={{ display: 'block', width: '100%', textAlign: 'left', fontSize: 11, padding: '4px 8px', background: effortOptions.currentValue === opt.value ? '#1f3a4c' : 'transparent', border: 'none', color: '#ccc', cursor: 'pointer', borderRadius: 3 }}
+                        style={{ display: 'block', width: '100%', textAlign: 'left', fontSize: 11, padding: '4px 8px', background: effortCurrentValue === opt.value ? '#1f3a4c' : 'transparent', border: 'none', color: '#ccc', cursor: 'pointer', borderRadius: 3 }}
                       >
                         {opt.label}
                       </button>
                     ))}
                   </div>
                 )}
-                {(!filteredModelOptions || filteredModelOptions.options.length === 0) && !effortOptions && (
+                {filteredModelOptionValues.length === 0 && effortOptionValues.length === 0 && (
                   <div style={{ fontSize: 11, color: '#888' }}>No model options available.</div>
                 )}
               </div>

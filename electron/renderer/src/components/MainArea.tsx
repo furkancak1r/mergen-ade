@@ -69,9 +69,7 @@ export const MainArea: React.FC<MainAreaProps> = ({ terminals, activeTerminalId,
 
   if (terminals.length === 0) {
     return (
-      <div className="main-area-empty">
-        <p>No active terminals. Use the Terminal Manager to spawn one.</p>
-      </div>
+      <div className="main-area-empty" style={{ width: '100%', height: '100%', background: '#0c0c0c' }} />
     );
   }
 

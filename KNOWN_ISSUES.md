@@ -3524,6 +3524,39 @@
 
 ---
 
+#### Electron ACP protocol/status drift ve bildirim IPC uyumsuzlugu {#electron-acp-protocol-status-notify-drift}
+- Date: 2026-06-10
+- Context: User requested investigation and fixes for five critical bugs in the Electron worktree.
+- Error signature:
+  1. `npx tsc --noEmit` failed in `AcpChatPanel.tsx` because `effortOptions` was narrowed unsafely inside JSX callbacks.
+  2. ACP activity tracking in `App.tsx` reset `acpRunning` to false for events such as `promptSent` and `queued` because those events did not carry a `status` field.
+  3. Renderer called `api.invoke('notify:show')`, but the main process registered `notify:show` with `ipcMain.on`, so OS notifications had no invoke handler.
+  4. Electron ACP sessions ignored the configured ACP startup mode and could not persist a mode toggle before `sessionId` was available.
+  5. ACP permission handling used `params.requestId` and a synthetic `session/permission_response` method instead of replying to the JSON-RPC request id with a JSON-RPC result; the auto-approve setting was also unused.
+- Symptoms/Impact:
+  - Electron TypeScript builds failed.
+  - Closing the app could omit warnings for active ACP turns or queued prompts.
+  - Permission/turn-complete OS notifications failed at runtime.
+  - New ACP chats could start in the wrong mode and queued startup prompts could be dispatched with the wrong mode/model binding.
+  - ACP permission prompts could fail to unblock OpenCode, and auto-approve did not work even when enabled.
+- Root cause:
+  - ACP protocol/status behavior was duplicated in UI and main-process code without small tested helpers.
+  - IPC channel registration drifted from the renderer call shape.
+  - The Electron ACP implementation diverged from the Rust ACP permission response behavior.
+- Resolution:
+  - Added shared ACP protocol helpers for startup mode mapping, permission request id normalization, auto-approve option selection, and JSON-RPC permission responses.
+  - Added renderer ACP UI helpers for activity state, welcome gating, selector option gating, and action-control readiness.
+  - Updated `acpService.ts` to apply startup/pending mode on session creation, keep mode toggles while starting, auto-approve permission requests when configured, and keep sessions running after permission responses until the real prompt response arrives.
+  - Updated notification registration to `ipcMain.handle('notify:show')` and moved `notify:show` to invoke-channel typing.
+  - Rebuilt Electron dist assets from the updated source.
+- Prevent recurrence:
+  - Added regression tests in `electron/renderer/src/lib/acpProtocol.test.ts` and `electron/renderer/src/lib/acpUi.test.ts`.
+  - Verified with `npx tsc --noEmit`, `npx vitest run --reporter=dot`, and `npx vite build`.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/main/index.ts`, `electron/renderer/src/App.tsx`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/shared/acpProtocol.ts`, `electron/shared/types.ts`, `electron/renderer/dist/*`, `KNOWN_ISSUES.md`
+- References: User request 2026-06-10
+
+---
+
 #### OpenCode ACP queued mesajı küçük ve ESC stop kısayolu eksikti {#acp-queued-row-escape-stop}
 - Date: 2026-06-04
 - Context: User reported that locally queued ACP messages looked absurdly tiny in the chat area, and requested that pressing `Esc` stop the AI response.

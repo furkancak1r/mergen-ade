@@ -14,6 +14,7 @@ import { SettingsPopup } from './components/SettingsPopup';
 import { InputHistory } from './components/InputHistory';
 import { usePty } from './hooks/usePty';
 import { activeBrowserScope as resolveActiveBrowserScope, scopeKeyString } from './lib/browserScope';
+import { nextAcpActivityState, type AcpEventLike } from './lib/acpUi';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -131,15 +132,15 @@ function App() {
 
   // Track ACP running state and queued prompts
   useEffect(() => {
-    const unsub = api.on('acp:event', (eventChatId: string, event: { type: string; status?: string; queuedPrompts?: number; count?: number }) => {
+    const unsub = api.on('acp:event', (eventChatId: string, event: AcpEventLike) => {
       if (activeAcpChat && eventChatId === activeAcpChat.chatId) {
-        setAcpRunning(event.status === 'running' || event.status === 'permission');
-        const queued = event.queuedPrompts ?? event.count ?? 0;
-        setAcpQueuedPrompts(queued > 0);
+        const next = nextAcpActivityState({ running: acpRunning, hasQueuedPrompts: acpQueuedPrompts }, event);
+        setAcpRunning(next.running);
+        setAcpQueuedPrompts(next.hasQueuedPrompts);
       }
     });
     return () => { unsub(); };
-  }, [activeAcpChat]);
+  }, [activeAcpChat, acpRunning, acpQueuedPrompts]);
 
   // Browser hide on modal open (Settings, Checklist) with grace period after close
   useEffect(() => {

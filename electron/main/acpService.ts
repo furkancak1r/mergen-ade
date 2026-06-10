@@ -4,6 +4,7 @@ import fs from 'fs';
 import { BrowserWindow } from 'electron';
 import type { AcpChatSession, AcpConfigOption, AcpAvailableCommand, AcpChatMessage, OpenCodeModelConfig } from '../shared/types';
 import { activeBuildModel, effectivePlanModel, effectivePlanEffort, mergeAcpKnownModels } from '../shared/types';
+import { buildAcpPermissionResponse, firstAutoApproveOptionId, permissionRequestIdFromRpc, startupModeToModeId } from '../shared/acpProtocol';
 import { loadConfig, saveConfig } from './config';
 import { getOpencodeBinPath } from './opencode';
 
@@ -59,8 +60,22 @@ function broadcast(channel: string, ...args: unknown[]) {
 
 function sendRpc(session: AcpSession, method: string, params: unknown): void {
   const req = { jsonrpc: '2.0', id: Date.now(), method, params };
+  sendRawRpc(session, req);
+}
+
+function sendRawRpc(session: AcpSession, req: unknown): void {
   if (!session.process) return;
   session.process.stdin?.write(JSON.stringify(req) + '\n');
+}
+
+function setSessionMode(session: AcpSession, modeId: string, forceRpc = false): void {
+  if (!modeId) return;
+  const changed = session.currentModeId !== modeId;
+  session.currentModeId = modeId;
+  if (session.sessionId && (forceRpc || changed)) {
+    sendRpc(session, 'session/set_config_option', { sessionId: session.sessionId, configId: 'mode', value: modeId });
+  }
+  applyModeModelBinding(session, modeId);
 }
 
 function applyModeModelBinding(session: AcpSession, modeId: string): void {
@@ -86,6 +101,7 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
   const chatId = `acp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   const opencodeBin = getOpencodeBinPath();
+  const initialModeId = startupModeToModeId(loadConfig().acpStartupMode);
 
   const session: AcpSession = {
     process: null as unknown as ChildProcess,
@@ -98,6 +114,7 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
     promptInput: '',
     attachments: [],
     configOptions: [],
+    currentModeId: initialModeId,
     queuedPrompts: [],
   };
 
@@ -220,6 +237,8 @@ function handleAcpLine(session: AcpSession, line: string): void {
           if (modelOpt) session.currentModel = modelOpt.currentValue;
           const effortOpt = session.configOptions.find((o) => o.id === 'effort');
           if (effortOpt) session.currentEffort = effortOpt.currentValue;
+          const modeOpt = session.configOptions.find((o) => o.id === 'mode');
+          if (!session.currentModeId && modeOpt) session.currentModeId = modeOpt.currentValue;
           // Update known models from server options
           const modelOptions = session.configOptions.find((o) => o.id === 'model');
           if (modelOptions) {
@@ -230,9 +249,8 @@ function handleAcpLine(session: AcpSession, line: string): void {
           }
           broadcast('acp:event', session.chatId, { type: 'configOptions', options: session.configOptions });
         }
-        // Apply mode/model binding from Mergen config on session start
-        const effectiveMode = session.currentModeId || 'build';
-        applyModeModelBinding(session, effectiveMode);
+        // Apply startup/pending mode and model binding from Mergen config on session start.
+        setSessionMode(session, session.currentModeId || startupModeToModeId(loadConfig().acpStartupMode), true);
         updateAcpStandbyStatus(session.chatId, 'idle', session.sessionId);
         broadcast('acp:event', session.chatId, { type: 'sessionCreated', sessionId: session.sessionId });
         // Flush any prompts queued while starting
@@ -262,17 +280,27 @@ function handleAcpLine(session: AcpSession, line: string): void {
           id: (o.optionId as string) || '',
           label: (o.name as string) || '',
         }));
-        session.status = 'permission';
-        updateAcpStandbyStatus(session.chatId, 'permission');
-        broadcast('acp:event', session.chatId, {
-          type: 'permission',
-          requestId: params.requestId,
-          message: params.message,
-          options,
-          multiple: params.multiple,
-          custom: params.custom,
-          sessionId: session.sessionId,
-        });
+        const requestId = permissionRequestIdFromRpc(id, params);
+        const autoOptionId = firstAutoApproveOptionId(options, loadConfig().opencode.acpAutoApprovePermissions);
+        if (requestId && autoOptionId) {
+          sendRawRpc(session, buildAcpPermissionResponse(requestId, autoOptionId));
+          session.status = 'running';
+          updateAcpStandbyStatus(session.chatId, 'running');
+          broadcast('acp:event', session.chatId, { type: 'permissionResponse', requestId, rejected: false, autoApproved: true, status: 'running', queuedPrompts: session.queuedPrompts.length });
+        } else {
+          session.status = 'permission';
+          updateAcpStandbyStatus(session.chatId, 'permission');
+          broadcast('acp:event', session.chatId, {
+            type: 'permission',
+            requestId,
+            message: params.message,
+            options,
+            multiple: params.multiple,
+            custom: params.custom,
+            sessionId: session.sessionId,
+            status: 'permission',
+          });
+        }
         return;
       }
       return;
@@ -341,6 +369,8 @@ function handleAcpLine(session: AcpSession, line: string): void {
             if (modelOpt) session.currentModel = modelOpt.currentValue;
             const effortOpt = optionsRaw.find((o) => o.id === 'effort');
             if (effortOpt) session.currentEffort = effortOpt.currentValue;
+            const modeOpt = optionsRaw.find((o) => o.id === 'mode');
+            if (modeOpt) session.currentModeId = modeOpt.currentValue;
             // Update known models from server options
             const modelOptions = optionsRaw.find((o) => o.id === 'model');
             if (modelOptions) {
@@ -394,9 +424,7 @@ function flushNextQueuedPrompt(session: AcpSession): void {
 
   // Apply queued prompt's mode before sending, if different from current
   if (next.modeId && next.modeId !== session.currentModeId) {
-    sendRpc(session, 'session/set_config_option', { sessionId: session.sessionId, configId: 'mode', value: next.modeId });
-    session.currentModeId = next.modeId;
-    applyModeModelBinding(session, next.modeId);
+    setSessionMode(session, next.modeId);
   }
 
   session.status = 'running';
@@ -424,9 +452,7 @@ export function sendAcpPrompt(chatId: string, promptText: string, attachments: s
 
   // Apply mode if explicitly provided and different
   if (modeId && modeId !== session.currentModeId) {
-    sendRpc(session, 'session/set_config_option', { sessionId: session.sessionId, configId: 'mode', value: modeId });
-    session.currentModeId = modeId;
-    applyModeModelBinding(session, modeId);
+    setSessionMode(session, modeId);
   }
 
   session.status = 'running';
@@ -450,13 +476,22 @@ export function cancelAcpPrompt(chatId: string): void {
 
 export function setAcpConfigOption(chatId: string, configId: string, value: string): void {
   const session = sessions.get(chatId);
-  if (!session || !session.sessionId) return;
+  if (!session) return;
+
+  if (configId === 'mode') {
+    setSessionMode(session, value, Boolean(session.sessionId));
+    broadcast('acp:event', session.chatId, { type: 'modeUpdate', modeId: value });
+    return;
+  }
+
+  if (!session.sessionId) return;
 
   sendRpc(session, 'session/set_config_option', { sessionId: session.sessionId, configId, value });
 
-  if (configId === 'mode') {
-    session.currentModeId = value;
-    applyModeModelBinding(session, value);
+  if (configId === 'model') {
+    session.currentModel = value;
+  } else if (configId === 'effort') {
+    session.currentEffort = value;
   }
 }
 
@@ -464,17 +499,10 @@ export function sendAcpPermissionResponse(chatId: string, requestId: string | nu
   const session = sessions.get(chatId);
   if (!session || !session.sessionId) return;
 
-  sendRpc(session, 'session/permission_response', {
-    sessionId: session.sessionId,
-    requestId: String(requestId),
-    answers,
-    rejected,
-  });
-  session.status = 'idle';
-  updateAcpStandbyStatus(session.chatId, 'idle');
+  sendRawRpc(session, buildAcpPermissionResponse(requestId, answers[0] || '', rejected));
+  session.status = 'running';
+  updateAcpStandbyStatus(session.chatId, 'running');
   broadcast('acp:event', chatId, { type: 'permissionResponse', requestId: String(requestId), rejected });
-  // Flush queued prompts after permission response
-  flushNextQueuedPrompt(session);
 }
 
 export function getAcpSession(chatId: string): AcpChatSession | undefined {
