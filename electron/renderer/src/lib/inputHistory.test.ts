@@ -4,6 +4,8 @@ import { defaultAppHistory, InputHistoryFilter, TerminalKind } from '../../../sh
 import {
   collectInputHistoryEntries,
   formatHistoryRelativeTime,
+  inputHistoryCountLabel,
+  inputHistoryEmptyMessage,
   inputHistoryFilterMatchesKind,
   removeProjectInputHistory,
   removeProjectsInputHistory,
@@ -47,6 +49,13 @@ function history(entries: TerminalInputRecord[], path = 'C:\\repo', maxEntries =
 }
 
 describe('inputHistory', () => {
+  it('formats empty and count labels like the Rust input history panel', () => {
+    expect(inputHistoryEmptyMessage(false)).toBe('No history entries for this project yet');
+    expect(inputHistoryEmptyMessage(true)).toBe('No matching entries');
+    expect(inputHistoryCountLabel(1)).toBe('1 entries');
+    expect(inputHistoryCountLabel(2)).toBe('2 entries');
+  });
+
   it('matches All, Foreground, and Background filters by terminal kind', () => {
     expect(inputHistoryFilterMatchesKind(InputHistoryFilter.All, TerminalKind.Foreground)).toBe(true);
     expect(inputHistoryFilterMatchesKind(InputHistoryFilter.All, TerminalKind.Background)).toBe(true);

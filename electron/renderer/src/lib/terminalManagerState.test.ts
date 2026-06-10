@@ -37,9 +37,12 @@ describe('terminalManagerState', () => {
     const config = defaultAppConfig();
     config.ui.leftSidebarTab = LeftSidebarTab.Directory;
     config.ui.terminalManagerFilter = TerminalManagerFilter.Background;
+    config.ui.projectExplorerExpanded = false;
 
     const next = withTerminalManagerOpened(config);
 
+    expect(next.ui.showProjectExplorer).toBe(true);
+    expect(next.ui.projectExplorerExpanded).toBe(true);
     expect(next.ui.leftSidebarTab).toBe(LeftSidebarTab.TerminalManager);
     expect(next.ui.terminalManagerFilter).toBe(TerminalManagerFilter.Foreground);
   });

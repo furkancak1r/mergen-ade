@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import type { DirectoryNode, ProjectRecord } from '../../../shared/types';
 import { repairMojibakeDisplay } from '../lib/mojibake';
-import { collectLoadedDirectoryPaths, directoryTreeHasCollapsedFolders } from '../lib/directoryTree';
+import { collectLoadedDirectoryPaths, directoryNodeContextActions, directoryTreeHasCollapsedFolders, type DirectoryNodeContextAction } from '../lib/directoryTree';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
 
@@ -59,6 +59,19 @@ function highlightMatch(text: string, query: string): React.ReactNode {
   return parts;
 }
 
+function directoryContextActionLabel(action: DirectoryNodeContextAction): string {
+  switch (action) {
+    case 'openInEditor':
+      return 'Open in Editor';
+    case 'openWithDefaultApp':
+      return 'Open with Default App';
+    case 'revealInFolder':
+      return 'Reveal in Folder';
+    case 'copyPath':
+      return 'Copy Path';
+  }
+}
+
 interface ProjectExplorerProps {
   project: ProjectRecord;
   projects?: ProjectRecord[];
@@ -84,6 +97,7 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, proje
   const refreshRequestRef = useRef(0);
   const feedbackTimerRef = useRef<number | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [nodeContextMenu, setNodeContextMenu] = useState<{ x: number; y: number; node: DirectoryNode } | null>(null);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(query), 250);
@@ -130,6 +144,21 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, proje
       window.clearTimeout(feedbackTimerRef.current);
     }
   }, []);
+
+  useEffect(() => {
+    if (!nodeContextMenu) return undefined;
+
+    const closeMenu = () => setNodeContextMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu();
+    };
+    window.addEventListener('click', closeMenu);
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      window.removeEventListener('click', closeMenu);
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [nodeContextMenu]);
 
   const refreshRoot = useCallback(async (): Promise<boolean> => {
     const requestId = ++refreshRequestRef.current;
@@ -188,6 +217,37 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, proje
       .then((ok) => showFeedback(ok ? 'Directory index refreshed' : 'Directory index refresh failed'))
       .catch((err) => showFeedback(`Directory index refresh failed: ${err instanceof Error ? err.message : String(err)}`));
   }, [refreshRoot, showFeedback]);
+
+  const runNodeContextAction = useCallback((action: DirectoryNodeContextAction, node: DirectoryNode) => {
+    switch (action) {
+      case 'openInEditor':
+        if (onOpenFile) {
+          onSelectPath?.(node.path);
+          onOpenFile(node.path);
+          showFeedback(`Opening ${node.name} in editor...`);
+        } else {
+          showFeedback('Editor is not available for this file');
+        }
+        break;
+      case 'openWithDefaultApp':
+        api.invoke('shell:openPath', node.path)
+          .then((result) => {
+            const message = typeof result === 'string' && result ? `Open file failed: ${result}` : `Opened file: ${node.name}`;
+            showFeedback(message);
+          })
+          .catch((err) => showFeedback(`Open file failed: ${err instanceof Error ? err.message : String(err)}`));
+        break;
+      case 'revealInFolder':
+        api.invoke('shell:showItemInFolder', node.path)
+          .then(() => showFeedback(`Revealed file in folder: ${node.name}`))
+          .catch((err) => showFeedback(`Open folder failed: ${err instanceof Error ? err.message : String(err)}`));
+        break;
+      case 'copyPath':
+        api.invoke('clipboard:writeText', node.path).catch(() => {});
+        showFeedback(`Copied path for ${node.name}`);
+        break;
+    }
+  }, [onOpenFile, onSelectPath, showFeedback]);
 
   const expandNode = useCallback(async (node: DirectoryNode) => {
     if (node.isSymlink) return;
@@ -383,6 +443,12 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, proje
               onOpenFile?.(node.path);
             }
           }}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onSelectPath?.(node.path);
+            setNodeContextMenu({ x: event.clientX, y: event.clientY, node });
+          }}
           onDoubleClick={() => {
             if (node.isDirectory) {
               toggleNode(node);
@@ -510,6 +576,27 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, proje
       {feedback && (
         <div className="project-explorer-feedback-toast" role="status">
           {feedback}
+        </div>
+      )}
+      {nodeContextMenu && (
+        <div
+          className="project-explorer-context-menu"
+          style={{ left: nodeContextMenu.x, top: nodeContextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          {directoryNodeContextActions(nodeContextMenu.node).map((action) => (
+            <button
+              key={action}
+              type="button"
+              onClick={() => {
+                runNodeContextAction(action, nodeContextMenu.node);
+                setNodeContextMenu(null);
+              }}
+            >
+              {directoryContextActionLabel(action)}
+            </button>
+          ))}
         </div>
       )}
     </div>

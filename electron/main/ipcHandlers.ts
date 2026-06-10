@@ -145,6 +145,9 @@ export function registerIpcHandlers() {
   ipcMain.handle('shell:openExternal', async (_event, url: string) => {
     await shell.openExternal(url);
   });
+  ipcMain.handle('shell:openPath', async (_event, filePath: string) => {
+    return shell.openPath(filePath);
+  });
   ipcMain.handle('shell:showItemInFolder', async (_event, filePath: string) => {
     shell.showItemInFolder(filePath);
   });

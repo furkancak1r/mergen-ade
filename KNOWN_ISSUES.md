@@ -4357,3 +4357,253 @@
   - Keep Source Control toolbar actions and IPC options aligned with Rust's `request_source_control_refresh(run_fetch, manual)` behavior.
 - Files/Commands touched: `electron/main/worktree.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/components/SourceControl.tsx`, `KNOWN_ISSUES.md`
 - References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Directory satir context menusu eksikti {#electron-directory-node-context-menu}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Directory tree rows expose right-click actions for folders and files, while Electron rows only supported left-click navigation/opening.
+- Error signature:
+  1. Folder rows had no `Copy Path` context action.
+  2. File rows had no `Open in Editor`, `Open with Default App`, `Reveal in Folder`, or `Copy Path` context actions.
+  3. The renderer lacked an IPC channel for opening a local file with the OS default app.
+- Symptoms/Impact:
+  - Common file-tree actions required leaving the Directory panel or using external tools.
+  - Electron's Directory panel felt less complete than the Rust implementation for repeated file navigation.
+- Root cause:
+  - The Electron Project Explorer port implemented lazy tree rendering but skipped the row-level context menu behavior from Rust's `draw_folder_tree()`.
+- Resolution:
+  - Added tested directory-tree context action helpers matching Rust's folder/file action sets.
+  - Added a Project Explorer row context menu with file editor open, default app open, reveal-in-folder, and path copy actions.
+  - Added `shell:openPath` IPC support for OS default-app file opening.
+- Prevent recurrence:
+  - Keep Directory row action sets covered in `directoryTree.test.ts` when adding or changing tree context menu behavior.
+- Files/Commands touched: `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/lib/directoryTree.ts`, `electron/renderer/src/lib/directoryTree.test.ts`, `electron/renderer/src/components/ProjectExplorer.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron File Editor context menusu Rust davranisindan sapti {#electron-file-editor-context-menu-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's File Editor uses a lightweight context menu with a selection-aware `Copy` action, while Electron created an ad hoc DOM menu with different styling and an extra paste action.
+- Error signature:
+  1. File Editor context menu was created imperatively with `document.createElement`.
+  2. The menu styling did not match the other Electron/Rust-like context menus.
+  3. Copy did not preserve a right-click pre-selection as explicitly as Rust's stored selection path.
+- Symptoms/Impact:
+  - File Editor right-click behavior looked and felt different from Rust and from the rest of Electron's panels.
+  - Right-clicking selected text could risk copying the post-click caret state instead of the original selection.
+- Root cause:
+  - The Electron File Editor implemented a quick browser-style menu before the Rust selection-preservation behavior was ported.
+- Resolution:
+  - Replaced the imperative DOM menu with React-managed context menu state.
+  - Captured the secondary-click selection before the context menu opens and restored it while the menu is visible.
+  - Added a shared helper and regression tests for selection range text extraction.
+- Prevent recurrence:
+  - Keep editor context menu behavior state-driven and covered by helper tests for selection range edge cases.
+- Files/Commands touched: `electron/renderer/src/components/FileEditor.tsx`, `electron/renderer/src/lib/fileEditor.ts`, `electron/renderer/src/lib/fileEditor.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control proje secici ve bos durum metni Rust ile uyumsuzdu {#electron-source-control-project-selector-status-text}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Source Control panel includes a project selector in the header and distinguishes `Status pending` from `Working tree is clean`, while Electron showed only the active project name and used different clean-state wording.
+- Error signature:
+  1. Source Control header could not switch projects directly from inside the panel.
+  2. Clean state displayed `Working tree clean.` instead of Rust's `Working tree is clean`.
+  3. The panel had no Rust-equivalent display-data helper for deciding when to show `Status pending`.
+- Symptoms/Impact:
+  - Source Control navigation was less efficient than Rust for multi-project workspaces.
+  - Empty-state copy and status lifecycle were inconsistent across ports.
+- Root cause:
+  - The Electron Source Control component was scoped to a single selected project and did not carry Rust's source-control snapshot display-data rule.
+- Resolution:
+  - Added Source Control project selector props and wired them from App.
+  - Added shared `sourceControlSnapshotHasDisplayData()` with regression coverage.
+  - Updated empty-state messaging to show `Status pending` or `Working tree is clean` using the Rust display-data rule.
+- Prevent recurrence:
+  - Keep Source Control panel header controls and empty-state labels covered when porting Rust Source Control behavior.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/SourceControl.tsx`, `electron/shared/sourceControl.ts`, `electron/renderer/src/lib/sourceControl.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser toolbar refresh ve URL temizleme kontrolleri eksikti {#electron-browser-toolbar-refresh-clear-url}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Browser panel has compact toolbar controls for refreshing the active page and clearing the URL/tab state, while Electron exposed URL navigation, inspect, and screenshots but not these two direct actions.
+- Error signature:
+  1. Browser UI had no visible `Refresh` action despite an existing `browser:reload` IPC channel.
+  2. Browser UI had no `Clear URL` action to reset the draft, active tab metadata, and persisted project URL.
+  3. Project-scoped `browserLastUrl` could only be replaced by navigating elsewhere, not cleared from the browser toolbar.
+- Symptoms/Impact:
+  - Users had to use external browser gestures or MCP commands for a simple refresh.
+  - Reopening the Browser panel could restore an unwanted last URL after the user intended to clear it.
+- Root cause:
+  - The Electron BrowserPanel toolbar port skipped Rust's refresh/clear toolbar actions and only wired the lower-level IPC/state pieces.
+- Resolution:
+  - Added compact Refresh and Clear URL toolbar buttons.
+  - Wired Refresh to `browser:reload`.
+  - Added tested helpers for clearable URL detection and active-tab URL reset.
+  - Added App-level clearing of project-family `browserLastUrl` for project-scoped browser panels.
+- Prevent recurrence:
+  - Keep Browser toolbar controls aligned with Rust's compact URL-row actions when adding or reshuffling browser UI.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/BrowserPanel.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Input History bos durum metinleri Rust ile birebir degildi {#electron-input-history-label-copy-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Input History panel uses exact no-period empty messages and always formats the result count as `N entries`, while Electron used sentence punctuation and singularized `1 entry`.
+- Error signature:
+  1. Empty project state showed `Select a project to view history.` instead of `Select a project to view history`.
+  2. Empty history/search states showed trailing periods.
+  3. Count label singularized one result as `1 entry`, unlike Rust's `1 entries`.
+- Symptoms/Impact:
+  - The Input History panel copy did not visually match the Rust reference.
+- Root cause:
+  - Electron implemented natural English UI copy independently instead of using the Rust panel's exact labels.
+- Resolution:
+  - Added tested Input History label helpers for empty messages and result count formatting.
+  - Updated the Input History component to use Rust-equivalent labels.
+- Prevent recurrence:
+  - Keep Input History visible copy in helper tests when changing panel labels.
+- Files/Commands touched: `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/lib/inputHistory.ts`, `electron/renderer/src/lib/inputHistory.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron File Editor kaydet dugmesi Rust toolbar gorunumunden farkliydi {#electron-file-editor-save-button-visual-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's File Editor header uses compact icon-only Save and Close buttons, while Electron still used a wider text `Save` button.
+- Error signature:
+  1. Save action rendered as a text button instead of a 28px icon-only toolbar button.
+  2. Save tooltip said `Save (Ctrl+S)` instead of Rust's `Save File (Ctrl+S)` / `No unsaved changes` split.
+  3. Close tooltip said `Close` instead of `Close Editor`.
+- Symptoms/Impact:
+  - File Editor header looked heavier and less like the Rust reference.
+- Root cause:
+  - The Electron File Editor header was implemented before the Rust compact toolbar treatment was ported.
+- Resolution:
+  - Replaced the text Save button with a compact icon-only toolbar button.
+  - Added shared File Editor toolbar button styling for enabled, hover, and muted disabled states.
+  - Aligned Save and Close tooltips with Rust labels.
+- Prevent recurrence:
+  - Keep File Editor header actions icon-only unless the Rust reference changes.
+- Files/Commands touched: `electron/renderer/src/components/FileEditor.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron activity rail metinliydi ve Rust ikon-only gorunumunden farkliydi {#electron-activity-rail-icon-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's activity rail uses compact icon-only buttons with tooltip labels, while Electron rendered text such as `Explorer`, `Terminals`, `History`, and `Check` inside 40px buttons.
+- Error signature:
+  1. Rail buttons used visible text labels instead of icons.
+  2. Long labels were cramped in the fixed 48px rail.
+  3. Tooltip copy did not fully match Rust labels such as `Open Directory` and `Toggle Browser Panel`.
+- Symptoms/Impact:
+  - The Electron shell looked less like the Rust reference and the rail was harder to scan.
+- Root cause:
+  - The initial Electron shell used descriptive text labels before the Rust icon rail treatment was ported.
+- Resolution:
+  - Added tested activity rail item metadata for Rust-equivalent order, icons, and tooltip labels.
+  - Updated App rail buttons to render icon-only content with accessible labels.
+  - Added rail icon styling, including monospace treatment for the terminal glyph.
+- Prevent recurrence:
+  - Keep rail order and tooltip copy covered by `activityRail.test.ts` when changing shell navigation.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/activityRail.ts`, `electron/renderer/src/lib/activityRail.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron activity rail ayni sekmeye tiklayinca sol paneli kapatmiyordu {#electron-activity-rail-toggle-collapse}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's activity rail toggles the left sidebar: clicking the active Directory/Source Control/Terminal Manager/Input History icon collapses the panel, while clicking an inactive icon opens the panel and switches tabs.
+- Error signature:
+  1. Electron ignored `ui.projectExplorerExpanded` during render.
+  2. Left sidebar and resize handle were always visible.
+  3. Active rail state was based only on `activeTab`, so a collapsed tab could still look active.
+- Symptoms/Impact:
+  - Users could not reclaim horizontal space from the left sidebar using the rail.
+  - Electron shell behavior diverged from the Rust reference even though the persisted config fields existed.
+- Root cause:
+  - The Electron shell rendered a permanently open sidebar and never wired the Rust expand/collapse rail behavior.
+- Resolution:
+  - Added tested activity rail state helpers for active-tab detection, programmatic open, and user toggle.
+  - Rendered sidebar and resize handle only when `showProjectExplorer && projectExplorerExpanded`.
+  - Updated rail active styling to depend on the expanded state.
+  - Ensured programmatic Terminal Manager/Source Control reveal paths open the sidebar instead of toggling it closed.
+- Prevent recurrence:
+  - Keep activity rail toggle behavior covered in helper tests whenever shell navigation state changes.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/activityRail.ts`, `electron/renderer/src/lib/activityRail.test.ts`, `electron/renderer/src/lib/terminalManagerState.ts`, `electron/renderer/src/lib/terminalManagerState.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Check-list paneli bos projeleri gosteriyordu {#electron-checklist-items-only-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's floating Check-list panel lists only projects that currently have checklist items and shows a centered helper message when the list is empty, while Electron listed every project with `No items` rows.
+- Error signature:
+  1. Projects with empty checklist arrays appeared in the floating panel.
+  2. Empty state said `No projects with checklist items.` instead of Rust's two-line guidance.
+  3. Panel title used `Checklist` instead of `Check-list`.
+  4. Copy feedback used `item(s)` instead of Rust's `Copied N checklist items`, and item copy had no feedback.
+- Symptoms/Impact:
+  - The Check-list panel was noisier than Rust and less clear when there were no saved items.
+- Root cause:
+  - The Electron panel rendered the raw project list instead of Rust's prefiltered `projects_with_checklist` collection.
+- Resolution:
+  - Added tested checklist helpers for item-bearing project filtering, clipboard formatting, and feedback text.
+  - Updated the component to render only projects with checklist items.
+  - Aligned title, empty state, copy-all feedback, and item-copy feedback with Rust.
+- Prevent recurrence:
+  - Keep Check-list filtering and visible copy covered by `checklist.test.ts` when changing checklist UI behavior.
+- Files/Commands touched: `electron/renderer/src/components/Checklist.tsx`, `electron/renderer/src/lib/checklist.ts`, `electron/renderer/src/lib/checklist.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Check-list Browser acikken WebView'i gizliyordu {#electron-checklist-browser-coexistence}
+- Date: 2026-06-10
+- Context: Rust's floating Check-list is non-modal: it can coexist with the Browser panel and is offset to the left of the Browser so it does not cover the native WebView area. Electron hid Browser whenever Check-list was visible.
+- Error signature:
+  1. `checklistVisible` triggered `browser:hideAll`.
+  2. BrowserPanel received `hidden={settingsOpen || checklistVisible}`.
+  3. The Check-list popup always used a fixed right offset and could overlap the Browser panel area.
+- Symptoms/Impact:
+  - Opening Check-list made the embedded browser disappear, unlike Rust.
+  - Check-list and Browser could not be used side by side.
+- Root cause:
+  - Electron treated Check-list like a modal overlay instead of Rust's non-modal floating panel.
+- Resolution:
+  - Removed Check-list from Browser hide/hidden conditions; Settings remains modal and still hides Browser.
+  - Added tested Check-list right-offset calculation so the popup moves left of the Browser panel when Browser is visible.
+  - Passed the computed offset from App into the Check-list component.
+- Prevent recurrence:
+  - Keep Check-list/Browser coexistence covered by checklist positioning helpers and avoid adding `checklistVisible` back to Browser hide conditions.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/Checklist.tsx`, `electron/renderer/src/lib/checklist.ts`, `electron/renderer/src/lib/checklist.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser son project tab kapaninca paneli acik birakiyordu {#electron-browser-last-tab-closes-panel}
+- Date: 2026-06-10
+- Context: Rust's `close_browser_panel_tab()` closes the Browser panel for the project when the last tab in that scope is closed. Electron cleared the tab state but left the right Browser panel open for project-scoped tabs.
+- Error signature:
+  1. `BrowserPanel.closeTab()` called `onScopeEmpty(scope)` when no tabs remained.
+  2. App's `onScopeEmpty` only handled terminal-scoped browser override cleanup.
+  3. Project-scoped browser panels remained open with no tabs.
+- Symptoms/Impact:
+  - Closing the final Browser tab left an empty Browser panel instead of reclaiming the right-side space like Rust.
+- Root cause:
+  - Electron did not map the Rust project-panel close step to `browserOpenProjects` state.
+- Resolution:
+  - Added tested Browser toolbar helper for project-open set updates when a browser scope becomes empty.
+  - Wired project-scoped `onScopeEmpty` to remove the project from `browserOpenProjects`.
+  - Preserved terminal-scoped behavior so only the terminal override is cleared while the project Browser panel stays open.
+- Prevent recurrence:
+  - Keep Browser empty-scope lifecycle covered in `browserToolbar.test.ts`.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10

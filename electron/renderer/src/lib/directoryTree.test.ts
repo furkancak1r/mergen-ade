@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DirectoryNode } from '../../../shared/types';
-import { collectLoadedDirectoryPaths, directoryTreeHasCollapsedFolders } from './directoryTree';
+import { collectLoadedDirectoryPaths, directoryNodeContextActions, directoryTreeHasCollapsedFolders } from './directoryTree';
 
 function node(partial: Partial<DirectoryNode> & Pick<DirectoryNode, 'name' | 'path'>): DirectoryNode {
   return {
@@ -37,5 +37,15 @@ describe('directoryTree helpers', () => {
 
     expect(directoryTreeHasCollapsedFolders(root, new Set(['/repo']))).toBe(true);
     expect(directoryTreeHasCollapsedFolders(root, new Set(['/repo', '/repo/src']))).toBe(false);
+  });
+
+  it('matches Rust directory row context actions', () => {
+    expect(directoryNodeContextActions(node({ name: 'src', path: '/repo/src' }))).toEqual(['copyPath']);
+    expect(directoryNodeContextActions(node({ name: 'main.ts', path: '/repo/main.ts', isDirectory: false }))).toEqual([
+      'openInEditor',
+      'openWithDefaultApp',
+      'revealInFolder',
+      'copyPath',
+    ]);
   });
 });

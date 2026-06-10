@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import type { ProjectRecord, GitWorktreeInfo, SourceControlSnapshot, SourceControlStatus } from '../../../shared/types';
-import { sourceControlBranchLine, sourceControlFileAbsolutePath, sourceControlStatusLabel, sourceControlWorktreeLabel } from '../../../shared/sourceControl';
+import { sourceControlBranchLine, sourceControlFileAbsolutePath, sourceControlSnapshotHasDisplayData, sourceControlStatusLabel, sourceControlWorktreeLabel } from '../../../shared/sourceControl';
 import { repairMojibakeDisplay } from '../lib/mojibake';
 import { defaultWorktreePathForBranch } from '../lib/worktree';
 
@@ -8,6 +8,9 @@ const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...ar
 
 interface SourceControlProps {
   project: ProjectRecord;
+  projects?: ProjectRecord[];
+  selectedProjectId?: number | null;
+  onSelectProject?: (projectId: number) => void;
   onAddWorktree?: (worktree: GitWorktreeInfo) => void;
   onRemoveWorktree?: (worktree: GitWorktreeInfo) => void;
   onDeleteGitWorktree?: (worktree: GitWorktreeInfo) => void;
@@ -18,7 +21,7 @@ interface SourceControlProps {
   autoOpenCreateRequestId?: number;
 }
 
-export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWorktree, onRemoveWorktree, onDeleteGitWorktree, hasLiveTerminals, registeredWorktreePaths, onOrphanWorktrees, onBranchChange, autoOpenCreateRequestId }) => {
+export const SourceControl: React.FC<SourceControlProps> = ({ project, projects, selectedProjectId, onSelectProject, onAddWorktree, onRemoveWorktree, onDeleteGitWorktree, hasLiveTerminals, registeredWorktreePaths, onOrphanWorktrees, onBranchChange, autoOpenCreateRequestId }) => {
   const [snapshot, setSnapshot] = useState<SourceControlSnapshot>({ loading: true, files: [], worktrees: [] });
   const [query, setQuery] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -138,6 +141,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
     return sourceControlWorktreeLabel(w).toLowerCase().includes(q) || w.path.toLowerCase().includes(q);
   });
   const branchLine = sourceControlBranchLine(snapshot);
+  const hasDisplayData = sourceControlSnapshotHasDisplayData(snapshot);
   const createWorktreePath = createBranch.trim()
     ? defaultWorktreePathForBranch(project.path, createBranch.trim())
     : '';
@@ -160,9 +164,24 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', position: 'relative' }}>
       <div style={{ padding: '8px 12px', borderBottom: '1px solid #222', display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>
-          {repairMojibakeDisplay(project.name)}
-        </span>
+        {projects && projects.length > 0 && onSelectProject ? (
+          <select
+            className="source-control-project-select"
+            value={selectedProjectId ?? project.id}
+            title={project.path}
+            onChange={(event) => onSelectProject(Number(event.target.value))}
+          >
+            {projects.map((item) => (
+              <option key={item.id} value={item.id}>
+                {repairMojibakeDisplay(item.name)}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span style={{ fontSize: 12, fontWeight: 600, color: '#eee', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {repairMojibakeDisplay(project.name)}
+          </span>
+        )}
         <span style={{ fontSize: 11, color: '#888' }}>
           {snapshot.files.length > 0 ? `${snapshot.files.length} changes` : 'Clean'}
         </span>
@@ -260,9 +279,6 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 0' }}>
         {snapshot.loading && <div style={{ padding: 12, color: '#888', fontSize: 12 }}>Refreshing source control...</div>}
         {snapshot.error && <div style={{ padding: 12, color: '#ff8a8a', fontSize: 12 }}>{snapshot.error}</div>}
-        {!snapshot.loading && snapshot.files.length === 0 && snapshot.worktrees.length === 0 && (
-          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>{snapshot.error ? 'Status unavailable.' : 'Working tree clean.'}</div>
-        )}
 
         {filteredWorktrees.length > 0 && (
           <div style={{ marginBottom: 8 }}>
@@ -324,6 +340,13 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
               );
             })}
           </div>
+        )}
+
+        {!snapshot.loading && !snapshot.error && !hasDisplayData && (
+          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>Status pending</div>
+        )}
+        {!snapshot.loading && !snapshot.error && hasDisplayData && snapshot.files.length === 0 && (
+          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>Working tree is clean</div>
         )}
 
         {filteredFiles.length > 0 && (

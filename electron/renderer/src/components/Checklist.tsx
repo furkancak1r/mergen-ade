@@ -1,18 +1,26 @@
 import React, { useState, useCallback, useRef } from 'react';
 import type { ProjectRecord } from '../../../shared/types';
+import {
+  CHECKLIST_EMPTY_MESSAGE,
+  checklistCopiedItemsMessage,
+  formatChecklistForClipboard,
+  projectsWithChecklistItems,
+} from '../lib/checklist';
 
 const CHECKLIST_MESSAGE_MAX_HEIGHT = 120;
 
 interface ChecklistProps {
   projects: ProjectRecord[];
+  rightOffset?: number;
   onRemoveItem?: (projectId: number, index: number) => void;
   onClose?: () => void;
 }
 
-export const Checklist: React.FC<ChecklistProps> = ({ projects, onRemoveItem, onClose }) => {
+export const Checklist: React.FC<ChecklistProps> = ({ projects, rightOffset = 18, onRemoveItem, onClose }) => {
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
   const [toast, setToast] = useState<{ text: string; id: number } | null>(null);
   const toastIdRef = useRef(0);
+  const projectsWithItems = projectsWithChecklistItems(projects);
 
   const showToast = useCallback((text: string) => {
     const id = ++toastIdRef.current;
@@ -35,19 +43,20 @@ export const Checklist: React.FC<ChecklistProps> = ({ projects, onRemoveItem, on
   }, []);
 
   const copyAll = useCallback((project: ProjectRecord) => {
-    const text = project.checklist.join('\n\n');
+    const text = formatChecklistForClipboard(project.checklist);
     navigator.clipboard.writeText(text).catch(() => {});
-    showToast(`Copied ${project.checklist.length} item(s)`);
+    showToast(checklistCopiedItemsMessage(project.checklist.length));
   }, [showToast]);
 
   const copyItem = useCallback((item: string) => {
     navigator.clipboard.writeText(item).catch(() => {});
-  }, []);
+    showToast('Copied message');
+  }, [showToast]);
 
   return (
-    <div style={{ position: 'fixed', bottom: 16, right: 16, width: 360, maxHeight: 500, background: '#141414', border: '1px solid #333', borderRadius: 8, display: 'flex', flexDirection: 'column', overflow: 'hidden', zIndex: 100 }}>
+    <div style={{ position: 'fixed', bottom: 16, right: rightOffset, width: 360, maxHeight: 500, background: '#141414', border: '1px solid #333', borderRadius: 8, display: 'flex', flexDirection: 'column', overflow: 'hidden', zIndex: 100 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #222' }}>
-        <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>Checklist</span>
+        <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>Check-list</span>
         {onClose && (
           <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 14 }}>
             ✕
@@ -55,7 +64,7 @@ export const Checklist: React.FC<ChecklistProps> = ({ projects, onRemoveItem, on
         )}
       </div>
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 0' }}>
-        {projects.map((project) => (
+        {projectsWithItems.map((project) => (
           <div key={project.id} style={{ marginBottom: 4 }}>
             <div
               style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 12px', cursor: 'pointer' }}
@@ -98,15 +107,14 @@ export const Checklist: React.FC<ChecklistProps> = ({ projects, onRemoveItem, on
                     </button>
                   </div>
                 ))}
-                {project.checklist.length === 0 && (
-                  <div style={{ padding: '2px 12px 2px 24px', fontSize: 11, color: '#666' }}>No items</div>
-                )}
               </div>
             )}
           </div>
         ))}
-        {projects.length === 0 && (
-          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>No projects with checklist items.</div>
+        {projectsWithItems.length === 0 && (
+          <div style={{ minHeight: 160, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, color: '#888', fontSize: 13, textAlign: 'center', whiteSpace: 'pre-line' }}>
+            {CHECKLIST_EMPTY_MESSAGE}
+          </div>
         )}
       </div>
       {toast && (

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppConfig, AppHistory, InputHistoryFilter } from '../../../shared/types';
 import { InputHistoryFilter as InputHistoryFilterEnum, InputHistoryFilterLabel, TerminalKindLabel } from '../../../shared/types';
-import { collectInputHistoryEntries, formatHistoryRelativeTime } from '../lib/inputHistory';
+import { collectInputHistoryEntries, formatHistoryRelativeTime, inputHistoryCountLabel, inputHistoryEmptyMessage } from '../lib/inputHistory';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).mergenApi;
 
@@ -136,15 +136,15 @@ export const InputHistory: React.FC<InputHistoryProps> = ({
 
       <div style={{ flex: 1, overflow: 'auto', padding: '6px 0' }}>
         {historyProjectId === null || !selectedProject ? (
-          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>Select a project to view history.</div>
+          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>Select a project to view history</div>
         ) : result.entries.length === 0 ? (
           <div style={{ padding: 12, color: '#888', fontSize: 12 }}>
-            {searchQuery.trim() ? 'No matching entries.' : 'No history entries for this project yet.'}
+            {inputHistoryEmptyMessage(Boolean(searchQuery.trim()))}
           </div>
         ) : (
           <>
             <div style={{ padding: '0 8px 4px', color: '#888', fontSize: 11 }}>
-              {result.totalMatching} {result.totalMatching === 1 ? 'entry' : 'entries'}
+              {inputHistoryCountLabel(result.totalMatching)}
             </div>
             {result.entries.map((entry, i) => (
               <div

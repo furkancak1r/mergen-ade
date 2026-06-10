@@ -24,6 +24,9 @@ import {
   withToggledTerminalManagerHideInactive,
 } from './lib/terminalManagerState';
 import { recordInputHistory, removeProjectsInputHistory } from './lib/inputHistory';
+import { activityRailItem, isLeftSidebarTabActive, withLeftSidebarRailToggle, withLeftSidebarTabOpen } from './lib/activityRail';
+import { checklistRightOffset } from './lib/checklist';
+import { browserProjectIdsAfterScopeEmpty } from './lib/browserToolbar';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -203,9 +206,10 @@ function App() {
     return () => { unsub(); };
   }, [activeAcpChat, acpRunning, acpQueuedPrompts]);
 
-  // Browser hide on modal open (Settings, Checklist) with grace period after close
+  // Browser hide on modal open (Settings) with grace period after close.
+  // Check-list is a non-modal floating panel and must not hide Browser.
   useEffect(() => {
-    if (settingsOpen || checklistVisible) {
+    if (settingsOpen) {
       api.invoke('browser:hideAll');
       return;
     }
@@ -215,7 +219,7 @@ function App() {
       }
     }, 150);
     return () => clearTimeout(timer);
-  }, [settingsOpen, checklistVisible, activeBrowserScope]);
+  }, [settingsOpen, activeBrowserScope]);
 
   // OS notification handling for AI attention events
   useEffect(() => {
@@ -269,6 +273,25 @@ function App() {
     return () => { unsub(); };
   }, [config]);
 
+  const clearProjectBrowserLastUrl = useCallback((projectId: number) => {
+    setConfig((prev) => {
+      if (!prev) return prev;
+      const target = prev.projects.find((project) => project.id === projectId);
+      if (!target) return prev;
+      const rootPath = target.repoRoot ?? target.path;
+      let changed = false;
+      const projects = prev.projects.map((project) => {
+        const projectRoot = project.repoRoot ?? project.path;
+        const sameFamily = project.id === projectId || project.path === rootPath || projectRoot === rootPath;
+        if (!sameFamily || !project.browserLastUrl) return project;
+        changed = true;
+        const { browserLastUrl: _browserLastUrl, ...rest } = project;
+        return rest;
+      });
+      return changed ? { ...prev, projects } : prev;
+    });
+  }, []);
+
   const activateTerminal = useCallback((id: number) => {
     setActiveTerminalId(id);
     setFileEditorOpen(false);
@@ -288,6 +311,7 @@ function App() {
       setActiveAcpChat({ chatId, projectId });
       setFileEditorOpen(false);
       setActiveTab(LeftSidebarTabEnum.TerminalManager);
+      setConfig((prev) => prev ? withTerminalManagerOpened(prev) : prev);
     }
   }, [activeAcpChatByProject]);
 
@@ -668,6 +692,7 @@ function App() {
     setFileEditorOpen(false);
     // Reveal Terminal Manager with Foreground filter and expand root project
     setActiveTab(LeftSidebarTabEnum.TerminalManager);
+    setConfig((prev) => prev ? withTerminalManagerOpened(prev) : prev);
   }, [config]);
 
   const closeAcpChat = useCallback(() => {
@@ -785,69 +810,80 @@ function App() {
     }
   }, [activeTerminals, activeTerminalId, activeAcpChat, settingsOpen, checklistVisible]);
 
+  const leftSidebarVisible = Boolean(config?.ui.showProjectExplorer && config.ui.projectExplorerExpanded);
+  const openLeftSidebarTab = useCallback((tab: LeftSidebarTab) => {
+    setActiveTab(tab);
+    setConfig((prev) => prev ? withLeftSidebarRailToggle(prev, tab) : prev);
+  }, []);
+
   return (
     <div className="app-container">
       <div className="activity-rail">
         <button
-          className={`rail-btn ${activeTab === LeftSidebarTabEnum.Directory ? 'active' : ''}`}
-          onClick={() => setActiveTab(LeftSidebarTabEnum.Directory)}
-          title="Project Explorer"
+          className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.Directory) ? 'active' : ''}`}
+          onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.Directory)}
+          title={activityRailItem('directory').title}
+          aria-label={activityRailItem('directory').title}
         >
-          Explorer
+          <span className="rail-icon">{activityRailItem('directory').icon}</span>
         </button>
         <button
-          className={`rail-btn ${activeTab === LeftSidebarTabEnum.TerminalManager ? 'active' : ''}`}
-          onClick={() => {
-            setActiveTab(LeftSidebarTabEnum.TerminalManager);
-            setConfig((prev) => prev ? withTerminalManagerOpened(prev) : prev);
-          }}
-          title="Terminal Manager"
+          className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.TerminalManager) ? 'active' : ''}`}
+          onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.TerminalManager)}
+          title={activityRailItem('terminalManager').title}
+          aria-label={activityRailItem('terminalManager').title}
         >
-          Terminals
+          <span className="rail-icon terminal">{activityRailItem('terminalManager').icon}</span>
         </button>
         <button
-          className={`rail-btn ${activeTab === LeftSidebarTabEnum.SourceControl ? 'active' : ''}`}
-          onClick={() => setActiveTab(LeftSidebarTabEnum.SourceControl)}
-          title="Source Control"
+          className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.SourceControl) ? 'active' : ''}`}
+          onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.SourceControl)}
+          title={activityRailItem('sourceControl').title}
+          aria-label={activityRailItem('sourceControl').title}
         >
-          Git
+          <span className="rail-icon">{activityRailItem('sourceControl').icon}</span>
         </button>
         <button
-          className={`rail-btn ${activeTab === LeftSidebarTabEnum.InputHistory ? 'active' : ''}`}
-          onClick={() => setActiveTab(LeftSidebarTabEnum.InputHistory)}
-          title="Input History"
+          className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.InputHistory) ? 'active' : ''}`}
+          onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.InputHistory)}
+          title={activityRailItem('inputHistory').title}
+          aria-label={activityRailItem('inputHistory').title}
         >
-          History
+          <span className="rail-icon">{activityRailItem('inputHistory').icon}</span>
         </button>
         <div style={{ flex: 1 }} />
         <button
           className={`rail-btn ${isBrowserOpen ? 'active' : ''}`}
           onClick={toggleBrowser}
-          title="Browser"
+          title={activityRailItem('browser').title}
+          aria-label={activityRailItem('browser').title}
         >
-          Web
+          <span className="rail-icon">{activityRailItem('browser').icon}</span>
         </button>
         <button
           className={`rail-btn ${checklistVisible ? 'active' : ''}`}
           onClick={() => setChecklistVisible((v) => !v)}
-          title="Checklist"
+          title={activityRailItem('checklist').title}
+          aria-label={activityRailItem('checklist').title}
         >
-          Check
+          <span className="rail-icon">{activityRailItem('checklist').icon}</span>
         </button>
         <button
           className={`rail-btn ${settingsOpen ? 'active' : ''}`}
           onClick={() => setSettingsOpen(true)}
-          title="Settings"
+          title={activityRailItem('settings').title}
+          aria-label={activityRailItem('settings').title}
         >
-          ⚙
+          <span className="rail-icon">{activityRailItem('settings').icon}</span>
         </button>
       </div>
 
-      <div
-        ref={sidebarRef}
-        className="sidebar"
-        style={{ width: sidebarWidth, minWidth: 200, maxWidth: 500, display: 'flex', flexDirection: 'column', overflow: 'hidden', borderRight: '1px solid #222' }}
-      >
+      {leftSidebarVisible && (
+        <div
+          ref={sidebarRef}
+          className="sidebar"
+          style={{ width: sidebarWidth, minWidth: 200, maxWidth: 500, display: 'flex', flexDirection: 'column', overflow: 'hidden', borderRight: '1px solid #222' }}
+        >
         {activeTab === LeftSidebarTabEnum.Directory && selectedProject && (
           <ProjectExplorer
             project={selectedProject}
@@ -931,6 +967,7 @@ function App() {
               createWorktreeRequestSeqRef.current += 1;
               setSelectedProjectId(projectId);
               setActiveTab(LeftSidebarTabEnum.SourceControl);
+              setConfig((prev) => prev ? withLeftSidebarTabOpen(prev, LeftSidebarTabEnum.SourceControl) : prev);
               setCreateWorktreeRequest({ projectId, requestId: createWorktreeRequestSeqRef.current });
             }}
             onOverlayOpenChange={setTerminalManagerOverlayOpen}
@@ -945,6 +982,9 @@ function App() {
         {activeTab === LeftSidebarTabEnum.SourceControl && selectedProject && config && (
           <SourceControl
             project={selectedProject}
+            projects={config.projects}
+            selectedProjectId={selectedProjectId}
+            onSelectProject={setSelectedProjectId}
             registeredWorktreePaths={config.projects
               .filter((p) => p.isWorktree && p.repoRoot === selectedProject.path)
               .map((p) => p.path)}
@@ -1015,17 +1055,20 @@ function App() {
             }}
           />
         )}
-      </div>
+        </div>
+      )}
 
-      <div
-        className="resize-handle"
-        onMouseDown={() => setIsResizing(true)}
-        style={{
-          width: 4,
-          cursor: 'col-resize',
-          background: isResizing ? '#0078d4' : 'transparent',
-        }}
-      />
+      {leftSidebarVisible && (
+        <div
+          className="resize-handle"
+          onMouseDown={() => setIsResizing(true)}
+          style={{
+            width: 4,
+            cursor: 'col-resize',
+            background: isResizing ? '#0078d4' : 'transparent',
+          }}
+        />
+      )}
 
       <div className="main-area" ref={mainRef}>
         {activeAcpChat && acpProject ? (
@@ -1080,7 +1123,6 @@ function App() {
               activeTerminalId={activeTerminalId}
               visibleScopeOverride={browserPanelVisibleScopeByProject.get(selectedProjectId) ?? undefined}
               onClose={toggleBrowser}
-              hidden={settingsOpen || checklistVisible}
               tabsByScope={browserTabsByScope}
               activeTabByScope={browserActiveTabByScope}
               urlDraftByScope={browserUrlDraftByScope}
@@ -1089,7 +1131,10 @@ function App() {
               onActiveTabChange={setBrowserActiveTabByScope}
               onUrlDraftChange={setBrowserUrlDraftByScope}
               onDesignInspectChange={setBrowserDesignInspectByScope}
+              onClearProjectBrowserLastUrl={clearProjectBrowserLastUrl}
+              hidden={settingsOpen}
               onScopeEmpty={(scope) => {
+                setBrowserOpenProjects((prev) => browserProjectIdsAfterScopeEmpty(prev, scope));
                 if (scope.type === BrowserScopeKeyType.Terminal) {
                   setBrowserPanelVisibleScopeByProject((prev) => {
                     const override = prev.get(selectedProjectId);
@@ -1110,6 +1155,7 @@ function App() {
       {checklistVisible && config && (
         <Checklist
           projects={config.projects}
+          rightOffset={checklistRightOffset(isBrowserOpen && !settingsOpen, browserPanelWidth)}
           onRemoveItem={(projectId, index) => {
             const newProjects = config.projects.map((p) => {
               if (p.id === projectId) {

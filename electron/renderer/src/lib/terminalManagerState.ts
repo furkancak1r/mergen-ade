@@ -29,6 +29,8 @@ export function withTerminalManagerOpened(config: AppConfig): AppConfig {
   if (
     config.ui.leftSidebarTab === LeftSidebarTab.TerminalManager
     && config.ui.terminalManagerFilter === TerminalManagerFilterEnum.Foreground
+    && config.ui.showProjectExplorer
+    && config.ui.projectExplorerExpanded
   ) {
     return config;
   }
@@ -37,6 +39,8 @@ export function withTerminalManagerOpened(config: AppConfig): AppConfig {
     ...config,
     ui: {
       ...config.ui,
+      showProjectExplorer: true,
+      projectExplorerExpanded: true,
       leftSidebarTab: LeftSidebarTab.TerminalManager,
       terminalManagerFilter: TerminalManagerFilterEnum.Foreground,
     },

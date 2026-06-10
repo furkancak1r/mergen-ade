@@ -21,6 +21,14 @@ export interface InputHistoryResult {
   totalMatching: number;
 }
 
+export function inputHistoryEmptyMessage(hasSearchQuery: boolean): string {
+  return hasSearchQuery ? 'No matching entries' : 'No history entries for this project yet';
+}
+
+export function inputHistoryCountLabel(totalMatching: number): string {
+  return `${totalMatching} entries`;
+}
+
 export function inputHistoryFilterMatchesKind(filter: InputHistoryFilter, kind: TerminalKind): boolean {
   if (filter === InputHistoryFilterEnum.Foreground) return kind === TerminalKindEnum.Foreground;
   if (filter === InputHistoryFilterEnum.Background) return kind === TerminalKindEnum.Background;

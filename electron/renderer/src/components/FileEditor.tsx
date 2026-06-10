@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { cappedHoverText } from '../lib/mojibake';
+import { selectedTextFromRange } from '../lib/fileEditor';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).mergenApi;
 
@@ -16,9 +17,11 @@ export const FileEditor: React.FC<FileEditorProps> = ({ filePath, displayName, o
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectionDragActive, setSelectionDragActive] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; selectedText: string | null; selectionStart: number; selectionEnd: number } | null>(null);
   const [visibleRows, setVisibleRows] = useState(25);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const secondaryClickSelectionRef = useRef<{ start: number; end: number } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -100,8 +103,8 @@ export const FileEditor: React.FC<FileEditorProps> = ({ filePath, displayName, o
     if (!ta) return;
     const start = ta.selectionStart;
     const end = ta.selectionEnd;
-    if (start === end) return;
-    const selected = text.slice(start, end);
+    const selected = selectedTextFromRange(text, start, end);
+    if (!selected) return;
     navigator.clipboard.writeText(selected).catch(() => {});
   }, [text]);
 
@@ -112,8 +115,8 @@ export const FileEditor: React.FC<FileEditorProps> = ({ filePath, displayName, o
     const handleCopyEvent = (e: ClipboardEvent) => {
       const start = ta.selectionStart;
       const end = ta.selectionEnd;
-      if (start === end) return;
-      const selected = text.slice(start, end);
+      const selected = selectedTextFromRange(text, start, end);
+      if (!selected) return;
       e.clipboardData?.setData('text/plain', selected);
       e.preventDefault();
     };
@@ -121,56 +124,54 @@ export const FileEditor: React.FC<FileEditorProps> = ({ filePath, displayName, o
     return () => ta.removeEventListener('copy', handleCopyEvent);
   }, [text]);
 
-  // Context menu handler
+  useEffect(() => {
+    if (!contextMenu) return undefined;
+
+    const closeMenu = () => {
+      setContextMenu(null);
+      secondaryClickSelectionRef.current = null;
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu();
+    };
+    window.addEventListener('click', closeMenu);
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      window.removeEventListener('click', closeMenu);
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [contextMenu]);
+
+  const handleMouseDown = useCallback((event: React.MouseEvent<HTMLTextAreaElement>) => {
+    const ta = textareaRef.current;
+    if (event.button === 2) {
+      if (ta && selectedTextFromRange(text, ta.selectionStart, ta.selectionEnd)) {
+        secondaryClickSelectionRef.current = { start: ta.selectionStart, end: ta.selectionEnd };
+      } else {
+        secondaryClickSelectionRef.current = null;
+      }
+      return;
+    }
+    setSelectionDragActive(true);
+  }, [text]);
+
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
-    // Simple context menu: copy/paste
-    const menu = document.createElement('div');
-    menu.style.cssText = 'position:fixed;z-index:1000;background:#1a1a1a;border:1px solid #333;border-radius:4px;padding:4px 0;font-size:12px;color:#ccc;';
-    menu.style.left = `${e.clientX}px`;
-    menu.style.top = `${e.clientY}px`;
-
-    const copyBtn = document.createElement('button');
-    copyBtn.textContent = 'Copy';
-    copyBtn.style.cssText = 'display:block;width:100%;text-align:left;padding:4px 12px;background:transparent;border:none;color:#ccc;cursor:pointer;font-size:12px;';
-    copyBtn.onmouseenter = () => { copyBtn.style.background = '#333'; };
-    copyBtn.onmouseleave = () => { copyBtn.style.background = 'transparent'; };
-    copyBtn.onclick = () => {
-      handleCopy();
-      menu.remove();
-    };
-    menu.appendChild(copyBtn);
-
-    const pasteBtn = document.createElement('button');
-    pasteBtn.textContent = 'Paste';
-    pasteBtn.style.cssText = 'display:block;width:100%;text-align:left;padding:4px 12px;background:transparent;border:none;color:#ccc;cursor:pointer;font-size:12px;';
-    pasteBtn.onmouseenter = () => { pasteBtn.style.background = '#333'; };
-    pasteBtn.onmouseleave = () => { pasteBtn.style.background = 'transparent'; };
-    pasteBtn.onclick = async () => {
-      try {
-        const clip = await navigator.clipboard.readText();
-        const ta = textareaRef.current;
-        if (!ta) return;
-        const start = ta.selectionStart;
-        const end = ta.selectionEnd;
-        const newText = text.slice(0, start) + clip + text.slice(end);
-        setText(newText);
-        requestAnimationFrame(() => {
-          ta.selectionStart = ta.selectionEnd = start + clip.length;
-        });
-      } catch {
-        // ignore
-      }
-      menu.remove();
-    };
-    menu.appendChild(pasteBtn);
-
-    document.body.appendChild(menu);
-    const close = () => { menu.remove(); document.removeEventListener('click', close); };
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const stored = secondaryClickSelectionRef.current;
+    const selectionStart = stored?.start ?? ta.selectionStart;
+    const selectionEnd = stored?.end ?? ta.selectionEnd;
+    const selectedText = selectedTextFromRange(text, selectionStart, selectionEnd);
+    setContextMenu({ x: e.clientX, y: e.clientY, selectedText, selectionStart, selectionEnd });
     requestAnimationFrame(() => {
-      document.addEventListener('click', close);
+      if (selectedText && textareaRef.current) {
+        textareaRef.current.focus();
+        textareaRef.current.selectionStart = selectionStart;
+        textareaRef.current.selectionEnd = selectionEnd;
+      }
     });
-  }, [handleCopy, text]);
+  }, [text]);
 
   // Drag selection edge autoscroll with document-level tracking
   useEffect(() => {
@@ -215,37 +216,18 @@ export const FileEditor: React.FC<FileEditorProps> = ({ filePath, displayName, o
         </span>
         <div style={{ display: 'flex', gap: 8 }}>
           <button
+            className={`file-editor-toolbar-btn ${isDirty ? '' : 'muted'}`}
             onClick={save}
             disabled={!isDirty}
-            title="Save (Ctrl+S)"
-            style={{
-              padding: '4px 12px',
-              fontSize: 11,
-              background: isDirty ? '#1f3a4c' : '#1a1a1a',
-              border: '1px solid #333',
-              color: '#ccc',
-              borderRadius: 3,
-              cursor: isDirty ? 'pointer' : 'not-allowed',
-            }}
+            title={isDirty ? 'Save File (Ctrl+S)' : 'No unsaved changes'}
           >
-            Save
+            ✓
           </button>
           {onClose && (
             <button
+              className="file-editor-toolbar-btn"
               onClick={onClose}
-              title="Close"
-              style={{
-                background: 'transparent',
-                border: 'none',
-                color: '#888',
-                cursor: 'pointer',
-                fontSize: 14,
-                width: 24,
-                height: 24,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-              }}
+              title="Close Editor"
             >
               ✕
             </button>
@@ -266,7 +248,7 @@ export const FileEditor: React.FC<FileEditorProps> = ({ filePath, displayName, o
             value={text}
             rows={Math.max(visibleRows, text.split('\n').length)}
             onChange={(e) => setText(e.target.value)}
-            onMouseDown={() => setSelectionDragActive(true)}
+            onMouseDown={handleMouseDown}
             onKeyDown={(e) => {
               if (e.ctrlKey && e.key === 's') {
                 e.preventDefault();
@@ -298,6 +280,34 @@ export const FileEditor: React.FC<FileEditorProps> = ({ filePath, displayName, o
           />
         )}
       </div>
+      {contextMenu && (
+        <div
+          className="file-editor-context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            disabled={!contextMenu.selectedText}
+            onClick={() => {
+              if (!contextMenu.selectedText) return;
+              navigator.clipboard.writeText(contextMenu.selectedText).catch(() => {});
+              setContextMenu(null);
+              secondaryClickSelectionRef.current = null;
+              requestAnimationFrame(() => {
+                if (textareaRef.current) {
+                  textareaRef.current.focus();
+                  textareaRef.current.selectionStart = contextMenu.selectionStart;
+                  textareaRef.current.selectionEnd = contextMenu.selectionEnd;
+                }
+              });
+            }}
+          >
+            Copy
+          </button>
+        </div>
+      )}
     </div>
   );
 };

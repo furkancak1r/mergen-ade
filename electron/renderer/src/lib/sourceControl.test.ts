@@ -4,6 +4,7 @@ import {
   parseSourceControlStatusLine,
   sourceControlFileAbsolutePath,
   sourceControlBranchLine,
+  sourceControlSnapshotHasDisplayData,
   sourceControlStatusLabel,
   sourceControlWorktreeLabel,
 } from '../../../shared/sourceControl';
@@ -29,6 +30,14 @@ describe('sourceControl helpers', () => {
     expect(sourceControlBranchLine({ branch: 'main', ahead: 2, behind: 1 })).toBe('main  ahead:2 behind:1');
     expect(sourceControlBranchLine({ branch: 'main', ahead: 0, behind: 0 })).toBe('main');
     expect(sourceControlBranchLine({ branch: '' })).toBeUndefined();
+  });
+
+  it('detects source control display data like the Rust panel', () => {
+    expect(sourceControlSnapshotHasDisplayData({ files: [] })).toBe(false);
+    expect(sourceControlSnapshotHasDisplayData({ branch: 'main', files: [] })).toBe(true);
+    expect(sourceControlSnapshotHasDisplayData({ ahead: 1, files: [] })).toBe(true);
+    expect(sourceControlSnapshotHasDisplayData({ behind: 1, files: [] })).toBe(true);
+    expect(sourceControlSnapshotHasDisplayData({ files: [{ path: 'src/app.ts', status: 'Modified', staged: false }] })).toBe(true);
   });
 
   it('parses renamed status lines using the new path', () => {

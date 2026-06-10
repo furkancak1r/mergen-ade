@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useCallback } from 'react';
 import { BrowserScopeKeyType } from '../../../shared/types';
 import type { BrowserScopeKey, ProjectRecord, BrowserTab } from '../../../shared/types';
 import { normalizeBrowserUrl } from '../lib/urlNormalize';
+import { browserToolbarCanClearUrl, clearBrowserActiveTabUrl } from '../lib/browserToolbar';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -20,6 +21,7 @@ interface BrowserPanelProps {
   onUrlDraftChange: React.Dispatch<React.SetStateAction<Map<string, string>>>;
   onDesignInspectChange: React.Dispatch<React.SetStateAction<Map<string, boolean>>>;
   onScopeEmpty?: (scope: BrowserScopeKey) => void;
+  onClearProjectBrowserLastUrl?: (projectId: number) => void;
 }
 
 function scopeKeyString(scope: BrowserScopeKey): string {
@@ -98,6 +100,7 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
   onUrlDraftChange,
   onDesignInspectChange,
   onScopeEmpty,
+  onClearProjectBrowserLastUrl,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const hasAutoCreatedRef = useRef(false);
@@ -112,6 +115,8 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
   const activeTabId = activeTabByScope.get(scopeKey) ?? null;
   const urlDraft = urlDraftByScope.get(scopeKey) ?? '';
   const designInspect = designInspectByScope.get(scopeKey) ?? false;
+  const activeTab = tabs.find((tab) => tab.id === activeTabId);
+  const canClearUrl = browserToolbarCanClearUrl(urlDraft, activeTab);
 
   const setTabs = useCallback((next: BrowserTab[] | ((prev: BrowserTab[]) => BrowserTab[])) => {
     onTabsChange((prev) => {
@@ -267,6 +272,18 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
     }
   }, [scope, urlDraft, setUrlDraft]);
 
+  const refresh = useCallback(() => {
+    api.invoke('browser:reload', scope);
+  }, [scope]);
+
+  const clearUrl = useCallback(() => {
+    setUrlDraft('');
+    setTabs((prev) => clearBrowserActiveTabUrl(prev, activeTabId));
+    if (scope.type === BrowserScopeKeyType.Project) {
+      onClearProjectBrowserLastUrl?.(scope.projectId);
+    }
+  }, [activeTabId, scope, setTabs, setUrlDraft, onClearProjectBrowserLastUrl]);
+
   const toggleDesignInspect = useCallback(() => {
     const next = !designInspect;
     setDesignInspect(next);
@@ -324,6 +341,9 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
       </div>
 
       <div style={{ display: 'flex', gap: 4, padding: '4px 8px', borderBottom: '1px solid #222', alignItems: 'center' }}>
+        <TooltipAbove text="Refresh">
+          <button onClick={refresh} className="browser-toolbar-btn" type="button">↻</button>
+        </TooltipAbove>
         <input
           value={urlDraft}
           onChange={(e) => setUrlDraft(e.target.value)}
@@ -332,10 +352,13 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
           style={{ flex: 1, background: '#1a1a1a', border: '1px solid #333', borderRadius: 4, padding: '4px 8px', color: '#ccc', fontSize: 12, outline: 'none', minWidth: 100 }}
         />
         <TooltipAbove text="Navigate to URL">
-          <button onClick={go} style={{ background: 'transparent', border: '1px solid #333', color: '#ccc', cursor: 'pointer', fontSize: 10, padding: '2px 6px', borderRadius: 3 }}>Go</button>
+          <button onClick={go} className="browser-toolbar-btn text" type="button">Go</button>
+        </TooltipAbove>
+        <TooltipAbove text="Clear URL">
+          <button onClick={clearUrl} className="browser-toolbar-btn" type="button" disabled={!canClearUrl}>×</button>
         </TooltipAbove>
         <TooltipAbove text={designInspect ? 'Disable Design Inspect' : 'Enable Design Inspect'}>
-          <button onClick={toggleDesignInspect} style={{ background: designInspect ? '#1f3a4c' : 'transparent', border: '1px solid #333', color: '#ccc', cursor: 'pointer', fontSize: 10, padding: '2px 6px', borderRadius: 3 }}>
+          <button onClick={toggleDesignInspect} className={`browser-toolbar-btn text ${designInspect ? 'active' : ''}`} type="button">
             Inspect
           </button>
         </TooltipAbove>

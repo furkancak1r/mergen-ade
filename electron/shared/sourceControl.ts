@@ -1,4 +1,4 @@
-import type { GitWorktreeInfo, SourceControlFile } from './types';
+import type { GitWorktreeInfo, SourceControlFile, SourceControlSnapshot } from './types';
 
 export interface BranchStatus {
   branch: string;
@@ -46,6 +46,13 @@ export function sourceControlBranchLine(status: Partial<BranchStatus>): string |
     return `${status.branch}  ahead:${ahead} behind:${behind}`;
   }
   return status.branch;
+}
+
+export function sourceControlSnapshotHasDisplayData(snapshot: Pick<SourceControlSnapshot, 'branch' | 'ahead' | 'behind' | 'files'>): boolean {
+  return Boolean(snapshot.branch)
+    || (snapshot.ahead ?? 0) > 0
+    || (snapshot.behind ?? 0) > 0
+    || snapshot.files.length > 0;
 }
 
 export function sourceControlStatusLabel(statusCode: string): string {
