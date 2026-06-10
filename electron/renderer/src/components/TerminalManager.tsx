@@ -16,9 +16,10 @@ interface TerminalManagerProps {
   terminals: TerminalInstance[];
   activeTerminalId: number | null;
   onActivateTerminal: (id: number) => void;
-  onSpawnTerminal: (projectId: number, kind: TerminalKind) => void;
+  onSpawnTerminal: (projectId: number, kind: TerminalKind) => Promise<number>;
   onKillTerminal: (id: number) => void;
   rerunBackground: (terminalId: number) => void;
+  sendSavedMessageToTerminal?: (terminalId: number, message: string, recordRecentInput: boolean) => void;
   onRemoveForegroundMessage?: (projectId: number, message: string) => void;
   onAddForegroundMessage?: (projectId: number, message: string) => void;
   onUpdateForegroundMessage?: (projectId: number, index: number, message: string) => void;
@@ -36,6 +37,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onSpawnTerminal,
   onKillTerminal,
   rerunBackground,
+  sendSavedMessageToTerminal,
   onRemoveForegroundMessage,
   onAddForegroundMessage,
   onUpdateForegroundMessage,
@@ -87,16 +89,14 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
       target = terminals.find((t) => t.projectId === projectId && t.kind === kind);
     }
     if (!target) return;
-    // Use bracketed paste for safe delivery + delayed confirmation Enter
-    await api.invoke('pty:write', target.id, '\x1b[200~' + message + '\x1b[201~');
-    await api.invoke('pty:write', target.id, '\r');
-    // Saved messages use single confirmation Enter after 1000ms
-    setTimeout(() => api.invoke('pty:write', target.id, '\r'), 1000);
+    // Use the centralized saved message delivery which handles bracketed paste,
+    // recent input tracking, and correct confirmation Enter scheduling.
+    sendSavedMessageToTerminal?.(target.id, message, kind === TerminalKindEnum.Background);
     // Foreground saved messages are send-and-remove
     if (kind === TerminalKindEnum.Foreground) {
       onRemoveForegroundMessage?.(projectId, message);
     }
-  }, [terminals, activeTerminalId, onRemoveForegroundMessage]);
+  }, [terminals, activeTerminalId, sendSavedMessageToTerminal, onRemoveForegroundMessage]);
 
   // Group projects: root projects first, then their worktrees
   const rootProjects = config.projects.filter((p) => !p.isWorktree);
@@ -385,7 +385,7 @@ interface ProjectGroupProps {
   onToggle: () => void;
   activeTerminalId: number | null;
   onActivate: (id: number) => void;
-  onSpawn: (projectId: number, kind: TerminalKind) => void;
+  onSpawn: (projectId: number, kind: TerminalKind) => Promise<number>;
   onKill: (id: number) => void;
   showSavedMessages: number | null;
   setShowSavedMessages: (id: number | null) => void;
@@ -540,23 +540,18 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                               kimiStrictPermissions: config.opencode.kimiStrictPermissions,
                             });
                           }
-                          onSpawn(project.id, TerminalKindEnum.Foreground);
-                          // Send launch command after a short delay to allow terminal to spawn
-                          setTimeout(async () => {
-                            const projectTerminals = terminals.filter((t) => t.projectId === project.id && t.kind === TerminalKindEnum.Foreground);
-                            const target = projectTerminals[projectTerminals.length - 1];
-                            if (target) {
-                              const isSlash = cmd.startsWith('/');
-                              await api.invoke('pty:write', target.id, '\x1b[200~' + cmd + '\x1b[201~');
-                              await api.invoke('pty:write', target.id, '\r');
-                              if (isSlash) {
-                                setTimeout(() => api.invoke('pty:write', target.id, '\r'), 600);
-                                setTimeout(() => api.invoke('pty:write', target.id, '\r'), 1200);
-                              } else {
-                                setTimeout(() => api.invoke('pty:write', target.id, '\r'), 1200);
-                              }
+                          const targetId = await onSpawn(project.id, TerminalKindEnum.Foreground);
+                          if (targetId) {
+                            const isSlash = cmd.startsWith('/');
+                            await api.invoke('pty:write', targetId, '\x1b[200~' + cmd + '\x1b[201~');
+                            await api.invoke('pty:write', targetId, '\r');
+                            if (isSlash) {
+                              setTimeout(() => api.invoke('pty:write', targetId, '\r'), 600);
+                              setTimeout(() => api.invoke('pty:write', targetId, '\r'), 1200);
+                            } else {
+                              setTimeout(() => api.invoke('pty:write', targetId, '\r'), 1200);
                             }
-                          }, 300);
+                          }
                         }}
                         style={{ display: 'block', width: '100%', textAlign: 'left', padding: '4px 8px', fontSize: 11, background: 'transparent', border: 'none', color: '#ccc', cursor: 'pointer' }}
                         title={l.displayName + (l.launchCommand ? ' — ' + l.launchCommand : '')}

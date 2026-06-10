@@ -58,6 +58,7 @@ function App() {
   const [browserDesignInspectByScope, setBrowserDesignInspectByScope] = useState<Map<string, boolean>>(new Map());
 
   const pty = usePty();
+  const suppressAcpRestoreRef = useRef(false);
 
   useEffect(() => {
     api.invoke('config:load').then((cfg) => {
@@ -210,6 +211,7 @@ function App() {
     setActiveTerminalId(id);
     setFileEditorOpen(false);
     setActiveAcpChat(null);
+    suppressAcpRestoreRef.current = true;
     const t = terminals.find((x) => x.id === id);
     if (t) {
       setSelectedProjectId(t.projectId);
@@ -228,6 +230,10 @@ function App() {
   // Restore ACP chat when switching to a project that has an active chat
   useEffect(() => {
     if (!selectedProjectId) return;
+    if (suppressAcpRestoreRef.current) {
+      suppressAcpRestoreRef.current = false;
+      return;
+    }
     const chatId = activeAcpChatByProject.get(selectedProjectId);
     if (chatId) {
       setActiveAcpChat({ chatId, projectId: selectedProjectId });
@@ -446,8 +452,8 @@ function App() {
     }
   }, [activeTerminalId, selectedProjectId, terminals, browserTabsByScope]);
 
-  const spawnTerminal = useCallback(async (projectId: number, kind: TerminalKind) => {
-    if (!config) return;
+  const spawnTerminal = useCallback(async (projectId: number, kind: TerminalKind): Promise<number> => {
+    if (!config) return 0;
     const project = config.projects.find((p) => p.id === projectId);
     const cwd = project?.path ?? process.cwd();
     const id = await pty.createTerminal({
@@ -459,6 +465,7 @@ function App() {
       kind,
     });
     setActiveTerminalId(id);
+    return id;
   }, [config, pty]);
 
   const killTerminal = useCallback((id: number) => {
@@ -723,6 +730,7 @@ function App() {
             onSpawnTerminal={spawnTerminal}
             onKillTerminal={killTerminal}
             rerunBackground={pty.rerunBackground}
+            sendSavedMessageToTerminal={pty.sendSavedMessageToTerminal}
             onRemoveForegroundMessage={(projectId, message) => {
               if (!config) return;
               const newProjects = config.projects.map((p) => {

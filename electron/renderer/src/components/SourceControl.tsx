@@ -367,7 +367,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
                   setCreateLoading(true);
                   const slug = sanitizeWorktreeSlug(createBranch);
                   const parentDir = project.path.replace(/[\\/][^\\/]+$/, '');
-                  const wtPath = `${parentDir}\\worktrees\\${slug}`;
+                  const wtPath = parentDir + '/' + 'worktrees/' + slug;
                   const ok = await api.invoke('git:createWorktree', project.path, createBranch, wtPath, createBaseBranch || undefined) as boolean;
                   setCreateLoading(false);
                   if (ok) {

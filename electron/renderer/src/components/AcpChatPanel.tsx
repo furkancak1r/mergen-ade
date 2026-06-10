@@ -65,6 +65,10 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     if (disabled) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+        if (modeDropdownOpen) {
+          setModeDropdownOpen(false);
+          return;
+        }
         if (session?.status === 'running' || session?.status === 'permission') {
           e.preventDefault();
           cancelAcp();

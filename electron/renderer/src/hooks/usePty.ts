@@ -241,10 +241,42 @@ export function usePty() {
           t.opencodeLeadingBlankRows = 0;
           t.opencodeManualScrollDetached = false;
         }
-        if (event.eventKind === 'question.asked' && event.rawJson) {
+        if (event.eventKind && event.eventKind.includes('question.asked') && event.rawJson) {
           try {
             const q = JSON.parse(event.rawJson) as { question?: OpenCodeQuestion };
             if (q.question) t.opencodePendingQuestion = q.question;
+          } catch { /* ignore */ }
+        }
+        if (event.eventKind && event.eventKind.includes('permission.asked') && event.rawJson) {
+          try {
+            const p = JSON.parse(event.rawJson) as { permission?: { requestId: string; message: string; options?: string[] } };
+            if (p.permission) {
+              t.opencodePendingQuestion = {
+                header: 'Permission Request',
+                question: p.permission.message,
+                options: (p.permission.options || []).map((o, i) => ({ id: String(i), label: o })),
+                multiple: false,
+                custom: false,
+                requestId: String(p.permission.requestId),
+                sessionId: '',
+              };
+            }
+          } catch { /* ignore */ }
+        }
+        if (event.eventKind && event.eventKind.includes('plan_mode_prompt') && event.rawJson) {
+          try {
+            const pm = JSON.parse(event.rawJson) as { planModePrompt?: { message: string } };
+            if (pm.planModePrompt) {
+              t.opencodePendingQuestion = {
+                header: 'Plan Mode',
+                question: pm.planModePrompt.message,
+                options: [],
+                multiple: false,
+                custom: true,
+                requestId: '',
+                sessionId: '',
+              };
+            }
           } catch { /* ignore */ }
         }
         if (event.status === 'running' || event.status === 'attention') {
@@ -524,6 +556,35 @@ export function usePty() {
     notify();
   }, [notify, pushRecentInput]);
 
+  const sendSavedMessageToTerminal = useCallback((terminalId: number, message: string, recordRecentInput: boolean) => {
+    const t = terminalsRef.current.get(terminalId);
+    if (!t) return;
+    const now = Date.now();
+
+    // Clear previous delayed enters
+    t.pendingDelayedEnters = [];
+
+    // Send with bracketed paste
+    api.invoke('pty:write', terminalId, `\x1b[200~${message}\x1b[201~`);
+    api.invoke('pty:write', terminalId, '\r');
+
+    if (recordRecentInput && message.trim()) {
+      pushRecentInput(terminalId, message);
+    }
+
+    // Schedule delayed confirmation Enters
+    // Slash-prefixed commands get two staggered confirmation Enters (600ms + 1200ms)
+    // Non-slash commands get a single delayed Enter after 1200ms
+    const isSlashCommand = message.trim().startsWith('/');
+    if (isSlashCommand) {
+      t.pendingDelayedEnters.push(now + 600);
+      t.pendingDelayedEnters.push(now + 1200);
+    } else {
+      t.pendingDelayedEnters.push(now + 1200);
+    }
+    notify();
+  }, [notify, pushRecentInput]);
+
   const rerunBackground = useCallback((terminalId: number) => {
     const t = terminalsRef.current.get(terminalId);
     if (!t) return;
@@ -559,6 +620,7 @@ export function usePty() {
     updateQuestionState,
     sendSmartInputToTerminal,
     sendShortcutToTerminal,
+    sendSavedMessageToTerminal,
     rerunBackground,
   };
 }
