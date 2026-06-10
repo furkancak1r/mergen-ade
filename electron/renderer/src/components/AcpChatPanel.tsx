@@ -189,9 +189,20 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   const resolvedConfig = config ?? defaultAppConfig();
   const favoriteModels = resolvedConfig.opencode.acpFavoriteModels;
-  const filteredModelOptions = modelOptions && favoriteModels.length > 0
-    ? { ...modelOptions, options: modelOptions.options.filter((o) => favoriteModels.includes(o.value)) }
-    : modelOptions;
+  const knownModels = resolvedConfig.opencode.acpKnownModels;
+
+  // Fallback to known models from config when ACP server hasn't sent options yet
+  const effectiveModelOptions = modelOptions || {
+    id: 'model',
+    name: 'Model',
+    category: 'model',
+    currentValue: session?.currentModel || '',
+    options: knownModels.map((m) => ({ value: m.value, label: m.name || m.value })),
+  };
+
+  const filteredModelOptions = effectiveModelOptions && favoriteModels.length > 0
+    ? { ...effectiveModelOptions, options: effectiveModelOptions.options.filter((o) => favoriteModels.includes(o.value)) }
+    : effectiveModelOptions;
 
   const setModel = (value: string) => {
     api.invoke('acp:setConfigOption', { chatId, configId: 'model', value });
@@ -428,7 +439,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
                     ))}
                   </div>
                 )}
-                {!modelOptions && !effortOptions && (
+                {(!filteredModelOptions || filteredModelOptions.options.length === 0) && !effortOptions && (
                   <div style={{ fontSize: 11, color: '#888' }}>No model options available.</div>
                 )}
               </div>

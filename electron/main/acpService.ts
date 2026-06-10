@@ -3,8 +3,8 @@ import path from 'path';
 import fs from 'fs';
 import { BrowserWindow } from 'electron';
 import type { AcpChatSession, AcpConfigOption, AcpAvailableCommand, AcpChatMessage, OpenCodeModelConfig } from '../shared/types';
-import { activeBuildModel, effectivePlanModel, effectivePlanEffort } from '../shared/types';
-import { loadConfig } from './config';
+import { activeBuildModel, effectivePlanModel, effectivePlanEffort, mergeAcpKnownModels } from '../shared/types';
+import { loadConfig, saveConfig } from './config';
 import { getOpencodeBinPath } from './opencode';
 
 function buildAcpPromptText(text: string, attachments: string[]): string {
@@ -220,8 +220,19 @@ function handleAcpLine(session: AcpSession, line: string): void {
           if (modelOpt) session.currentModel = modelOpt.currentValue;
           const effortOpt = session.configOptions.find((o) => o.id === 'effort');
           if (effortOpt) session.currentEffort = effortOpt.currentValue;
+          // Update known models from server options
+          const modelOptions = session.configOptions.find((o) => o.id === 'model');
+          if (modelOptions) {
+            const config = loadConfig();
+            const entries = modelOptions.options.map((o) => [o.value, o.label || o.value] as [string, string]);
+            const changed = mergeAcpKnownModels(config.opencode, entries);
+            if (changed) saveConfig(config);
+          }
           broadcast('acp:event', session.chatId, { type: 'configOptions', options: session.configOptions });
         }
+        // Apply mode/model binding from Mergen config on session start
+        const effectiveMode = session.currentModeId || 'build';
+        applyModeModelBinding(session, effectiveMode);
         updateAcpStandbyStatus(session.chatId, 'idle', session.sessionId);
         broadcast('acp:event', session.chatId, { type: 'sessionCreated', sessionId: session.sessionId });
         // Flush any prompts queued while starting
@@ -330,6 +341,14 @@ function handleAcpLine(session: AcpSession, line: string): void {
             if (modelOpt) session.currentModel = modelOpt.currentValue;
             const effortOpt = optionsRaw.find((o) => o.id === 'effort');
             if (effortOpt) session.currentEffort = effortOpt.currentValue;
+            // Update known models from server options
+            const modelOptions = optionsRaw.find((o) => o.id === 'model');
+            if (modelOptions) {
+              const config = loadConfig();
+              const entries = modelOptions.options.map((o) => [o.value, o.label || o.value] as [string, string]);
+              const changed = mergeAcpKnownModels(config.opencode, entries);
+              if (changed) saveConfig(config);
+            }
           } else {
             // Legacy fallback: single field format
             const category = (update.category as string) || '';
