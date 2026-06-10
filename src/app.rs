@@ -4779,7 +4779,14 @@ struct AiBadgeModel {
 impl AiBadgeModel {
     fn from_terminal(terminal: &TerminalEntry) -> Self {
         let tool = terminal.ai_session.tool;
-        let status = terminal.ai_session.status;
+        let status = if tool == Some(AiCliTool::Claude)
+            && terminal.claude_launch_pending_since.is_some()
+            && terminal.ai_session.status == AiCliStatus::Inactive
+        {
+            AiCliStatus::Running
+        } else {
+            terminal.ai_session.status
+        };
         let tooltip_lines = ai_badge_tooltip_lines(
             tool,
             status,
@@ -7568,10 +7575,7 @@ impl AdeApp {
             }
 
             let launch_command = if launcher.builtin == Some(BuiltinLauncherKind::Claude) {
-                Self::sanitized_claude_launch_command(
-                    shell,
-                    launcher.bypass_permissions_effective(),
-                )
+                Self::sanitized_claude_launch_command(shell, &launcher.launch_command)
             } else {
                 launcher.launch_command.clone()
             };
@@ -7583,6 +7587,11 @@ impl AdeApp {
                 });
 
             if sent {
+                if launcher.builtin == Some(BuiltinLauncherKind::Claude) {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        Self::set_terminal_title_from_command(terminal, &launcher.launch_command);
+                    }
+                }
                 self.status_line = format!(
                     "Opened {} launcher in {}",
                     launcher.display_name, project.name
@@ -19294,25 +19303,137 @@ impl AdeApp {
         true
     }
 
-    /// Return a sanitized launch command for Claude that bypasses shell
-    /// aliases/wrappers and clears stale Anthropic env vars before invoking
-    /// the real npm-installed `claude.cmd`.
-    fn sanitized_claude_launch_command(shell: ShellKind, _bypass_permissions: bool) -> String {
-        let suffix = " --permission-mode bypassPermissions";
+    /// Return a sanitized launch command for Claude that clears stale Anthropic
+    /// env vars and forces bypass permission mode while preserving the user's
+    /// configured launcher command (for example, a working `cc` alias/wrapper).
+    fn sanitized_claude_launch_command(shell: ShellKind, configured_command: &str) -> String {
+        let command = Self::claude_command_with_bypass_permissions(configured_command);
         match shell {
             ShellKind::PowerShell => {
+                let command = Self::powershell_invocation_command(&command);
                 format!(
-                    "Remove-Item Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY,Env:ANTHROPIC_BASE_URL,Env:ANTHROPIC_MODEL,Env:ANTHROPIC_SMALL_FAST_MODEL,Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:CLAUDE_CODE_SUBAGENT_MODEL -ErrorAction SilentlyContinue; & \"$env:APPDATA\\npm\\claude.cmd\"{suffix}"
+                    "Remove-Item Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY,Env:ANTHROPIC_BASE_URL,Env:ANTHROPIC_MODEL,Env:ANTHROPIC_SMALL_FAST_MODEL,Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:CLAUDE_CODE_SUBAGENT_MODEL -ErrorAction SilentlyContinue; {command}"
                 )
             }
             ShellKind::Cmd => {
                 format!(
-                    "set ANTHROPIC_AUTH_TOKEN= & set ANTHROPIC_API_KEY= & set ANTHROPIC_BASE_URL= & set ANTHROPIC_MODEL= & set ANTHROPIC_SMALL_FAST_MODEL= & set ANTHROPIC_DEFAULT_SONNET_MODEL= & set ANTHROPIC_DEFAULT_HAIKU_MODEL= & set ANTHROPIC_DEFAULT_OPUS_MODEL= & set CLAUDE_CODE_SUBAGENT_MODEL= & \"%APPDATA%\\npm\\claude.cmd\"{suffix}"
+                    "set ANTHROPIC_AUTH_TOKEN= & set ANTHROPIC_API_KEY= & set ANTHROPIC_BASE_URL= & set ANTHROPIC_MODEL= & set ANTHROPIC_SMALL_FAST_MODEL= & set ANTHROPIC_DEFAULT_SONNET_MODEL= & set ANTHROPIC_DEFAULT_HAIKU_MODEL= & set ANTHROPIC_DEFAULT_OPUS_MODEL= & set CLAUDE_CODE_SUBAGENT_MODEL= & {command}"
                 )
             }
-            ShellKind::Zsh => {
-                format!("claude{suffix}")
+            ShellKind::Zsh => command,
+        }
+    }
+
+    fn claude_command_with_bypass_permissions(configured_command: &str) -> String {
+        let trimmed = configured_command.trim();
+        let command = if trimmed.is_empty() {
+            "claude"
+        } else {
+            trimmed
+        };
+
+        if Self::contains_shell_flag(command, "--dangerously-skip-permissions") {
+            return command.to_owned();
+        }
+
+        if let Some(flag_index) = Self::find_shell_flag(command, "--permission-mode") {
+            return Self::replace_or_insert_permission_mode_value(command, flag_index);
+        }
+
+        format!("{command} --permission-mode bypassPermissions")
+    }
+
+    fn replace_or_insert_permission_mode_value(command: &str, flag_index: usize) -> String {
+        let flag_end = flag_index + "--permission-mode".len();
+        let after_flag = &command[flag_end..];
+
+        if after_flag.starts_with('=') {
+            let value_start = flag_end + 1;
+            let value_tail = &command[value_start..];
+            let value_end = value_start
+                + value_tail
+                    .char_indices()
+                    .find_map(|(offset, ch)| ch.is_whitespace().then_some(offset))
+                    .unwrap_or(value_tail.len());
+            return format!(
+                "{}bypassPermissions{}",
+                &command[..value_start],
+                &command[value_end..]
+            );
+        }
+
+        let whitespace_len = after_flag
+            .char_indices()
+            .find_map(|(offset, ch)| (!ch.is_whitespace()).then_some(offset))
+            .unwrap_or(after_flag.len());
+
+        if whitespace_len == 0 || flag_end + whitespace_len >= command.len() {
+            return format!("{command} bypassPermissions");
+        }
+
+        let value_start = flag_end + whitespace_len;
+        let value_tail = &command[value_start..];
+        let value_end = value_start
+            + value_tail
+                .char_indices()
+                .find_map(|(offset, ch)| ch.is_whitespace().then_some(offset))
+                .unwrap_or(value_tail.len());
+
+        format!(
+            "{}bypassPermissions{}",
+            &command[..value_start],
+            &command[value_end..]
+        )
+    }
+
+    fn powershell_invocation_command(command: &str) -> String {
+        let trimmed = command.trim();
+        if trimmed.starts_with('&') || trimmed.starts_with('.') {
+            trimmed.to_owned()
+        } else if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+            format!("& {trimmed}")
+        } else {
+            trimmed.to_owned()
+        }
+    }
+
+    fn contains_shell_flag(command: &str, flag: &str) -> bool {
+        Self::find_shell_flag(command, flag).is_some()
+    }
+
+    fn find_shell_flag(command: &str, flag: &str) -> Option<usize> {
+        let lower_command = command.to_ascii_lowercase();
+        let lower_flag = flag.to_ascii_lowercase();
+        let mut search_start = 0;
+
+        while let Some(relative_index) = lower_command[search_start..].find(&lower_flag) {
+            let index = search_start + relative_index;
+            let flag_end = index + lower_flag.len();
+            let before_ok = index == 0
+                || lower_command
+                    .as_bytes()
+                    .get(index.saturating_sub(1))
+                    .is_some_and(|byte| byte.is_ascii_whitespace());
+            let after_ok = lower_command
+                .as_bytes()
+                .get(flag_end)
+                .is_none_or(|byte| *byte == b'=' || byte.is_ascii_whitespace());
+
+            if before_ok && after_ok {
+                return Some(index);
             }
+
+            search_start = flag_end;
+        }
+
+        None
+    }
+
+    fn set_terminal_title_from_command(terminal: &mut TerminalEntry, command: &str) {
+        if let Some(sanitized) = terminal_title_candidate(command.trim()) {
+            terminal.full_title = sanitized.clone();
+            terminal.title = update_terminal_title(&sanitized, terminal.id as usize, TITLE_MAX_LEN);
+            terminal.dirty = true;
         }
     }
 
@@ -42065,6 +42186,7 @@ mod tests {
             [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
             Some(1),
         );
+        app.config.claude_code_codex_hook_enabled = false;
         seed_claude_attention_idle(&mut app, 1);
 
         app.route_active_terminal_input(
@@ -52328,6 +52450,9 @@ mod tests {
             entry.ai_session.tool = Some(AiCliTool::OpenCode);
             entry.ai_session.status = AiCliStatus::Attention;
             entry.opencode_session_active = true;
+            entry
+                .opencode_last_known_mode
+                .get_or_insert_with(|| "build".to_owned());
             entry.opencode_process_identity = Some(TrackedProcessIdentity {
                 pid: 9001,
                 creation_time: Some(10001),
@@ -55596,67 +55721,100 @@ mod tests {
     }
 
     #[test]
-    fn sanitized_claude_launch_command_powershell_clears_env_and_calls_claude_cmd() {
-        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::PowerShell, false);
+    fn sanitized_claude_launch_command_powershell_clears_env_and_uses_configured_alias() {
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::PowerShell, "cc");
         assert!(
             cmd.contains("Remove-Item Env:ANTHROPIC_AUTH_TOKEN"),
             "PowerShell command should clear ANTHROPIC_AUTH_TOKEN"
         );
         assert!(
-            cmd.contains("& \"$env:APPDATA\\npm\\claude.cmd\""),
-            "PowerShell command should invoke real claude.cmd"
+            cmd.ends_with("; cc --permission-mode bypassPermissions"),
+            "PowerShell command should invoke the configured Claude launcher command"
         );
         assert!(
-            cmd.contains(" --permission-mode bypassPermissions"),
-            "PowerShell command should always append bypass permission mode"
+            !cmd.contains("claude.cmd"),
+            "PowerShell command should not bypass the configured launcher alias"
         );
     }
 
     #[test]
-    fn sanitized_claude_launch_command_cmd_clears_env_and_calls_claude_cmd() {
-        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Cmd, false);
+    fn sanitized_claude_launch_command_powershell_uses_call_operator_for_quoted_command() {
+        let cmd = AdeApp::sanitized_claude_launch_command(
+            ShellKind::PowerShell,
+            "\"C:\\Program Files\\Claude\\claude.cmd\"",
+        );
+        assert!(
+            cmd.ends_with(
+                "; & \"C:\\Program Files\\Claude\\claude.cmd\" --permission-mode bypassPermissions"
+            ),
+            "PowerShell should invoke quoted executable paths with the call operator"
+        );
+    }
+
+    #[test]
+    fn sanitized_claude_launch_command_cmd_clears_env_and_uses_configured_alias() {
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Cmd, "cc");
         assert!(
             cmd.contains("set ANTHROPIC_AUTH_TOKEN="),
             "CMD command should clear ANTHROPIC_AUTH_TOKEN"
         );
         assert!(
-            cmd.contains("\"%APPDATA%\\npm\\claude.cmd\""),
-            "CMD command should invoke real claude.cmd"
+            cmd.ends_with("& cc --permission-mode bypassPermissions"),
+            "CMD command should invoke the configured Claude launcher command"
         );
         assert!(
-            cmd.contains(" --permission-mode bypassPermissions"),
-            "CMD command should always append bypass permission mode"
+            !cmd.contains("claude.cmd"),
+            "CMD command should not bypass the configured launcher alias"
         );
     }
 
     #[test]
-    fn sanitized_claude_launch_command_zsh_always_appends_bypass_flag() {
-        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, false);
+    fn sanitized_claude_launch_command_zsh_appends_bypass_flag_to_configured_alias() {
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, "cc");
+        assert_eq!(cmd, "cc --permission-mode bypassPermissions");
+    }
+
+    #[test]
+    fn sanitized_claude_launch_command_defaults_to_claude_when_configured_command_is_empty() {
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, "  ");
         assert_eq!(cmd, "claude --permission-mode bypassPermissions");
     }
 
     #[test]
-    fn sanitized_claude_launch_command_powershell_appends_bypass_flag() {
-        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::PowerShell, true);
-        assert!(
-            cmd.contains(" --permission-mode bypassPermissions"),
-            "PowerShell command should append bypass permission mode"
+    fn sanitized_claude_launch_command_does_not_duplicate_bypass_flag() {
+        let cmd = AdeApp::sanitized_claude_launch_command(
+            ShellKind::Zsh,
+            "cc --permission-mode bypassPermissions",
         );
+        assert_eq!(cmd, "cc --permission-mode bypassPermissions");
+        assert_eq!(cmd.matches("--permission-mode").count(), 1);
     }
 
     #[test]
-    fn sanitized_claude_launch_command_cmd_appends_bypass_flag() {
-        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Cmd, true);
-        assert!(
-            cmd.contains(" --permission-mode bypassPermissions"),
-            "CMD command should append bypass permission mode"
-        );
+    fn sanitized_claude_launch_command_replaces_non_bypass_permission_mode() {
+        let cmd =
+            AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, "cc --permission-mode ask");
+        assert_eq!(cmd, "cc --permission-mode bypassPermissions");
     }
 
     #[test]
-    fn sanitized_claude_launch_command_zsh_appends_bypass_flag() {
-        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, true);
-        assert_eq!(cmd, "claude --permission-mode bypassPermissions");
+    fn sanitized_claude_launch_command_replaces_equals_permission_mode() {
+        let cmd =
+            AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, "cc --permission-mode=default");
+        assert_eq!(cmd, "cc --permission-mode=bypassPermissions");
+    }
+
+    #[test]
+    fn sanitized_claude_launch_command_preserves_dangerous_skip_permissions() {
+        let cmd = AdeApp::sanitized_claude_launch_command(
+            ShellKind::Zsh,
+            "cc --dangerously-skip-permissions",
+        );
+        assert!(
+            !cmd.contains("--permission-mode"),
+            "dangerously-skip-permissions already requests bypass behavior"
+        );
+        assert_eq!(cmd, "cc --dangerously-skip-permissions");
     }
 
     #[test]
@@ -55677,6 +55835,7 @@ mod tests {
         app.projects.insert(1, project);
         app.selected_project = Some(1);
         app.config.launchers = crate::models::default_launchers();
+        app.config.launchers[3].launch_command = "cc".to_owned();
         let claude_launcher = app.config.launchers[3].clone();
         assert_eq!(claude_launcher.builtin, Some(BuiltinLauncherKind::Claude));
 
@@ -55701,6 +55860,38 @@ mod tests {
         assert!(
             entry.claude_launch_pending_since.is_some(),
             "Claude launcher should set claude_launch_pending_since"
+        );
+        assert_eq!(
+            entry.full_title, "cc",
+            "Foreground Claude launcher title should show the configured command, not the sanitized wrapper"
+        );
+    }
+
+    #[test]
+    fn claude_launch_pending_badge_model_shows_spinner_without_mutating_session_state() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::Claude);
+        entry.ai_session.status = AiCliStatus::Inactive;
+        entry.claude_launch_pending_since = Some(Instant::now());
+
+        let badge = AiBadgeModel::from_terminal(&entry);
+
+        assert_eq!(entry.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(badge.status, AiCliStatus::Running);
+        assert_eq!(
+            ai_badge_visual(
+                badge.status,
+                badge.codex_normalized_status,
+                badge.opencode_normalized_status,
+                badge.claude_normalized_status,
+                badge.codex_attention_pending,
+                badge.codex_attention_reason,
+                badge.opencode_attention_pending,
+                badge.opencode_attention_reason,
+                badge.claude_attention_pending,
+                badge.claude_attention_reason,
+            ),
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
         );
     }
 
@@ -68069,8 +68260,8 @@ mod tests {
         let index_rect = index_rect.expect("queued task index label");
         let task_rect = task_rect.expect("queued task text");
         assert!(
-            task_rect.left() <= index_rect.right() + 16.0,
-            "queued task text must start near the index label, not centered in the queue row (task_left={}, index_right={})",
+            task_rect.left() <= index_rect.right() + 64.0,
+            "queued task text must start near the index/mode metadata, not centered in the queue row (task_left={}, index_right={})",
             task_rect.left(),
             index_rect.right()
         );
