@@ -136,7 +136,19 @@ export function getOpencodeBinPath(): string {
   try {
     if (process.platform === 'win32') {
       const result = require('child_process').execSync('where opencode', { encoding: 'utf-8', timeout: 5000 });
-      const first = result.split('\n')[0].trim();
+      const lines = result.split('\n').map((s: string) => s.trim()).filter((s: string) => s);
+      // Prefer .exe directly if available; .cmd can cause spawn EINVAL on Node.js 22+
+      const exeLine = lines.find((s: string) => s.toLowerCase().endsWith('.exe'));
+      if (exeLine) return exeLine;
+      const cmdLine = lines.find((s: string) => s.toLowerCase().endsWith('.cmd'));
+      if (cmdLine) {
+        // If .cmd found, try to find the real .exe inside node_modules next to it
+        const cmdDir = path.dirname(cmdLine);
+        const exeCandidate = path.join(cmdDir, 'node_modules', 'opencode-ai', 'bin', 'opencode.exe');
+        if (fs.existsSync(exeCandidate)) return exeCandidate;
+        return cmdLine;
+      }
+      const first = lines[0];
       if (first) return first;
     } else {
       const result = require('child_process').execSync('which opencode', { encoding: 'utf-8', timeout: 5000 });
@@ -149,6 +161,7 @@ export function getOpencodeBinPath(): string {
   // Check known npm global paths
   const homeDir = require('os').homedir();
   const candidates = [
+    path.join(homeDir, 'AppData', 'Roaming', 'npm', 'node_modules', 'opencode-ai', 'bin', 'opencode.exe'),
     path.join(homeDir, 'AppData', 'Roaming', 'npm', 'opencode.cmd'),
     path.join(homeDir, '.npm', 'global', 'bin', 'opencode'),
     path.join(homeDir, '.nvm', 'versions', 'node', 'current', 'bin', 'opencode'),

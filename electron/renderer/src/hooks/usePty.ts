@@ -39,6 +39,7 @@ export interface TerminalInstance {
   smartInputState: SmartInputState;
   terminalOutputFocusOverride: boolean;
   pendingDelayedEnters: number[];
+  exited: boolean;
   // Background rerun state machine
   pendingRerunPhase?: 'interrupt_sent' | 'batch_confirm_sent' | 'rerun_ready';
   pendingRerunSince?: number;
@@ -107,6 +108,7 @@ export function usePty() {
       pendingDelayedEnters: [],
       opencodeLastHookEventSince: undefined,
       recentOutputBuffer: '',
+      exited: false,
     };
     terminalsRef.current.set(id, t);
     notify();
@@ -209,8 +211,19 @@ export function usePty() {
       }
     });
     const unsubExit = api.on('pty:exit', (terminalId: number, _exitCode: number) => {
-      terminalsRef.current.delete(terminalId);
-      notify();
+      const t = terminalsRef.current.get(terminalId);
+      if (t) {
+        t.exited = true;
+        notify();
+        // Remove after a short delay so UI can render exited state
+        setTimeout(() => {
+          terminalsRef.current.delete(terminalId);
+          notify();
+        }, 5000);
+      } else {
+        terminalsRef.current.delete(terminalId);
+        notify();
+      }
     });
     const unsubState = api.on('pty:state', (terminalId: number, state: { recentInputs?: string[]; title?: string }) => {
       const t = terminalsRef.current.get(terminalId);

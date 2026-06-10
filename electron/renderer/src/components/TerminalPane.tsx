@@ -253,7 +253,6 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
       style={{
         width: '100%',
         height: '100%',
-        outline: active ? '1px solid #0078d4' : 'none',
         cursor: 'text',
       }}
       onClick={(e) => {

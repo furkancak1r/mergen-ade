@@ -28,13 +28,15 @@ function createWindow() {
   });
 
   if (isDev) {
-    mainWindow.loadURL('http://localhost:5173');
+    const devPort = process.env.VITE_DEV_PORT || '5174';
+    mainWindow.loadURL(`http://localhost:${devPort}`);
   } else {
     mainWindow.loadFile(path.join(__dirname, '../renderer/dist/index.html'));
   }
 
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
+    mainWindow?.webContents.openDevTools();
   });
 
   mainWindow.on('close', (e) => {
@@ -161,6 +163,7 @@ function clearTray() {
 }
 
 app.whenReady().then(() => {
+  console.log('Electron app ready');
   registerIpcHandlers();
   startHookService();
 
@@ -173,6 +176,7 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+  console.log('Window created');
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -201,8 +205,10 @@ app.on('window-all-closed', () => {
 // CLI mode dispatch
 function dispatchCliMode() {
   const args = process.argv.slice(2);
+  console.log('CLI args:', args);
   if (args.length === 0) return false;
   const mode = args[0];
+  console.log('CLI mode:', mode);
   switch (mode) {
     case '--browser-mcp-helper': {
       handleBrowserMcpHelperMode();

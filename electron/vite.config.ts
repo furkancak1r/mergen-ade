@@ -38,6 +38,9 @@ export default defineConfig({
     ]),
   ],
   root: 'renderer',
+  server: {
+    port: 5174,
+  },
   build: {
     outDir: 'dist',
     emptyOutDir: true,

@@ -224,8 +224,22 @@ function App() {
     const chatId = activeAcpChatByProject.get(projectId);
     if (chatId) {
       setActiveAcpChat({ chatId, projectId });
+      setFileEditorOpen(false);
+      setActiveTab(LeftSidebarTabEnum.TerminalManager);
     }
   }, [activeAcpChatByProject]);
+
+  // Warm ACP standby for selected project
+  useEffect(() => {
+    if (!selectedProjectId || !config) return;
+    const project = config.projects.find((p) => p.id === selectedProjectId);
+    if (!project) return;
+    // Warm standby after a short delay so it doesn't fire on every rapid selection change
+    const timer = setTimeout(() => {
+      api.invoke('acp:standby:warm', selectedProjectId, project.path);
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [selectedProjectId, config]);
 
   // Restore ACP chat when switching to a project that has an active chat
   useEffect(() => {
@@ -536,7 +550,21 @@ function App() {
     if (!config) return;
     const project = config.projects.find((p) => p.id === projectId);
     if (!project) return;
-    const chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [] }) as string;
+
+    // Try to promote standby first
+    const standby = await api.invoke('acp:standby:get', projectId) as { chatId: string; sessionId?: string; status: string } | undefined;
+    let chatId: string;
+    if (standby && standby.sessionId && (standby.status === 'idle' || standby.status === 'running' || standby.status === 'permission')) {
+      const promoted = await api.invoke('acp:standby:promote', projectId, '') as { chatId: string } | undefined;
+      if (promoted) {
+        chatId = promoted.chatId;
+      } else {
+        chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [] }) as string;
+      }
+    } else {
+      chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [] }) as string;
+    }
+
     setActiveAcpChatByProject((prev) => {
       const next = new Map(prev);
       next.set(projectId, chatId);
@@ -544,6 +572,8 @@ function App() {
     });
     setActiveAcpChat({ chatId, projectId });
     setFileEditorOpen(false);
+    // Reveal Terminal Manager with Foreground filter and expand root project
+    setActiveTab(LeftSidebarTabEnum.TerminalManager);
   }, [config]);
 
   const closeAcpChat = useCallback(() => {
@@ -559,7 +589,13 @@ function App() {
     if (activeAcpChat && activeAcpChat.projectId === projectId) {
       setActiveAcpChat(null);
     }
-  }, [activeAcpChat]);
+    // Kill visible ACP chat and clear standby
+    const chatId = activeAcpChatByProject.get(projectId);
+    if (chatId) {
+      api.invoke('acp:kill', chatId);
+    }
+    api.invoke('acp:standby:clear', projectId);
+  }, [activeAcpChat, activeAcpChatByProject]);
 
   const toggleBrowser = useCallback(() => {
     if (!selectedProjectId) return;
@@ -607,13 +643,15 @@ function App() {
   // Clear ACP chat state for projects that no longer exist in config
   useEffect(() => {
     if (!config) return;
+    const existingIds = new Set(config.projects.map((p) => p.id));
+    let changed = false;
+    const removedIds: number[] = [];
     setActiveAcpChatByProject((prev) => {
-      const existingIds = new Set(config.projects.map((p) => p.id));
-      let changed = false;
       const next = new Map(prev);
       for (const [projectId] of prev) {
         if (!existingIds.has(projectId)) {
           next.delete(projectId);
+          removedIds.push(projectId);
           changed = true;
         }
       }
@@ -626,7 +664,15 @@ function App() {
       }
       return prev;
     });
-  }, [config, activeAcpChat]);
+    // Kill visible ACP chats and clear standby for removed projects
+    for (const projectId of removedIds) {
+      const chatId = activeAcpChatByProject.get(projectId);
+      if (chatId) {
+        api.invoke('acp:kill', chatId);
+      }
+      api.invoke('acp:standby:clear', projectId);
+    }
+  }, [config, activeAcpChat, activeAcpChatByProject]);
 
   // Ensure Smart Input focus when visible and no override
   useEffect(() => {

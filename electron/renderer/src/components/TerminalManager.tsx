@@ -205,7 +205,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 justifyContent: 'center',
                 cursor: 'pointer',
                 position: 'relative',
-                gap: TERMINAL_MANAGER_FILTER_CENTER_GAP,
               }}
             >
               <span style={{
@@ -213,20 +212,11 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 fontWeight: 600,
                 color: isSelected ? color : withAlpha(TEXT_MUTED, 180),
                 userSelect: 'none',
+                borderBottom: isSelected ? `${TERMINAL_MANAGER_FILTER_UNDERLINE_HEIGHT}px solid ${color}` : 'none',
+                paddingBottom: isSelected ? TERMINAL_MANAGER_FILTER_UNDERLINE_GAP : 0,
               }}>
                 {label}
               </span>
-              {isSelected && (
-                <div style={{
-                  position: 'absolute',
-                  bottom: TERMINAL_MANAGER_FILTER_UNDERLINE_GAP,
-                  left: '20%',
-                  right: '20%',
-                  height: TERMINAL_MANAGER_FILTER_UNDERLINE_HEIGHT,
-                  background: color,
-                  borderRadius: 1,
-                }} />
-              )}
             </div>
           );
         })}
@@ -635,6 +625,17 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   }}
                 />
                 <IconButton
+                  icon="💬"
+                  tooltip="OpenCode Chat"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (!expanded) {
+                      onToggle();
+                    }
+                    onOpenAcpChat?.(project.id);
+                  }}
+                />
+                <IconButton
                   icon="📁+"
                   tooltip="Create Worktree"
                   onClick={(e) => {
@@ -982,21 +983,140 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   {t.title || `${t.shell} #${t.id}`}
                 </span>
 
-                {/* Hover-driven action buttons */}
-                {(hovered || active) && (
-                  <div style={{ display: 'flex', gap: 2, zIndex: 1 }}>
-                    {t.kind === 'background' && (
+                {/* Action buttons — always reserve space, visible only on hover/active */}
+                {(() => {
+                  const actionVisible = hovered || active;
+                  const actionMinWidth = (() => {
+                    let w = 0;
+                    let count = 0;
+                    w += CONTROL_ROW_HEIGHT; count += 1; // kill
+                    if (t.kind === 'background') {
+                      w += CONTROL_ROW_HEIGHT; count += 1; // rerun
+                      if (effectiveSavedMessages.length > 0) { w += TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH; count += 1; }
+                    } else {
+                      if (t.recentInputs.length > 0) { w += CONTROL_ROW_HEIGHT; count += 1; }
+                      w += TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH; count += 1; // tasks
+                    }
+                    return w + (count - 1) * 2;
+                  })();
+                  return (
+                    <div style={{ display: 'flex', gap: 2, zIndex: 1, minWidth: actionMinWidth, visibility: actionVisible ? 'visible' : 'hidden' }}>
+                      {t.kind === 'background' && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            rerunBackground(t.id);
+                          }}
+                          style={{
+                            padding: '1px 4px',
+                            fontSize: 10,
+                            background: 'transparent',
+                            border: '1px solid #444',
+                            color: TEXT_MUTED,
+                            borderRadius: 3,
+                            cursor: 'pointer',
+                            flexShrink: 0,
+                            width: CONTROL_ROW_HEIGHT,
+                            height: CONTROL_ROW_HEIGHT - 4,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                          }}
+                          title={t.aiStatus === 'running' ? 'Interrupt' : 'Rerun'}
+                        >
+                          {t.aiStatus === 'running' ? '✕' : '↻'}
+                        </button>
+                      )}
+                      {t.kind === 'foreground' && t.recentInputs.length > 0 && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setHistoryPopupTerminalId(t.id);
+                            setHistoryPopupJustOpened(true);
+                          }}
+                          style={{
+                            padding: '1px 4px',
+                            fontSize: 10,
+                            background: 'transparent',
+                            border: '1px solid #444',
+                            color: TEXT_MUTED,
+                            borderRadius: 3,
+                            cursor: 'pointer',
+                            flexShrink: 0,
+                            width: CONTROL_ROW_HEIGHT,
+                            height: CONTROL_ROW_HEIGHT - 4,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                          }}
+                          title="Show input history"
+                        >
+                          🕒
+                        </button>
+                      )}
+                      {t.kind === 'background' && effectiveSavedMessages.length > 0 && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShowSavedMessages(showSavedMessages === t.id ? null : t.id);
+                          }}
+                          style={{
+                            padding: '1px 4px',
+                            fontSize: 10,
+                            background: 'transparent',
+                            border: '1px solid #444',
+                            color: TEXT_MUTED,
+                            borderRadius: 3,
+                            cursor: 'pointer',
+                            flexShrink: 0,
+                            width: TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH,
+                            height: CONTROL_ROW_HEIGHT - 4,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                          }}
+                          title="Send saved message"
+                        >
+                          💬
+                        </button>
+                      )}
+                      {t.kind === 'foreground' && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShowFgMessages(showFgMessages === t.id ? null : t.id);
+                          }}
+                          style={{
+                            padding: '1px 4px',
+                            fontSize: 10,
+                            background: 'transparent',
+                            border: '1px solid #444',
+                            color: hasFgMessages ? '#64c864' : TEXT_MUTED,
+                            borderRadius: 3,
+                            cursor: 'pointer',
+                            flexShrink: 0,
+                            width: TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH,
+                            height: CONTROL_ROW_HEIGHT - 4,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                          }}
+                          title="Foreground tasks"
+                        >
+                          💬
+                        </button>
+                      )}
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          rerunBackground(t.id);
+                          onKill(t.id);
                         }}
                         style={{
                           padding: '1px 4px',
                           fontSize: 10,
                           background: 'transparent',
                           border: '1px solid #444',
-                          color: TEXT_MUTED,
+                          color: BTN_RED,
                           borderRadius: 3,
                           cursor: 'pointer',
                           flexShrink: 0,
@@ -1006,116 +1126,13 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                           alignItems: 'center',
                           justifyContent: 'center',
                         }}
-                        title={t.aiStatus === 'running' ? 'Interrupt' : 'Rerun'}
+                        title="Kill"
                       >
-                        {t.aiStatus === 'running' ? '✕' : '↻'}
+                        ✕
                       </button>
-                    )}
-                    {t.kind === 'foreground' && t.recentInputs.length > 0 && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setHistoryPopupTerminalId(t.id);
-                          setHistoryPopupJustOpened(true);
-                        }}
-                        style={{
-                          padding: '1px 4px',
-                          fontSize: 10,
-                          background: 'transparent',
-                          border: '1px solid #444',
-                          color: TEXT_MUTED,
-                          borderRadius: 3,
-                          cursor: 'pointer',
-                          flexShrink: 0,
-                          width: CONTROL_ROW_HEIGHT,
-                          height: CONTROL_ROW_HEIGHT - 4,
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                        }}
-                        title="Show input history"
-                      >
-                        🕒
-                      </button>
-                    )}
-                    {t.kind === 'background' && effectiveSavedMessages.length > 0 && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setShowSavedMessages(showSavedMessages === t.id ? null : t.id);
-                        }}
-                        style={{
-                          padding: '1px 4px',
-                          fontSize: 10,
-                          background: 'transparent',
-                          border: '1px solid #444',
-                          color: TEXT_MUTED,
-                          borderRadius: 3,
-                          cursor: 'pointer',
-                          flexShrink: 0,
-                          width: TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH,
-                          height: CONTROL_ROW_HEIGHT - 4,
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                        }}
-                        title="Send saved message"
-                      >
-                        💬
-                      </button>
-                    )}
-                    {t.kind === 'foreground' && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setShowFgMessages(showFgMessages === t.id ? null : t.id);
-                        }}
-                        style={{
-                          padding: '1px 4px',
-                          fontSize: 10,
-                          background: 'transparent',
-                          border: '1px solid #444',
-                          color: hasFgMessages ? '#64c864' : TEXT_MUTED,
-                          borderRadius: 3,
-                          cursor: 'pointer',
-                          flexShrink: 0,
-                          width: TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH,
-                          height: CONTROL_ROW_HEIGHT - 4,
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                        }}
-                        title="Foreground tasks"
-                      >
-                        💬
-                      </button>
-                    )}
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onKill(t.id);
-                      }}
-                      style={{
-                        padding: '1px 4px',
-                        fontSize: 10,
-                        background: 'transparent',
-                        border: '1px solid #444',
-                        color: BTN_RED,
-                        borderRadius: 3,
-                        cursor: 'pointer',
-                        flexShrink: 0,
-                        width: CONTROL_ROW_HEIGHT,
-                        height: CONTROL_ROW_HEIGHT - 4,
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                      }}
-                      title="Kill"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}
@@ -1137,7 +1154,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             data-history-popup
             style={{
               position: 'fixed',
-              top: Math.max(8, Math.min(window.innerHeight - 300, (panelRef.current?.getBoundingClientRect().top ?? 0) + 100)),
+              top: 100,
               left: Math.max(8, panelRight + 8),
               width: popupWidth,
               maxHeight: TERMINAL_HISTORY_POPUP_MAX_HEIGHT,

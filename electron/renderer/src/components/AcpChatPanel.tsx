@@ -22,6 +22,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [pendingQuestion, setPendingQuestion] = useState<OpenCodeQuestion | null>(null);
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
   const [customAnswer, setCustomAnswer] = useState('');
+  const [slashHints, setSlashHints] = useState<string[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modeDropdownRef = useRef<HTMLDivElement>(null);
@@ -34,8 +35,36 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   useEffect(() => {
     refreshSession();
-    const unsub = api.on('acp:event', (eventChatId: string, event: { type: string; text?: string; options?: OpenCodeQuestion['options']; multiple?: boolean; custom?: boolean; requestId?: string; sessionId?: string; message?: string; header?: string; question?: string; count?: number; modeId?: string }) => {
+    const unsub = api.on('acp:event', (eventChatId: string, event: { type: string; text?: string; role?: string; options?: OpenCodeQuestion['options']; multiple?: boolean; custom?: boolean; requestId?: string; sessionId?: string; message?: string; header?: string; question?: string; count?: number; modeId?: string; commands?: { id: string; name: string }[]; toolCallId?: string; title?: string; kind?: string; status?: string }) => {
       if (eventChatId !== chatId) return;
+
+      // Handle high-frequency message chunks locally without re-fetching session
+      if (event.type === 'messageChunk') {
+        setSession((prev) => {
+          if (!prev) return prev;
+          const messages = [...prev.messages];
+          const role = (event.role || 'assistant') as 'user' | 'assistant' | 'system';
+          const lastMsg = messages[messages.length - 1];
+          if (lastMsg && lastMsg.role === role) {
+            messages[messages.length - 1] = { ...lastMsg, text: lastMsg.text + (event.text || '') };
+          } else {
+            messages.push({ role, text: event.text || '', timestamp: Date.now() });
+          }
+          return { ...prev, messages };
+        });
+        return;
+      }
+
+      if (event.type === 'toolCall') {
+        setSession((prev) => {
+          if (!prev) return prev;
+          const messages = [...prev.messages];
+          messages.push({ role: 'system', text: `${event.title || ''} (${event.kind || ''})`, timestamp: Date.now() });
+          return { ...prev, messages };
+        });
+        return;
+      }
+
       refreshSession();
       if (event.type === 'permission') {
         setPendingQuestion({
@@ -53,6 +82,9 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         setSelectedOptions([]);
         setCustomAnswer('');
       }
+      if (event.type === 'commands' && event.commands) {
+        setSlashHints(event.commands.map((c) => `/${c.id}`));
+      }
     });
     return () => { unsub(); };
   }, [chatId, refreshSession]);
@@ -66,6 +98,21 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     setSelectedOptions([]);
     setCustomAnswer('');
   }, [chatId]);
+
+  // Update slash hints when input changes
+  useEffect(() => {
+    if (!input.startsWith('/')) {
+      setSlashHints([]);
+      return;
+    }
+    const availableCommands = session?.availableCommands ?? [];
+    const query = input.slice(1).toLowerCase();
+    const matches = availableCommands
+      .filter((c) => c.id.toLowerCase().startsWith(query) || c.name.toLowerCase().startsWith(query))
+      .map((c) => `/${c.id}`)
+      .slice(0, 6);
+    setSlashHints(matches);
+  }, [input, session?.availableCommands]);
 
   useEffect(() => {
     if (disabled) return;
@@ -89,7 +136,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [session?.status, disabled]);
+  }, [session?.status, disabled, modeDropdownOpen]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -104,11 +151,10 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const send = useCallback(async () => {
     if (!input.trim() && attachments.length === 0) return;
     const text = input.trim();
-    const promptText = buildAcpPromptText(text, attachments);
-    await api.invoke('acp:send', { chatId, promptText, attachments: [] });
+    await api.invoke('acp:send', { chatId, promptText: text, attachments, modeId: session?.currentModeId });
     setInput('');
     setAttachments([]);
-  }, [chatId, input, attachments]);
+  }, [chatId, input, attachments, session?.currentModeId]);
 
   const cancelAcp = useCallback(async () => {
     await api.invoke('acp:cancel', chatId);
@@ -157,9 +203,13 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   const branchNameDisplay = branchName || 'main';
 
+  const hasMessages = (session?.messages.length ?? 0) > 0;
+  const isWelcome = !hasMessages && (session?.queuedPrompts.length ?? 0) === 0;
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#0c0c0c' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #222' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', background: '#0c0c0c' }}>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #222', flexShrink: 0 }}>
         <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>
           ACP Chat — {project.name}
         </span>
@@ -173,27 +223,33 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         )}
       </div>
 
-      <div style={{ flex: 1, overflow: 'auto', padding: '8px 12px' }}>
-        {session?.messages.length === 0 && (
-          <div style={{ color: '#666', fontSize: 12, textAlign: 'center', marginTop: 40 }}>
-            Welcome to ACP Chat. Type a message to start.
+      {/* Main content area */}
+      <div style={{ flex: 1, overflow: 'auto', padding: '8px 12px', display: 'flex', flexDirection: 'column' }}>
+        {isWelcome ? (
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16 }}>
+            <div style={{ color: '#666', fontSize: 13, textAlign: 'center' }}>
+              Welcome to ACP Chat
+            </div>
           </div>
-        )}
-        {session?.messages.map((msg, i) => (
-          <MessageBubble key={i} message={msg} />
-        ))}
-        {session?.queuedPrompts && session.queuedPrompts.length > 0 && (
-          <div style={{ marginTop: 8 }}>
-            {session.queuedPrompts.map((qp, i) => (
-              <QueuedPromptRow key={i} prompt={qp} />
+        ) : (
+          <>
+            {session?.messages.map((msg, i) => (
+              <MessageBubble key={i} message={msg} />
             ))}
-          </div>
+            {session?.queuedPrompts && session.queuedPrompts.length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                {session.queuedPrompts.map((qp, i) => (
+                  <QueuedPromptRow key={i} prompt={qp} />
+                ))}
+              </div>
+            )}
+          </>
         )}
         <div ref={messagesEndRef} />
       </div>
 
       {/* Status row */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 12px', fontSize: 11, color: '#666' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 12px', fontSize: 11, color: '#666', flexShrink: 0 }}>
         <span>{branchNameDisplay}</span>
         <span>Local</span>
         <span>{session?.status || 'Idle'}</span>
@@ -201,7 +257,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
       {/* Permission card */}
       {pendingQuestion && (
-        <div style={{ padding: '8px 12px', borderTop: '1px solid #222', background: '#1a1a1a' }}>
+        <div style={{ padding: '8px 12px', borderTop: '1px solid #222', background: '#1a1a1a', flexShrink: 0 }}>
           <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>{pendingQuestion.header}</div>
           <div style={{ fontSize: 12, color: '#aaa', marginBottom: 8 }}>{pendingQuestion.question}</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -260,21 +316,40 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         </div>
       )}
 
-      {/* Composer capsule */}
-      <div style={{ padding: '8px 12px', borderTop: '1px solid #222' }}>
-        {/* Attachment chips */}
+      {/* Composer area */}
+      <div style={{ padding: '8px 12px', borderTop: '1px solid #222', flexShrink: 0 }}>
+        {/* Slash hints above input */}
+        {slashHints.length > 0 && (
+          <div style={{ display: 'flex', gap: 4, marginBottom: 6, flexWrap: 'wrap' }}>
+            {slashHints.map((hint, i) => (
+              <button
+                key={i}
+                onClick={() => {
+                  setInput(hint + ' ');
+                  inputRef.current?.focus();
+                }}
+                style={{ fontSize: 11, color: '#888', background: '#1a1a1a', border: '1px solid #333', borderRadius: 4, padding: '2px 8px', cursor: 'pointer' }}
+              >
+                {hint}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Attachment chips below capsule */}
         {attachments.length > 0 && (
           <div style={{ display: 'flex', gap: 4, marginBottom: 6, flexWrap: 'wrap' }}>
             {attachments.map((a, i) => (
-              <span key={i} style={{ fontSize: 11, color: '#aaa', background: '#1a1a1a', padding: '2px 6px', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 4 }}>
-                {a}
+              <span key={i} style={{ fontSize: 11, color: '#b4b4b4', background: '#282828', padding: '2px 6px', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 4, border: '1px solid #5a5a5a' }}>
+                {a.split(/[/\\]/).pop() || a}
                 <button onClick={() => removeAttachment(i)} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}>✕</button>
               </span>
             ))}
           </div>
         )}
 
-        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', background: '#1b1b1b', borderRadius: 12, padding: '8px 12px' }}>
+        {/* Composer capsule */}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', background: '#1b1b1b', borderRadius: 12, padding: '8px 12px' }}>
           <button
             onClick={async () => {
               const paths = await api.invoke('dialog:showOpen', { properties: ['openFile', 'multiSelections'] }) as string[] | undefined;
@@ -306,7 +381,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
           {currentMode === 'plan' && (
             <button
               onClick={toggleMode}
-              style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: '1px solid #333', background: '#1f3a4c', color: '#ccc', cursor: 'pointer', flexShrink: 0 }}
+              style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: '1px solid #333', background: '#1f3a4c', color: '#ccc', cursor: 'pointer', flexShrink: 0, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
             >
               Plan
             </button>
@@ -316,7 +391,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
           <div style={{ position: 'relative', flexShrink: 0 }} ref={modeDropdownRef}>
             <button
               onClick={() => setModeDropdownOpen((v) => !v)}
-              style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: '1px solid #333', background: 'transparent', color: '#ccc', cursor: 'pointer', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+              style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: '1px solid #333', background: 'transparent', color: '#ccc', cursor: 'pointer', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
             >
               {modelLabel}
             </button>
@@ -374,7 +449,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
                 setInput((prev) => prev + '\n');
               }
             }}
-            placeholder="Type a message..."
+            placeholder={isWelcome ? 'Type a message to start...' : 'Type a message...'}
             style={{
               flex: 1,
               background: 'transparent',
@@ -382,9 +457,10 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               color: '#ccc',
               fontSize: 13,
               resize: 'none',
-              minHeight: 36,
+              minHeight: 28,
               maxHeight: 120,
               outline: 'none',
+              padding: '0 4px',
             }}
             rows={1}
           />
@@ -450,4 +526,3 @@ const QueuedPromptRow: React.FC<{ prompt: QueuedAcpPrompt }> = ({ prompt }) => {
     </div>
   );
 };
-

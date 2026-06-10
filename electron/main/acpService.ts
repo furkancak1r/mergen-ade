@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from 'child_process';
+import path from 'path';
+import fs from 'fs';
 import { BrowserWindow } from 'electron';
 import type { AcpChatSession, AcpConfigOption, AcpAvailableCommand, AcpChatMessage, OpenCodeModelConfig } from '../shared/types';
 import { activeBuildModel, effectivePlanModel, effectivePlanEffort } from '../shared/types';
@@ -14,7 +16,7 @@ function buildAcpPromptText(text: string, attachments: string[]): string {
 }
 
 interface AcpSession {
-  process: ChildProcess;
+  process: ChildProcess | null;
   sessionId?: string;
   chatId: string;
   projectId: number;
@@ -57,6 +59,7 @@ function broadcast(channel: string, ...args: unknown[]) {
 
 function sendRpc(session: AcpSession, method: string, params: unknown): void {
   const req = { jsonrpc: '2.0', id: Date.now(), method, params };
+  if (!session.process) return;
   session.process.stdin?.write(JSON.stringify(req) + '\n');
 }
 
@@ -83,14 +86,9 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
   const chatId = `acp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   const opencodeBin = getOpencodeBinPath();
-  const proc = spawn(opencodeBin, ['acp'], {
-    cwd: opts.cwd,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
 
   const session: AcpSession = {
-    process: proc,
+    process: null as unknown as ChildProcess,
     chatId,
     projectId: opts.projectId,
     cwd: opts.cwd,
@@ -105,45 +103,80 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
 
   sessions.set(chatId, session);
 
-  let buffer = '';
-  proc.stdout?.on('data', (data) => {
-    buffer += data.toString();
-    let idx;
-    while ((idx = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 1);
-      if (line.trim()) {
-        handleAcpLine(session, line);
+  try {
+    // Ensure cwd is valid and absolute on Windows
+    let cwd = opts.cwd;
+    if (process.platform === 'win32' && cwd) {
+      cwd = path.resolve(cwd);
+      if (!fs.existsSync(cwd)) {
+        throw new Error(`ACP spawn cwd does not exist: ${cwd}`);
       }
     }
-  });
+    const proc = spawn(opencodeBin, ['acp'], {
+      cwd: cwd || opts.cwd,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
 
-  proc.stderr?.on('data', (data) => {
-    const text = data.toString();
-    const now = Date.now();
-    if (session.cancelGraceUntil && now < session.cancelGraceUntil) {
-      // Suppress cancel-specific stderr noise
-      if (text.includes('Method not found') || text.includes('session/cancel') || text.includes('-32601')) {
-        return;
+    session.process = proc;
+
+    let buffer = '';
+    proc.stdout?.on('data', (data) => {
+      buffer += data.toString();
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        if (line.trim()) {
+          handleAcpLine(session, line);
+        }
       }
-    }
-    session.partialStderr = (session.partialStderr || '') + text;
-    const msg: AcpChatMessage = { role: 'system', text: `ACP stderr: ${text.trim()}`, timestamp: Date.now() };
-    session.messages.push(msg);
-    broadcast('acp:event', chatId, { type: 'error', text: text.trim() });
-  });
+    });
 
-  proc.on('exit', (code) => {
+    proc.stderr?.on('data', (data) => {
+      const text = data.toString();
+      const now = Date.now();
+      if (session.cancelGraceUntil && now < session.cancelGraceUntil) {
+        // Suppress cancel-specific stderr noise
+        if (text.includes('Method not found') || text.includes('session/cancel') || text.includes('-32601')) {
+          return;
+        }
+      }
+      session.partialStderr = (session.partialStderr || '') + text;
+      const msg: AcpChatMessage = { role: 'system', text: `ACP stderr: ${text.trim()}`, timestamp: Date.now() };
+      session.messages.push(msg);
+      broadcast('acp:event', chatId, { type: 'error', text: text.trim() });
+    });
+
+    proc.on('exit', (code) => {
+      session.status = 'error';
+      broadcast('acp:event', chatId, { type: 'exit', code });
+    });
+
+    proc.on('error', (err) => {
+      session.status = 'error';
+      const text = err.message;
+      const msg: AcpChatMessage = { role: 'system', text: `ACP spawn error: ${text}`, timestamp: Date.now() };
+      session.messages.push(msg);
+      broadcast('acp:event', chatId, { type: 'error', text: `ACP spawn error: ${text}` });
+    });
+
+    // Send initialize
+    sendRpc(session, 'initialize', {
+      protocolVersion: 1,
+      clientCapabilities: {
+        fs: { readTextFile: false, writeTextFile: false },
+        terminal: false,
+      },
+      clientInfo: { name: 'opencode-local-acp', title: 'OpenCode', version: '1.0.0' },
+    });
+  } catch (err) {
     session.status = 'error';
-    broadcast('acp:event', chatId, { type: 'exit', code });
-  });
-
-  // Send initialize
-  sendRpc(session, 'initialize', {
-    protocolVersion: '2024-11-05',
-    capabilities: {},
-    clientInfo: { name: 'opencode-local-acp', version: '1.0.0' },
-  });
+    const text = err instanceof Error ? err.message : String(err);
+    const msg: AcpChatMessage = { role: 'system', text: `ACP spawn error: ${text}`, timestamp: Date.now() };
+    session.messages.push(msg);
+    broadcast('acp:event', chatId, { type: 'error', text: `ACP spawn error: ${text}` });
+  }
 
   return chatId;
 }
@@ -154,75 +187,177 @@ function handleAcpLine(session: AcpSession, line: string): void {
     const method = msg.method as string | undefined;
     const result = msg.result as Record<string, unknown> | undefined;
     const id = msg.id as number | string | undefined;
+    const error = msg.error as Record<string, unknown> | undefined;
 
-    // Handle responses (have result + id) and notifications (have method)
-    // Response to initialize -> send session/new
-    if ((method === 'initialized' && result) || (result && id !== undefined && !method && result.protocolVersion !== undefined)) {
-      sendRpc(session, 'session/new', {
-        cwd: session.cwd,
-        mcpServers: session.mcpServers,
-      });
-    } else if (method === 'session/new' || (result && result.sessionId !== undefined)) {
-      const resultObj = result || (msg as Record<string, unknown>);
-      session.sessionId = (resultObj.sessionId as string) || undefined;
-      session.status = 'idle';
-      if (resultObj.configOptions) {
-        session.configOptions = resultObj.configOptions as AcpConfigOption[];
+    // Handle JSON-RPC error responses first
+    if (error) {
+      session.status = 'error';
+      const text = (error.message as string) || JSON.stringify(error);
+      const errMsg: AcpChatMessage = { role: 'system', text: `ACP error: ${text}`, timestamp: Date.now() };
+      session.messages.push(errMsg);
+      broadcast('acp:event', session.chatId, { type: 'error', text: `ACP error: ${text}` });
+      return;
+    }
+
+    // Responses (have result + id)
+    if (id !== undefined && result) {
+      // Response to initialize -> send session/new
+      if (result.protocolVersion !== undefined) {
+        sendRpc(session, 'session/new', {
+          cwd: session.cwd,
+          mcpServers: session.mcpServers,
+        });
+        return;
       }
-      updateAcpStandbyStatus(session.chatId, 'idle', session.sessionId);
-      broadcast('acp:event', session.chatId, { type: 'sessionCreated', sessionId: session.sessionId });
-    } else if (method === 'session/prompt' || (result && result.text !== undefined)) {
-      const resultObj = result || (msg as Record<string, unknown>);
-      const response: AcpChatMessage = {
-        role: 'assistant',
-        text: (resultObj.text as string) || '',
-        timestamp: Date.now(),
-      };
-      session.messages.push(response);
-      session.status = 'idle';
-      updateAcpStandbyStatus(session.chatId, 'idle');
-      broadcast('acp:event', session.chatId, { type: 'promptResponse', text: response.text, queuedPrompts: session.queuedPrompts.length });
-      // Flush queued prompts one at a time
-      flushNextQueuedPrompt(session);
-    } else if (method === 'config_option_update') {
-      const params = msg.params as Record<string, unknown>;
-      const options = params.configOptions as AcpConfigOption[] | undefined;
-      if (options) {
-        session.configOptions = options;
-        const modelOpt = options.find((o) => o.id === 'model');
-        if (modelOpt) session.currentModel = modelOpt.currentValue;
-        const effortOpt = options.find((o) => o.id === 'effort');
-        if (effortOpt) session.currentEffort = effortOpt.currentValue;
+
+      // session/new response
+      if (result.sessionId !== undefined) {
+        session.sessionId = (result.sessionId as string) || undefined;
+        session.status = 'idle';
+        if (result.configOptions) {
+          session.configOptions = result.configOptions as AcpConfigOption[];
+          const modelOpt = session.configOptions.find((o) => o.id === 'model');
+          if (modelOpt) session.currentModel = modelOpt.currentValue;
+          const effortOpt = session.configOptions.find((o) => o.id === 'effort');
+          if (effortOpt) session.currentEffort = effortOpt.currentValue;
+          broadcast('acp:event', session.chatId, { type: 'configOptions', options: session.configOptions });
+        }
+        updateAcpStandbyStatus(session.chatId, 'idle', session.sessionId);
+        broadcast('acp:event', session.chatId, { type: 'sessionCreated', sessionId: session.sessionId });
+        // Flush any prompts queued while starting
+        flushNextQueuedPrompt(session);
+        return;
       }
-      broadcast('acp:event', session.chatId, { type: 'configOptions', options });
-    } else if (method === 'current_mode_update') {
-      const params = msg.params as Record<string, unknown>;
-      const modeId = (params.currentModeId as string) || (params.modeId as string);
-      if (modeId) {
-        session.currentModeId = modeId;
-        applyModeModelBinding(session, modeId);
+
+      // session/prompt response (turn complete)
+      if (result.stopReason !== undefined || result.text !== undefined) {
+        session.status = 'idle';
+        updateAcpStandbyStatus(session.chatId, 'idle');
+        broadcast('acp:event', session.chatId, { type: 'promptResponse', stopReason: result.stopReason, text: result.text, queuedPrompts: session.queuedPrompts.length });
+        // Flush queued prompts one at a time
+        flushNextQueuedPrompt(session);
+        return;
       }
-      broadcast('acp:event', session.chatId, { type: 'modeUpdate', modeId });
-    } else if (method === 'available_commands_update') {
+
+      return;
+    }
+
+    // Requests from agent (have id and method, no result)
+    if (id !== undefined && method) {
+      if (method === 'session/request_permission') {
+        const params = msg.params as Record<string, unknown>;
+        const optionsRaw = (params.options as Array<Record<string, unknown>>) || [];
+        const options = optionsRaw.map((o) => ({
+          id: (o.optionId as string) || '',
+          label: (o.name as string) || '',
+        }));
+        session.status = 'permission';
+        updateAcpStandbyStatus(session.chatId, 'permission');
+        broadcast('acp:event', session.chatId, {
+          type: 'permission',
+          requestId: params.requestId,
+          message: params.message,
+          options,
+          multiple: params.multiple,
+          custom: params.custom,
+          sessionId: session.sessionId,
+        });
+        return;
+      }
+      return;
+    }
+
+    // Notifications (no id, have method)
+    if (method === 'session/update') {
       const params = msg.params as Record<string, unknown>;
-      const commands = (params.availableCommands as AcpAvailableCommand[]) || (params.commands as AcpAvailableCommand[]);
-      if (commands) session.availableCommands = commands;
-      broadcast('acp:event', session.chatId, { type: 'commands', commands });
-    } else if (method === 'permission_request') {
-      const params = msg.params as Record<string, unknown>;
-      session.status = 'permission';
-      updateAcpStandbyStatus(session.chatId, 'permission');
-      broadcast('acp:event', session.chatId, {
-        type: 'permission',
-        requestId: params.requestId,
-        message: params.message,
-        options: params.options,
-        multiple: params.multiple,
-        custom: params.custom,
-        sessionId: session.sessionId,
-      });
-    } else if (method) {
-      // Unknown notification
+      const update = (params.update as Record<string, unknown>) || {};
+      const sessionUpdate = (update.sessionUpdate as string) || '';
+
+      switch (sessionUpdate) {
+        case 'agent_message_chunk': {
+          const content = (update.content as Record<string, unknown>) || {};
+          const text = (content.text as string) || '';
+          const lastMsg = session.messages[session.messages.length - 1];
+          if (lastMsg && lastMsg.role === 'assistant') {
+            lastMsg.text += text;
+          } else {
+            session.messages.push({ role: 'assistant', text, timestamp: Date.now() });
+          }
+          broadcast('acp:event', session.chatId, { type: 'messageChunk', text, role: 'assistant' });
+          return;
+        }
+        case 'user_message_chunk': {
+          const content = (update.content as Record<string, unknown>) || {};
+          const text = (content.text as string) || '';
+          const lastMsg = session.messages[session.messages.length - 1];
+          if (lastMsg && lastMsg.role === 'user') {
+            lastMsg.text += text;
+          } else {
+            session.messages.push({ role: 'user', text, timestamp: Date.now() });
+          }
+          broadcast('acp:event', session.chatId, { type: 'messageChunk', text, role: 'user' });
+          return;
+        }
+        case 'tool_call': {
+          const toolCallId = (update.toolCallId as string) || '';
+          const title = (update.title as string) || '';
+          const kind = (update.kind as string) || '';
+          const status = (update.status as string) || 'pending';
+          session.messages.push({ role: 'system', text: `${title} (${kind})`, timestamp: Date.now() });
+          broadcast('acp:event', session.chatId, { type: 'toolCall', toolCallId, title, kind, status });
+          return;
+        }
+        case 'tool_call_update': {
+          const toolCallId = (update.toolCallId as string) || '';
+          const status = (update.status as string) || '';
+          broadcast('acp:event', session.chatId, { type: 'toolCallUpdate', toolCallId, status });
+          return;
+        }
+        case 'current_mode_update': {
+          const modeId = (update.currentModeId as string) || (update.modeId as string);
+          if (modeId) {
+            session.currentModeId = modeId;
+            applyModeModelBinding(session, modeId);
+          }
+          broadcast('acp:event', session.chatId, { type: 'modeUpdate', modeId });
+          return;
+        }
+        case 'config_option_update': {
+          const optionsRaw = update.configOptions as AcpConfigOption[] | undefined;
+          if (optionsRaw) {
+            session.configOptions = optionsRaw;
+            const modelOpt = optionsRaw.find((o) => o.id === 'model');
+            if (modelOpt) session.currentModel = modelOpt.currentValue;
+            const effortOpt = optionsRaw.find((o) => o.id === 'effort');
+            if (effortOpt) session.currentEffort = effortOpt.currentValue;
+          } else {
+            // Legacy fallback: single field format
+            const category = (update.category as string) || '';
+            const value = (update.value as string) || '';
+            if (category) {
+              const existing = session.configOptions.find((o) => o.id === category);
+              if (existing) {
+                existing.currentValue = value;
+              } else {
+                session.configOptions.push({ id: category, name: category, category, currentValue: value, options: [] });
+              }
+            }
+          }
+          broadcast('acp:event', session.chatId, { type: 'configOptions', options: session.configOptions });
+          return;
+        }
+        case 'available_commands_update': {
+          const commands = (update.availableCommands as AcpAvailableCommand[]) || (update.commands as AcpAvailableCommand[]) || [];
+          session.availableCommands = commands;
+          broadcast('acp:event', session.chatId, { type: 'commands', commands });
+          return;
+        }
+        default:
+          return;
+      }
+    }
+
+    if (method) {
       broadcast('acp:event', session.chatId, { type: 'raw', message: msg });
     }
   } catch {
@@ -249,7 +384,7 @@ function flushNextQueuedPrompt(session: AcpSession): void {
   updateAcpStandbyStatus(session.chatId, 'running');
   const msg: AcpChatMessage = { role: 'user', text: fullText, timestamp: Date.now() };
   session.messages.push(msg);
-  sendRpc(session, 'session/prompt', { sessionId: session.sessionId, promptText: fullText });
+  sendRpc(session, 'session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: fullText }] });
   broadcast('acp:event', session.chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
 }
 
@@ -279,7 +414,7 @@ export function sendAcpPrompt(chatId: string, promptText: string, attachments: s
   updateAcpStandbyStatus(session.chatId, 'running');
   const msg: AcpChatMessage = { role: 'user', text: fullText, timestamp: Date.now() };
   session.messages.push(msg);
-  sendRpc(session, 'session/prompt', { sessionId: session.sessionId, promptText: fullText });
+  sendRpc(session, 'session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: fullText }] });
   broadcast('acp:event', chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
 }
 
@@ -345,7 +480,13 @@ export function getAcpSession(chatId: string): AcpChatSession | undefined {
 export function killAcpChat(chatId: string): void {
   const session = sessions.get(chatId);
   if (!session) return;
-  session.process.kill();
+  if (session.process) {
+    try {
+      session.process.kill();
+    } catch {
+      // ignore
+    }
+  }
   sessions.delete(chatId);
 }
 
@@ -367,7 +508,13 @@ export async function warmAcpStandby(projectId: number, cwd: string): Promise<vo
   if (existing) {
     const oldSession = sessions.get(existing.chatId);
     if (oldSession) {
-      oldSession.process.kill();
+      if (oldSession.process) {
+        try {
+          oldSession.process.kill();
+        } catch {
+          // ignore
+        }
+      }
       sessions.delete(existing.chatId);
     }
     standbyPool.delete(projectId);
@@ -402,7 +549,13 @@ export function clearAcpStandby(projectId: number): void {
     if (entry.chatId) {
       const session = sessions.get(entry.chatId);
       if (session) {
-        session.process.kill();
+        if (session.process) {
+          try {
+            session.process.kill();
+          } catch {
+            // ignore
+          }
+        }
         sessions.delete(entry.chatId);
       }
     }
