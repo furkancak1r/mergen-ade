@@ -100,13 +100,32 @@ export function recordInputHistory(
   };
 }
 
+export function removeProjectInputHistory(history: AppHistory, projectPath: string | undefined): AppHistory {
+  if (!projectPath || !(projectPath in history.projects)) {
+    return history;
+  }
+
+  const { [projectPath]: _removed, ...projects } = history.projects;
+  return {
+    ...history,
+    projects,
+  };
+}
+
+export function removeProjectsInputHistory(history: AppHistory, projectPaths: string[]): AppHistory {
+  let next = history;
+  for (const projectPath of projectPaths) {
+    next = removeProjectInputHistory(next, projectPath);
+  }
+  return next;
+}
+
 export function formatHistoryRelativeTime(recordedAt: number, nowSeconds = Math.floor(Date.now() / 1000)): string {
   const ageSeconds = Math.max(0, nowSeconds - recordedAt);
-  if (ageSeconds < 60) return 'now';
-  const minutes = Math.floor(ageSeconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  const days = Math.floor(hours / 24);
-  return `${days}d`;
+  if (ageSeconds < 60) return 'just now';
+  if (ageSeconds < 3600) return `${Math.floor(ageSeconds / 60)}m ago`;
+  if (ageSeconds < 86400) return `${Math.floor(ageSeconds / 3600)}h ago`;
+  if (ageSeconds < 604800) return `${Math.floor(ageSeconds / 86400)}d ago`;
+  if (ageSeconds < 2592000) return `${Math.floor(ageSeconds / 604800)}w ago`;
+  return `${Math.floor(ageSeconds / 2592000)}mo ago`;
 }

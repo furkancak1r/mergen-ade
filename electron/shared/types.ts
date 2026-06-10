@@ -717,6 +717,8 @@ export interface SourceControlSnapshot {
   files: SourceControlFile[];
   worktrees: GitWorktreeInfo[];
   branch?: string;
+  ahead?: number;
+  behind?: number;
   lastUpdated?: number;
 }
 
@@ -733,6 +735,13 @@ export interface GitWorktreeInfo {
   detached: boolean;
   locked: boolean;
   prunable: boolean;
+}
+
+export interface SourceControlStatus {
+  files: SourceControlFile[];
+  branch: string;
+  ahead: number;
+  behind: number;
 }
 
 export interface AcpChatSession {
@@ -853,7 +862,7 @@ export interface IpcChannels {
 
   // Git / Worktree
   'git:diffSummary': (repoPath: string) => Promise<GitDiffSummary>;
-  'git:status': (repoPath: string) => Promise<{ files: SourceControlFile[]; branch: string }>;
+  'git:status': (repoPath: string) => Promise<SourceControlStatus>;
   'git:discoverWorktrees': (repoPath: string) => Promise<GitWorktreeInfo[]>;
   'git:createWorktree': (repoPath: string, branch: string, worktreePath: string, baseBranch?: string) => Promise<boolean>;
   'git:removeWorktree': (repoPath: string, worktreePath: string) => Promise<boolean>;
@@ -929,6 +938,7 @@ export interface IpcChannels {
 
   // Shell / External
   'shell:openExternal': (url: string) => Promise<void>;
+  'shell:showItemInFolder': (filePath: string) => Promise<void>;
 }
 
 export interface BrowserMcpRequest {
@@ -950,7 +960,7 @@ export interface BrowserMcpAuthScope {
   sessionId: string;
 }
 
-export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'diagnostics:get' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'git:diffSummary' | 'git:status' | 'git:discoverWorktrees' | 'git:createWorktree' | 'git:removeWorktree' | 'git:copyEnvFiles' | 'acp:spawn' | 'acp:send' | 'acp:cancel' | 'acp:setConfigOption' | 'acp:permissionResponse' | 'acp:questionResponse' | 'acp:getSession' | 'acp:kill' | 'acp:standby:warm' | 'acp:standby:get' | 'acp:standby:clear' | 'acp:standby:promote' | 'acp:standby:clearAll' | 'hook:answer' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'notify:show' | 'window:confirmClose'>;
+export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'diagnostics:get' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'git:diffSummary' | 'git:status' | 'git:discoverWorktrees' | 'git:createWorktree' | 'git:removeWorktree' | 'git:copyEnvFiles' | 'acp:spawn' | 'acp:send' | 'acp:cancel' | 'acp:setConfigOption' | 'acp:permissionResponse' | 'acp:questionResponse' | 'acp:getSession' | 'acp:kill' | 'acp:standby:warm' | 'acp:standby:get' | 'acp:standby:clear' | 'acp:standby:promote' | 'acp:standby:clearAll' | 'hook:answer' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'shell:showItemInFolder' | 'notify:show' | 'window:confirmClose'>;
 
 export type IpcSendChannel = keyof Pick<IpcChannels, 'pty:data' | 'pty:exit' | 'hook:status' | 'acp:event' | 'browser:urlChanged' | 'browser:designElementClicked' | 'window:closeRequest' | 'window:focused'>;
 

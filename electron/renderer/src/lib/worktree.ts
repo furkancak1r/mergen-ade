@@ -58,6 +58,7 @@ export function parseGitWorktreeList(output: string): GitWorktreeInfo[] {
 export function sanitizeWorktreeSlug(branchName: string): string {
   return branchName
     .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/[\\/ :*?"<>|]/g, '-')
+    .replace(/\.\./g, '-')
     .replace(/^-+|-+$/g, '');
 }

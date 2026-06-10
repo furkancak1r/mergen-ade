@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseGitWorktreeList } from './worktree';
+import { parseGitWorktreeList, sanitizeWorktreeSlug } from './worktree';
 
 describe('parseGitWorktreeList', () => {
   it('parses normal worktrees', () => {
@@ -73,5 +73,12 @@ prunable`;
   it('returns empty array for empty input', () => {
     const result = parseGitWorktreeList('');
     expect(result).toHaveLength(0);
+  });
+
+  it('sanitizes worktree slugs like the Rust app', () => {
+    expect(sanitizeWorktreeSlug('Feature/Foo Bar')).toBe('feature-foo-bar');
+    expect(sanitizeWorktreeSlug('release.v1')).toBe('release.v1');
+    expect(sanitizeWorktreeSlug('fix..bug')).toBe('fix-bug');
+    expect(sanitizeWorktreeSlug('özellik/çağrı')).toBe('özellik-çağrı');
   });
 });

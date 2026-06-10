@@ -145,6 +145,9 @@ export function registerIpcHandlers() {
   ipcMain.handle('shell:openExternal', async (_event, url: string) => {
     await shell.openExternal(url);
   });
+  ipcMain.handle('shell:showItemInFolder', async (_event, filePath: string) => {
+    shell.showItemInFolder(filePath);
+  });
 
   // ACP
   ipcMain.handle('acp:spawn', async (_event, opts: { projectId: number; cwd: string; mcpServers: string[] }) => {

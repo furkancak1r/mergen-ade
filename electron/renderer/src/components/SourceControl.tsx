@@ -1,5 +1,6 @@
-import React, { useEffect, useState, useCallback } from 'react';
-import type { ProjectRecord, GitWorktreeInfo, SourceControlSnapshot } from '../../../shared/types';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import type { ProjectRecord, GitWorktreeInfo, SourceControlSnapshot, SourceControlStatus } from '../../../shared/types';
+import { sourceControlBranchLine, sourceControlFileAbsolutePath, sourceControlStatusLabel } from '../../../shared/sourceControl';
 import { repairMojibakeDisplay } from '../lib/mojibake';
 import { sanitizeWorktreeSlug } from '../lib/worktree';
 
@@ -23,18 +24,23 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
   const [createBranch, setCreateBranch] = useState('');
   const [createBaseBranch, setCreateBaseBranch] = useState('');
   const [createLoading, setCreateLoading] = useState(false);
+  const [fileContextMenu, setFileContextMenu] = useState<{ x: number; y: number; filePath: string; relativePath: string } | null>(null);
+  const [feedback, setFeedback] = useState<string | null>(null);
+  const feedbackTimerRef = useRef<number | null>(null);
 
   const refresh = useCallback(async (manual = false) => {
     if (manual) {
       setSnapshot((prev) => ({ ...prev, loading: true }));
     }
-    const result = await api.invoke('git:status', project.path) as { files: { path: string; status: string; staged: boolean }[]; branch: string };
+    const result = await api.invoke('git:status', project.path) as SourceControlStatus;
     const worktrees = await api.invoke('git:discoverWorktrees', project.path) as GitWorktreeInfo[];
     setSnapshot({
       loading: false,
       files: result.files,
       worktrees: worktrees.filter((w) => w.path !== project.path),
       branch: result.branch,
+      ahead: result.ahead,
+      behind: result.behind,
       lastUpdated: Date.now(),
     });
   }, [project.path]);
@@ -50,6 +56,38 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
       onBranchChange?.(snapshot.branch);
     }
   }, [snapshot.branch, onBranchChange]);
+
+  useEffect(() => () => {
+    if (feedbackTimerRef.current !== null) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!fileContextMenu) return undefined;
+
+    const closeMenu = () => setFileContextMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu();
+    };
+    window.addEventListener('click', closeMenu);
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      window.removeEventListener('click', closeMenu);
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [fileContextMenu]);
+
+  const showFeedback = useCallback((message: string) => {
+    setFeedback(message);
+    if (feedbackTimerRef.current !== null) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setFeedback(null);
+      feedbackTimerRef.current = null;
+    }, 1600);
+  }, []);
 
   // Orphan worktree cleanup: auto-remove registered worktrees that no longer exist
   useEffect(() => {
@@ -73,10 +111,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
   }, [snapshot.worktrees, snapshot.loading, registeredWorktreePaths, onOrphanWorktrees]);
 
   const statusLabel = (status: string): string => {
-    const map: Record<string, string> = {
-      M: 'Modified', A: 'Added', D: 'Deleted', R: 'Renamed', C: 'Copied', U: 'Updated', '?': 'Untracked',
-    };
-    return map[status] || status;
+    return status.length === 1 ? sourceControlStatusLabel(status) : status;
   };
 
   const filteredFiles = snapshot.files.filter((f) => {
@@ -91,9 +126,10 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
     const q = query.toLowerCase();
     return w.branch.toLowerCase().includes(q) || w.path.toLowerCase().includes(q);
   });
+  const branchLine = sourceControlBranchLine(snapshot);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', position: 'relative' }}>
       <div style={{ padding: '8px 12px', borderBottom: '1px solid #222', display: 'flex', alignItems: 'center', gap: 8 }}>
         <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>
           {repairMojibakeDisplay(project.name)}
@@ -101,6 +137,11 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
         <span style={{ fontSize: 11, color: '#888' }}>
           {snapshot.files.length > 0 ? `${snapshot.files.length} changes` : 'Clean'}
         </span>
+        {branchLine && (
+          <span style={{ fontSize: 11, color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {repairMojibakeDisplay(branchLine)}
+          </span>
+        )}
         <button
           onClick={() => setShowCreateModal(true)}
           style={{
@@ -188,7 +229,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
                       return;
                     }
                     // Check worktree-specific uncommitted changes
-                    const worktreeStatus = await api.invoke('git:status', w.path) as { files: { path: string; status: string; staged: boolean }[] };
+                    const worktreeStatus = await api.invoke('git:status', w.path) as SourceControlStatus;
                     if (worktreeStatus.files.length > 0) {
                       alert('Cannot delete: worktree has uncommitted changes.');
                       return;
@@ -209,22 +250,34 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
         {filteredFiles.length > 0 && (
           <div>
             <div style={{ padding: '4px 12px', fontSize: 11, color: '#888', fontWeight: 600 }}>Changed Files</div>
-            {filteredFiles.map((f) => (
-              <div key={f.path} style={{ padding: '3px 12px', display: 'flex', alignItems: 'center', gap: 6 }}>
+            {filteredFiles.map((f) => {
+              const filePath = sourceControlFileAbsolutePath(project.path, f.path);
+              return (
+              <div
+                key={f.path}
+                style={{ padding: '3px 12px', display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, cursor: 'context-menu' }}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setFileContextMenu({ x: event.clientX, y: event.clientY, filePath, relativePath: f.path });
+                }}
+              >
                 <span style={{
-                  fontSize: 9,
+                  fontSize: 10,
                   fontWeight: 600,
                   color: f.staged ? '#64c864' : '#e8a838',
                   width: 14,
                   textAlign: 'center',
+                  flexShrink: 0,
                 }}>
-                  {f.status}
+                  {f.staged ? '✓' : '◷'}
                 </span>
-                <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {repairMojibakeDisplay(f.path)}
+                <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace' }}>
+                  {repairMojibakeDisplay(`${statusLabel(f.status)} ${f.path}`)}
                 </span>
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -232,6 +285,42 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, onAddWork
           <div style={{ padding: 12, color: '#888', fontSize: 12 }}>No matching files or worktrees.</div>
         )}
       </div>
+
+      {feedback && (
+        <div className="source-control-feedback-toast" role="status">
+          {feedback}
+        </div>
+      )}
+
+      {fileContextMenu && (
+        <div
+          className="source-control-context-menu"
+          style={{ left: fileContextMenu.x, top: fileContextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              api.invoke('shell:showItemInFolder', fileContextMenu.filePath)
+                .then(() => showFeedback('Opened containing folder'))
+                .catch((error) => showFeedback(`Open folder failed: ${error instanceof Error ? error.message : String(error)}`));
+              setFileContextMenu(null);
+            }}
+          >
+            Open in Folder
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              api.invoke('clipboard:writeText', fileContextMenu.relativePath).catch(() => {});
+              showFeedback('Copied relative path');
+              setFileContextMenu(null);
+            }}
+          >
+            Copy Relative Path
+          </button>
+        </div>
+      )}
       {/* Create Worktree Modal */}
       {showCreateModal && (
         <div

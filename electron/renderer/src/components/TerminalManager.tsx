@@ -41,6 +41,7 @@ const TERMINAL_HISTORY_MESSAGE_MAX_HEIGHT = 120;
 const TERMINAL_HISTORY_POPUP_MAX_VISIBLE_ENTRIES = 5;
 const TERMINAL_HISTORY_POPUP_CHROME_HEIGHT_ESTIMATE = 56;
 const TERMINAL_HISTORY_POPUP_ROW_GAP = 4;
+const TERMINAL_MANAGER_DIFF_REFRESH_INTERVAL_MS = 30_000;
 
 function withAlpha(color: string, alpha: number): string {
   const r = parseInt(color.slice(1, 3), 16);
@@ -124,44 +125,56 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
 
   useEffect(() => {
     let cancelled = false;
-    const projects = config.projects;
-    setDiffSummaryLoading(new Set(projects.map((p) => p.id)));
-    setDiffSummaries((prev) => {
-      const next = new Map<number, GitDiffSummary>();
-      for (const project of projects) {
-        const existing = prev.get(project.id);
-        if (existing) next.set(project.id, existing);
-      }
-      return next;
-    });
 
-    for (const project of projects) {
-      api.invoke('git:diffSummary', project.path)
-        .then((value) => {
-          if (cancelled) return;
-          setDiffSummaries((prev) => new Map(prev).set(project.id, value as GitDiffSummary));
-        })
-        .catch((error) => {
-          if (cancelled) return;
-          setDiffSummaries((prev) => new Map(prev).set(project.id, {
-            status: 'error',
-            addedLines: 0,
-            removedLines: 0,
-            error: error instanceof Error ? error.message : String(error),
-          }));
-        })
-        .finally(() => {
-          if (cancelled) return;
-          setDiffSummaryLoading((prev) => {
-            const next = new Set(prev);
-            next.delete(project.id);
-            return next;
+    const refreshDiffSummaries = (showLoading: boolean) => {
+      const projects = config.projects;
+      if (showLoading) {
+        setDiffSummaryLoading(new Set(projects.map((p) => p.id)));
+      }
+      setDiffSummaries((prev) => {
+        const next = new Map<number, GitDiffSummary>();
+        for (const project of projects) {
+          const existing = prev.get(project.id);
+          if (existing) next.set(project.id, existing);
+        }
+        return next;
+      });
+
+      for (const project of projects) {
+        api.invoke('git:diffSummary', project.path)
+          .then((value) => {
+            if (cancelled) return;
+            setDiffSummaries((prev) => new Map(prev).set(project.id, value as GitDiffSummary));
+          })
+          .catch((error) => {
+            if (cancelled) return;
+            setDiffSummaries((prev) => new Map(prev).set(project.id, {
+              status: 'error',
+              addedLines: 0,
+              removedLines: 0,
+              error: error instanceof Error ? error.message : String(error),
+            }));
+          })
+          .finally(() => {
+            if (cancelled || !showLoading) return;
+            setDiffSummaryLoading((prev) => {
+              const next = new Set(prev);
+              next.delete(project.id);
+              return next;
+            });
           });
-        });
-    }
+      }
+    };
+
+    refreshDiffSummaries(true);
+    const interval = window.setInterval(
+      () => refreshDiffSummaries(false),
+      TERMINAL_MANAGER_DIFF_REFRESH_INTERVAL_MS,
+    );
 
     return () => {
       cancelled = true;
+      window.clearInterval(interval);
     };
   }, [projectDiffKey]);
 

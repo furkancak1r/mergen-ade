@@ -5,6 +5,8 @@ import {
   collectInputHistoryEntries,
   formatHistoryRelativeTime,
   inputHistoryFilterMatchesKind,
+  removeProjectInputHistory,
+  removeProjectsInputHistory,
   recordInputHistory,
 } from './inputHistory';
 
@@ -138,10 +140,45 @@ describe('inputHistory', () => {
     expect(next.projects['C:\\repo'].entries.map((entry) => entry.text)).toEqual(['new', 'old']);
   });
 
+  it('removes input history for deleted projects without touching other projects', () => {
+    const appHistory: AppHistory = {
+      version: 1,
+      projects: {
+        'C:\\repo': { maxEntries: 500, entries: [record({ text: 'root' })] },
+        'C:\\repo-wt': { maxEntries: 500, entries: [record({ text: 'worktree', projectPath: 'C:\\repo-wt' })] },
+      },
+    };
+
+    const next = removeProjectInputHistory(appHistory, 'C:\\repo-wt');
+
+    expect(next).not.toBe(appHistory);
+    expect(next.projects).not.toHaveProperty('C:\\repo-wt');
+    expect(next.projects['C:\\repo'].entries[0].text).toBe('root');
+  });
+
+  it('removes multiple project histories for orphan cleanup', () => {
+    const appHistory: AppHistory = {
+      version: 1,
+      projects: {
+        'C:\\repo': { maxEntries: 500, entries: [record({ text: 'root' })] },
+        'C:\\repo-wt-a': { maxEntries: 500, entries: [record({ text: 'a', projectPath: 'C:\\repo-wt-a' })] },
+        'C:\\repo-wt-b': { maxEntries: 500, entries: [record({ text: 'b', projectPath: 'C:\\repo-wt-b' })] },
+      },
+    };
+
+    const next = removeProjectsInputHistory(appHistory, ['C:\\repo-wt-a', 'C:\\repo-wt-b']);
+
+    expect(next.projects).toEqual({
+      'C:\\repo': { maxEntries: 500, entries: [record({ text: 'root' })] },
+    });
+  });
+
   it('formats relative history times', () => {
-    expect(formatHistoryRelativeTime(100, 120)).toBe('now');
-    expect(formatHistoryRelativeTime(60, 180)).toBe('2m');
-    expect(formatHistoryRelativeTime(0, 7200)).toBe('2h');
-    expect(formatHistoryRelativeTime(0, 172800)).toBe('2d');
+    expect(formatHistoryRelativeTime(100, 120)).toBe('just now');
+    expect(formatHistoryRelativeTime(60, 180)).toBe('2m ago');
+    expect(formatHistoryRelativeTime(0, 7200)).toBe('2h ago');
+    expect(formatHistoryRelativeTime(0, 172800)).toBe('2d ago');
+    expect(formatHistoryRelativeTime(0, 1209600)).toBe('2w ago');
+    expect(formatHistoryRelativeTime(0, 5184000)).toBe('2mo ago');
   });
 });

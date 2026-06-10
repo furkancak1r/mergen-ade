@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppConfig, AppHistory, InputHistoryFilter } from '../../../shared/types';
 import { InputHistoryFilter as InputHistoryFilterEnum, InputHistoryFilterLabel, TerminalKindLabel } from '../../../shared/types';
 import { collectInputHistoryEntries, formatHistoryRelativeTime } from '../lib/inputHistory';
@@ -22,12 +22,48 @@ export const InputHistory: React.FC<InputHistoryProps> = ({
     selectedProjectId ?? config.ui.lastSelectedProjectId ?? config.projects[0]?.id ?? null,
   );
   const [searchQuery, setSearchQuery] = useState('');
+  const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; text: string } | null>(null);
+  const copyFeedbackTimerRef = useRef<number | null>(null);
   const filter = config.ui.inputHistoryFilter;
 
   useEffect(() => {
     if (historyProjectId !== null && config.projects.some((project) => project.id === historyProjectId)) return;
     setHistoryProjectId(selectedProjectId ?? config.projects[0]?.id ?? null);
   }, [config.projects, historyProjectId, selectedProjectId]);
+
+  useEffect(() => () => {
+    if (copyFeedbackTimerRef.current !== null) {
+      window.clearTimeout(copyFeedbackTimerRef.current);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!contextMenu) return undefined;
+
+    const closeMenu = () => setContextMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu();
+    };
+    window.addEventListener('click', closeMenu);
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      window.removeEventListener('click', closeMenu);
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [contextMenu]);
+
+  const copyHistoryText = useCallback((text: string) => {
+    api.invoke('clipboard:writeText', text).catch(() => {});
+    setCopyFeedback('Copied to clipboard');
+    if (copyFeedbackTimerRef.current !== null) {
+      window.clearTimeout(copyFeedbackTimerRef.current);
+    }
+    copyFeedbackTimerRef.current = window.setTimeout(() => {
+      setCopyFeedback(null);
+      copyFeedbackTimerRef.current = null;
+    }, 1600);
+  }, []);
 
   const selectedProject = historyProjectId === null
     ? undefined
@@ -41,7 +77,7 @@ export const InputHistory: React.FC<InputHistoryProps> = ({
   );
 
   return (
-    <div className="input-history" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+    <div className="input-history" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', position: 'relative' }}>
       <div style={{ padding: '8px 8px 6px', borderBottom: '1px solid #222', display: 'flex', flexDirection: 'column', gap: 8 }}>
         <div>
           <div style={{ fontSize: 10, color: '#888', marginBottom: 4 }}>Project</div>
@@ -66,29 +102,16 @@ export const InputHistory: React.FC<InputHistoryProps> = ({
           </select>
         </div>
 
-        <div style={{ display: 'flex', gap: 2 }}>
+        <div className="input-history-filter-tabs">
           {([InputHistoryFilterEnum.All, InputHistoryFilterEnum.Foreground, InputHistoryFilterEnum.Background] as InputHistoryFilter[]).map((candidate) => {
             const selected = filter === candidate;
             return (
               <button
                 key={candidate}
                 onClick={() => onUpdateFilter(candidate)}
-                style={{
-                  flex: 1,
-                  padding: '4px 8px',
-                  fontSize: 11,
-                  background: selected ? '#1f3a4c' : 'transparent',
-                  color: selected ? '#7ec0ee' : '#888',
-                  border: '1px solid ' + (selected ? '#1f3a4c' : '#333'),
-                  borderRadius: 4,
-                  cursor: 'pointer',
-                }}
+                className={`input-history-filter-tab ${selected ? 'selected' : ''}`}
               >
-                {candidate === InputHistoryFilterEnum.Foreground
-                  ? 'FG'
-                  : candidate === InputHistoryFilterEnum.Background
-                    ? 'BG'
-                    : InputHistoryFilterLabel[candidate]}
+                {InputHistoryFilterLabel[candidate]}
               </button>
             );
           })}
@@ -126,27 +149,24 @@ export const InputHistory: React.FC<InputHistoryProps> = ({
             {result.entries.map((entry, i) => (
               <div
                 key={`${entry.recordedAt}-${i}-${entry.text}`}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  padding: '4px 8px',
-                  cursor: 'pointer',
-                  borderRadius: 3,
-                  background: 'transparent',
-                }}
+                className="input-history-row"
                 onClick={() => {
-                  api.invoke('clipboard:writeText', entry.text);
+                  copyHistoryText(entry.text);
+                }}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setContextMenu({ x: event.clientX, y: event.clientY, text: entry.text });
                 }}
                 title={`${entry.projectName} - ${TerminalKindLabel[entry.kind]}`}
               >
-                <span style={{ fontSize: 10, color: '#666', flexShrink: 0, width: 20 }}>
+                <span style={{ fontSize: 11, color: entry.kind === 'foreground' ? '#aaaaaa' : '#8a8a8a', flexShrink: 0, width: 22 }}>
                   {entry.kind === 'foreground' ? 'FG' : 'BG'}
                 </span>
-                <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <span style={{ fontSize: 13, color: '#f4f4f4', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {entry.text}
                 </span>
-                <span style={{ fontSize: 10, color: '#666', flexShrink: 0 }}>
+                <span style={{ fontSize: 11, color: '#8a8a8a', flexShrink: 0 }}>
                   {formatHistoryRelativeTime(entry.recordedAt)}
                 </span>
               </div>
@@ -154,6 +174,30 @@ export const InputHistory: React.FC<InputHistoryProps> = ({
           </>
         )}
       </div>
+
+      {copyFeedback && (
+        <div className="input-history-copy-toast" role="status">
+          {copyFeedback}
+        </div>
+      )}
+
+      {contextMenu && (
+        <div
+          className="input-history-context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              copyHistoryText(contextMenu.text);
+              setContextMenu(null);
+            }}
+          >
+            Copy
+          </button>
+        </div>
+      )}
     </div>
   );
 };

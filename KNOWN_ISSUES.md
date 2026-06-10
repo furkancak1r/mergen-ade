@@ -3941,3 +3941,218 @@
   - Add regression tests for running-state helper enablement, separate stop/send footer layout, running submit queueing, and post-response queue flush.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, ACP composer tests
 - References: User request 2026-06-04
+
+---
+
+#### Electron Terminal Manager untracked satir ozeti eksikti {#electron-terminal-manager-untracked-line-summary}
+- Date: 2026-06-10
+- Context: Electron parity work found that the Terminal Manager diff summary counted tracked `git diff --numstat` lines but missed untracked text files that the Rust app includes in added-line totals.
+- Error signature:
+  1. `electron/main/worktree.ts` used only `git diff <base> --numstat`.
+  2. It did not run `git ls-files --others --exclude-standard -z`.
+  3. Untracked nested text files therefore showed as clean or under-counted in the Terminal Manager header badge.
+- Symptoms/Impact:
+  - New untracked source files were invisible to the Electron Terminal Manager `+N -M` summary.
+  - Electron did not match the original Rust `collect_source_control_line_totals()` behavior for collapsed untracked directories.
+- Root cause:
+  - The first Electron diff-summary implementation ported tracked numstat totals but omitted Rust's untracked text-file line counting and UTF-16/binary detection helpers.
+- Resolution:
+  - Added shared helpers for nul-delimited git path lists and UTF-8/UTF-16 text line counting.
+  - Updated `getGitDiffSummary()` to add untracked text-file line totals from `git ls-files --others --exclude-standard -z`.
+- Prevent recurrence:
+  - Added regression tests for nul-delimited path parsing, UTF-8/UTF-16 line counting, binary skip behavior, and existing numstat label formatting.
+- Files/Commands touched: `electron/main/worktree.ts`, `electron/shared/gitDiffSummary.ts`, `electron/renderer/src/lib/gitDiffSummary.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Input History zaman etiketleri Rust formatindan kisaydi {#electron-input-history-relative-time-format}
+- Date: 2026-06-10
+- Context: Electron parity work found that Input History timestamps used compact labels while the original Rust panel uses relative labels with `ago` wording plus week/month buckets.
+- Error signature:
+  1. `formatHistoryRelativeTime()` returned `now`, `2m`, `2h`, and `2d`.
+  2. Week and month ranges were not represented.
+  3. The visible Input History row therefore did not match Rust's `just now`, `2m ago`, `2w ago`, and `2mo ago` style.
+- Symptoms/Impact:
+  - Electron Input History looked less like the original sidebar and lost useful long-range context.
+- Root cause:
+  - The first Electron helper used a shorter display convention instead of porting Rust's `format_relative_time()` thresholds and labels.
+- Resolution:
+  - Updated the Electron relative-time helper to match Rust's second/minute/hour/day/week/month thresholds and wording.
+- Prevent recurrence:
+  - Expanded `inputHistory.test.ts` coverage for `just now`, minute, hour, day, week, and month labels.
+- Files/Commands touched: `electron/renderer/src/lib/inputHistory.ts`, `electron/renderer/src/lib/inputHistory.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Input History filtreleri kisaltilmis buton gibi gorunuyordu {#electron-input-history-filter-tab-visual-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that the Input History filter row still used compact `FG`/`BG` button labels while the original panel presents full `All`, `Foreground`, and `Background` tabs.
+- Error signature:
+  1. Filter labels used `FG` and `BG` abbreviations instead of the shared user-facing labels.
+  2. The row used heavier bordered button chrome, making the panel less consistent with the original sidebar style.
+  3. Input history rows used smaller 11px command text, reducing visual density compared with the Rust 13px row text.
+- Symptoms/Impact:
+  - The Electron Input History panel looked noticeably different from the Rust panel despite matching the underlying filtering behavior.
+- Root cause:
+  - The first Electron filter row favored compact web button styling instead of porting the original full-label tab appearance.
+- Resolution:
+  - Switched the filter row to full `InputHistoryFilterLabel` text.
+  - Moved tab and row hover/selected styling into global CSS with lighter, Rust-like row chrome.
+  - Increased entry text/timestamp sizing to better match the original sidebar density.
+- Prevent recurrence:
+  - Keep Input History filter labels sourced from the shared filter label table rather than local abbreviations.
+- Files/Commands touched: `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Input History kopyalama geri bildirimi yoktu {#electron-input-history-copy-feedback}
+- Date: 2026-06-10
+- Context: Electron parity work found that clicking an Input History row copied text silently, while the Rust panel shows a short `Copied to clipboard` status feedback and provides a right-click Copy menu.
+- Error signature:
+  1. `InputHistory.tsx` called `clipboard:writeText` directly on row click without any visible confirmation.
+  2. History rows did not handle `contextmenu`, so users had no explicit Copy action path.
+- Symptoms/Impact:
+  - Users could not tell whether a history row copy succeeded.
+  - Electron lacked the Rust panel's secondary copy affordance.
+- Root cause:
+  - The initial Electron panel port copied the underlying data behavior but omitted the UI feedback and context menu details.
+- Resolution:
+  - Added a short local `Copied to clipboard` toast after row-click or context-menu copy.
+  - Added a lightweight right-click context menu with a single Copy action for history rows.
+- Prevent recurrence:
+  - Keep row copy actions routed through one helper so click and context-menu copy share the same feedback path.
+- Files/Commands touched: `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron worktree kaldirma Input History kaydini temizlemiyordu {#electron-worktree-removal-input-history-cleanup}
+- Date: 2026-06-10
+- Context: Electron parity work found that the Rust app removes a deleted/removed project's input history and resets the selected history project if needed, but Electron worktree removal paths only updated config/browser state.
+- Error signature:
+  1. Orphan worktree cleanup removed projects from config without deleting `history.projects[path]`.
+  2. Git worktree deletion removed the registered project without deleting its persisted input history.
+  3. Source Control's `Remove from Mergen` button had an optional callback but App did not provide it.
+- Symptoms/Impact:
+  - Removed worktrees could leave stale Input History records in persistent history.
+  - The Source Control removal affordance appeared clickable but did not remove registered worktrees from Electron state.
+- Root cause:
+  - Project removal cleanup was duplicated inline and did not share Rust's input-history cleanup step.
+- Resolution:
+  - Added input-history removal helpers for one or many project paths.
+  - Centralized Electron project removal-by-path cleanup in App for config, history, browser scope, browser open state, active browser scope, and selected-project reset.
+  - Wired Source Control's `Remove from Mergen`, orphan cleanup, and delete-worktree paths through the shared cleanup callback.
+- Prevent recurrence:
+  - Added regression coverage for single and batch input-history removal helpers.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/inputHistory.ts`, `electron/renderer/src/lib/inputHistory.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Terminal Manager diff ozeti stale kalabiliyordu {#electron-terminal-manager-diff-summary-auto-refresh}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust Terminal Manager diff badges are fed by Source Control's recurring refresh state, while Electron fetched each project's diff summary only when the project list/path key changed.
+- Error signature:
+  1. `TerminalManager.tsx` loaded `git:diffSummary` inside a project-key effect.
+  2. After files changed, the `+N -M` badge could remain stale until the panel remounted or project paths changed.
+  3. This diverged from Rust's auto-refreshing Source Control snapshot model.
+- Symptoms/Impact:
+  - Terminal Manager could show outdated clean/changed badges for active projects.
+- Root cause:
+  - The first Electron diff badge port implemented initial fetch but omitted a background refresh loop.
+- Resolution:
+  - Added a 30-second background refresh for Terminal Manager diff summaries.
+  - Kept loading indicators only for the initial/project-list refresh so periodic updates do not flash `...` over existing badges.
+- Prevent recurrence:
+  - Keep future Terminal Manager diff-summary changes aligned with Source Control refresh behavior instead of treating the badge as a one-shot fetch.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control ahead/behind bilgisini gostermiyordu {#electron-source-control-ahead-behind}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust parses `git status --branch` headers into branch, ahead, and behind counts and displays them in Source Control, while Electron kept only the branch name.
+- Error signature:
+  1. `getGitStatus()` stripped the branch header with `split('...')[0]`.
+  2. `ahead` and `behind` counts from headers such as `## main...origin/main [ahead 2, behind 1]` were discarded.
+  3. The Source Control header could not show divergence from upstream.
+- Symptoms/Impact:
+  - Electron Source Control lost useful upstream divergence context visible in the Rust app.
+- Root cause:
+  - The first Electron status parser only needed a branch label and did not port Rust's `parse_branch_header()` behavior.
+- Resolution:
+  - Added shared branch-header parsing and branch-line formatting helpers.
+  - Extended `SourceControlStatus`/`SourceControlSnapshot` with `ahead` and `behind`.
+  - Updated `getGitStatus()` and Source Control header rendering to carry and display `branch  ahead:N behind:M`.
+- Prevent recurrence:
+  - Added regression tests for branch header parsing and Rust-style branch line formatting.
+- Files/Commands touched: `electron/shared/sourceControl.ts`, `electron/shared/types.ts`, `electron/main/worktree.ts`, `electron/renderer/src/components/SourceControl.tsx`, `electron/renderer/src/lib/sourceControl.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control status satirlari raw git kodu gosteriyordu {#electron-source-control-status-line-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust converts `git status --porcelain` file rows into semantic status labels and normalizes rename paths, while Electron carried raw status codes into the UI.
+- Error signature:
+  1. `getGitStatus()` pushed `statusCode.trim()` directly into `SourceControlFile.status`.
+  2. Rename rows such as `R  old.ts -> src/new.ts` kept the full `old -> new` path instead of the new path.
+  3. `U` was labeled `Updated` in the renderer while Rust labels it `Conflicted`.
+- Symptoms/Impact:
+  - Source Control rows did not match Rust's `Modified src/app.rs` / `Renamed src/new.ts` style.
+  - Search/status matching could miss Rust-style semantic terms such as `Conflicted`.
+- Root cause:
+  - The Electron status parser implemented a minimal raw-code view instead of porting Rust's `apply_source_control_status_line()` behavior.
+- Resolution:
+  - Added shared source-control status-line parsing with semantic labels, staged detection, conflict/ignored mappings, and rename path normalization.
+  - Updated main-process `getGitStatus()` to return semantic `SourceControlFile` rows.
+  - Updated Source Control file rows to render a staged/unstaged marker plus monospace `Status path` text.
+- Prevent recurrence:
+  - Added regression tests for renamed, unstaged, untracked, conflicted, ignored, and unknown status handling.
+- Files/Commands touched: `electron/shared/sourceControl.ts`, `electron/main/worktree.ts`, `electron/renderer/src/components/SourceControl.tsx`, `electron/renderer/src/lib/sourceControl.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control dosya satiri context menusu eksikti {#electron-source-control-file-context-menu}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust Source Control file rows provide a right-click menu for opening the containing folder and copying the relative path, while Electron file rows were passive.
+- Error signature:
+  1. Changed file rows in `SourceControl.tsx` rendered text only.
+  2. There was no `Open in Folder` action equivalent to Rust's file explorer integration.
+  3. There was no `Copy Relative Path` action or feedback.
+- Symptoms/Impact:
+  - Users could inspect changed files but could not quickly jump to the containing folder or copy paths from Source Control.
+- Root cause:
+  - The first Electron Source Control panel ported the status list display without porting row context actions.
+- Resolution:
+  - Added `shell:showItemInFolder` IPC backed by Electron `shell.showItemInFolder`.
+  - Added Source Control file-row context menu with `Open in Folder` and `Copy Relative Path`.
+  - Added short feedback toast for successful open/copy and open failures.
+- Prevent recurrence:
+  - Added a shared path-join helper for project-root plus git-relative file path, with regression coverage for Windows and POSIX-shaped paths.
+- Files/Commands touched: `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/shared/sourceControl.ts`, `electron/renderer/src/components/SourceControl.tsx`, `electron/renderer/src/lib/sourceControl.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron worktree slug temizleme Rust'tan daha agresifti {#electron-worktree-slug-sanitization}
+- Date: 2026-06-10
+- Context: Electron parity work found that Create Worktree slug generation removed valid branch-name characters that Rust preserves.
+- Error signature:
+  1. Electron used `/[^a-z0-9_-]+/g`, replacing dots and all non-ASCII characters.
+  2. Rust only replaces path-invalid characters (`/`, `\`, spaces, `:`, `*`, `?`, `"`, `<`, `>`, `|`), collapses `..`, trims `-`, and lowercases.
+- Symptoms/Impact:
+  - Branches like `release.v1` or `özellik/çağrı` generated different worktree paths in Electron than in Rust.
+- Root cause:
+  - The Electron slug helper used a broad ASCII-only URL-style sanitizer instead of porting Rust's path-oriented sanitizer.
+- Resolution:
+  - Updated `sanitizeWorktreeSlug()` to match Rust's invalid-character set, `..` handling, trimming, and lowercase behavior.
+- Prevent recurrence:
+  - Added regression tests for slash/space, dot preservation, `..` replacement, and Unicode preservation.
+- Files/Commands touched: `electron/renderer/src/lib/worktree.ts`, `electron/renderer/src/lib/worktree.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10

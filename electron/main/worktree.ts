@@ -2,8 +2,10 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import type { GitWorktreeInfo } from '../shared/types';
+import type { SourceControlStatus } from '../shared/types';
 import type { GitDiffSummary } from '../shared/gitDiffSummary';
-import { parseGitNumstatTotals } from '../shared/gitDiffSummary';
+import { countTextLineBytes, parseGitNumstatTotals, parseGitPathList } from '../shared/gitDiffSummary';
+import { parseBranchHeader, parseSourceControlStatusLine } from '../shared/sourceControl';
 
 export function parseGitWorktreeList(output: string): GitWorktreeInfo[] {
   const worktrees: GitWorktreeInfo[] = [];
@@ -152,7 +154,7 @@ export function removeWorktree(repoPath: string, path: string): Promise<boolean>
   });
 }
 
-export function getGitStatus(repoPath: string): Promise<{ files: { path: string; status: string; staged: boolean }[]; branch: string }> {
+export function getGitStatus(repoPath: string): Promise<SourceControlStatus> {
   return new Promise((resolve) => {
     const proc = spawn('git', ['status', '--porcelain', '-b'], { cwd: repoPath });
     let stdout = '';
@@ -161,29 +163,29 @@ export function getGitStatus(repoPath: string): Promise<{ files: { path: string;
     proc.stderr.on('data', (data) => { stderr += data; });
     proc.on('close', (code) => {
       if (code !== 0) {
-        resolve({ files: [], branch: '' });
+        resolve({ files: [], branch: '', ahead: 0, behind: 0 });
         return;
       }
       const lines = stdout.split('\n');
       let branch = '';
+      let ahead = 0;
+      let behind = 0;
       const files: { path: string; status: string; staged: boolean }[] = [];
       for (const line of lines) {
         if (line.startsWith('## ')) {
-          branch = line.slice(3).split('...')[0].split(' ')[0];
-        } else if (line.length >= 2) {
-          const statusCode = line.slice(0, 2);
-          const filePath = line.slice(3).trim();
-          if (filePath) {
-            const staged = statusCode[0] !== ' ' && statusCode[0] !== '?';
-            const status = statusCode.trim();
-            files.push({ path: filePath, status, staged });
-          }
+          const parsed = parseBranchHeader(line.slice(3));
+          branch = parsed.branch;
+          ahead = parsed.ahead;
+          behind = parsed.behind;
+        } else {
+          const file = parseSourceControlStatusLine(line);
+          if (file) files.push(file);
         }
       }
-      resolve({ files, branch });
+      resolve({ files, branch, ahead, behind });
     });
     proc.on('error', () => {
-      resolve({ files: [], branch: '' });
+      resolve({ files: [], branch: '', ahead: 0, behind: 0 });
     });
   });
 }
@@ -202,9 +204,10 @@ export async function getGitDiffSummary(repoPath: string): Promise<GitDiffSummar
     }
 
     const totals = parseGitNumstatTotals(output.stdout);
+    const untrackedAddedLines = await countUntrackedTextFileLines(repoPath);
     return {
       status: 'ready',
-      addedLines: totals.addedLines,
+      addedLines: totals.addedLines + untrackedAddedLines,
       removedLines: totals.removedLines,
     };
   } catch (error) {
@@ -229,6 +232,32 @@ async function resolveGitDiffBase(repoPath: string): Promise<string> {
   const oid = emptyTree.stdout.trim();
   if (!oid) throw new Error('git hash-object returned an empty tree id');
   return oid;
+}
+
+async function countUntrackedTextFileLines(repoPath: string): Promise<number> {
+  const output = await runGitCommand(repoPath, ['ls-files', '--others', '--exclude-standard', '-z']);
+  if (output.code !== 0) {
+    throw new Error(output.stderr.trim() || 'git ls-files --others failed');
+  }
+
+  let addedLines = 0;
+  for (const relativePath of parseGitPathList(output.stdout)) {
+    const lines = countTextFileLines(path.join(repoPath, relativePath));
+    if (lines !== undefined) {
+      addedLines += lines;
+    }
+  }
+  return addedLines;
+}
+
+function countTextFileLines(filePath: string): number | undefined {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return undefined;
+    return countTextLineBytes(fs.readFileSync(filePath));
+  } catch {
+    return undefined;
+  }
 }
 
 function runGitCommand(

@@ -23,7 +23,7 @@ import {
   withTerminalManagerOpened,
   withToggledTerminalManagerHideInactive,
 } from './lib/terminalManagerState';
-import { recordInputHistory } from './lib/inputHistory';
+import { recordInputHistory, removeProjectsInputHistory } from './lib/inputHistory';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -607,6 +607,37 @@ function App() {
     setSelectedProjectId(newProject.id);
   }, []);
 
+  const removeProjectsByPath = useCallback((projectPaths: string[]): ProjectRecord[] => {
+    if (!config || projectPaths.length === 0) return [];
+
+    const removePathSet = new Set(projectPaths);
+    const removedProjects = config.projects.filter((project) => removePathSet.has(project.path));
+    if (removedProjects.length === 0) return [];
+
+    const removedIds = new Set(removedProjects.map((project) => project.id));
+    const newProjects = config.projects.filter((project) => !removePathSet.has(project.path));
+    setConfig({ ...config, projects: newProjects });
+    setHistory((prev) => removeProjectsInputHistory(prev, removedProjects.map((project) => project.path)));
+
+    setBrowserOpenProjects((prev) => {
+      const next = new Set(prev);
+      for (const projectId of removedIds) next.delete(projectId);
+      return next;
+    });
+    setBrowserPanelVisibleScopeByProject((prev) => {
+      const next = new Map(prev);
+      for (const projectId of removedIds) next.delete(projectId);
+      return next;
+    });
+    setActiveBrowserScope((prev) => (prev && removedIds.has(prev.projectId) ? null : prev));
+
+    if (selectedProjectId !== null && removedIds.has(selectedProjectId)) {
+      setSelectedProjectId(newProjects[0]?.id ?? null);
+    }
+
+    return removedProjects;
+  }, [config, selectedProjectId]);
+
   const openAcpChat = useCallback(async (projectId: number) => {
     if (!config) return;
     const project = config.projects.find((p) => p.id === projectId);
@@ -903,23 +934,8 @@ function App() {
               .filter((p) => p.isWorktree && p.repoRoot === selectedProject.path)
               .map((p) => p.path)}
             onOrphanWorktrees={(orphanPaths) => {
-              if (!config) return;
-              // Remove orphan worktree projects from config
-              const removedProjects = config.projects.filter((p) => orphanPaths.includes(p.path));
-              const newProjects = config.projects.filter((p) => !orphanPaths.includes(p.path));
-              if (newProjects.length !== config.projects.length) {
-                setConfig({ ...config, projects: newProjects });
-              }
-              // Clear browser visible scope override for removed projects
-              if (removedProjects.length > 0) {
-                setBrowserPanelVisibleScopeByProject((prev) => {
-                  const copy = new Map(prev);
-                  for (const rp of removedProjects) {
-                    copy.delete(rp.id);
-                  }
-                  return copy;
-                });
-              }
+              const removedProjects = removeProjectsByPath(orphanPaths);
+              if (removedProjects.length === 0) return;
               // Kill any terminals running in orphan worktrees
               for (const path of orphanPaths) {
                 const normalizedPath = path.replace(/\\/g, '/');
@@ -931,6 +947,9 @@ function App() {
                   killTerminal(t.id);
                 }
               }
+            }}
+            onRemoveWorktree={(worktree) => {
+              removeProjectsByPath([worktree.path]);
             }}
             onAddWorktree={(worktree) => {
               if (!config) return;
@@ -952,18 +971,7 @@ function App() {
             onDeleteGitWorktree={async (worktree) => {
               if (!config) return;
               await api.invoke('git:removeWorktree', selectedProject.path, worktree.path);
-              // Remove worktree project from config
-              const removedProject = config.projects.find((p) => p.path === worktree.path);
-              const newProjects = config.projects.filter((p) => p.path !== worktree.path);
-              setConfig({ ...config, projects: newProjects });
-              // Clear browser visible scope override for removed project
-              if (removedProject) {
-                setBrowserPanelVisibleScopeByProject((prev) => {
-                  const copy = new Map(prev);
-                  copy.delete(removedProject.id);
-                  return copy;
-                });
-              }
+              removeProjectsByPath([worktree.path]);
             }}
             hasLiveTerminals={(path) => {
               const normalizedPath = path.replace(/\\/g, '/');
