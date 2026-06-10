@@ -195,21 +195,19 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
     };
   }, [terminalId]);
 
-  // Wheel forwarding: only attach when OpenCode is active and mouse reporting is on.
-  // When inactive, xterm.js handles scroll natively without interference.
+  // Wheel handling: when OpenCode is active and mouse reporting is on,
+  // prevent the browser from scrolling the viewport so xterm.js can forward
+  // mouse sequences to the PTY natively. When inactive, xterm.js scrolls
+  // the viewport normally.
   useEffect(() => {
     if (!containerRef.current || !isOpenCodeActive || !wheelEnabled) return;
     const handleWheel = (e: WheelEvent) => {
       if (!containerRef.current?.contains(e.target as Node)) return;
       if (e.ctrlKey || e.altKey || e.metaKey) return;
       if (!mouseReportingEnabledRef.current) return;
-      const button = e.deltaY < 0 ? 64 : 65;
-      const x = e.offsetX + 1;
-      const y = e.offsetY + 1;
-      const cx = String.fromCharCode(Math.min(x, 255));
-      const cy = String.fromCharCode(Math.min(y, 255));
-      const seq = `\x1b[M${String.fromCharCode(button + 32)}${cx}${cy}`;
-      api.invoke('pty:write', terminalId, seq);
+      // xterm.js forwards SGR mouse sequences natively; we only block the
+      // browser default scroll to keep the viewport pinned while OpenCode TUI
+      // handles wheel via the PTY mouse protocol.
       e.preventDefault();
     };
     const container = containerRef.current;
