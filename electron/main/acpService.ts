@@ -4,7 +4,16 @@ import fs from 'fs';
 import { BrowserWindow } from 'electron';
 import type { AcpChatSession, AcpConfigOption, AcpAvailableCommand, AcpChatMessage, OpenCodeModelConfig } from '../shared/types';
 import { activeBuildModel, effectivePlanModel, effectivePlanEffort, mergeAcpKnownModels } from '../shared/types';
-import { buildAcpPermissionResponse, firstAutoApproveOptionId, permissionRequestIdFromRpc, startupModeToModeId } from '../shared/acpProtocol';
+import {
+  buildAcpPermissionResponse,
+  buildAcpQuestionResponse,
+  firstAutoApproveOptionId,
+  isJsonRpcId,
+  permissionRequestIdFromRpc,
+  stripAnsi,
+  startupModeToModeId,
+  type JsonRpcId,
+} from '../shared/acpProtocol';
 import { loadConfig, saveConfig } from './config';
 import { getOpencodeBinPath } from './opencode';
 
@@ -15,6 +24,10 @@ function buildAcpPromptText(text: string, attachments: string[]): string {
   if (!text.trim()) return attachmentBlock;
   return `${text}\n\n${attachmentBlock}`;
 }
+
+type AcpPendingInteraction =
+  | { kind: 'permission'; rpcId: JsonRpcId; optionIds: Set<string> }
+  | { kind: 'question'; rpcId: JsonRpcId; questionCount: number };
 
 interface AcpSession {
   process: ChildProcess | null;
@@ -35,6 +48,8 @@ interface AcpSession {
   queuedPrompts: { text: string; attachments: string[]; modeId: string; finalPromptText: string }[];
   partialStderr?: string;
   cancelGraceUntil?: number;
+  pendingInteractions: Map<string, AcpPendingInteraction>;
+  nextInteractionId: number;
 }
 
 const sessions = new Map<string, AcpSession>();
@@ -66,6 +81,27 @@ function sendRpc(session: AcpSession, method: string, params: unknown): void {
 function sendRawRpc(session: AcpSession, req: unknown): void {
   if (!session.process) return;
   session.process.stdin?.write(JSON.stringify(req) + '\n');
+}
+
+function appendAcpSystemMessage(session: AcpSession, text: string): void {
+  session.messages.push({ role: 'system', text, timestamp: Date.now() });
+}
+
+function broadcastAcpWarning(session: AcpSession, text: string): void {
+  const clean = stripAnsi(text).trim();
+  if (!clean) return;
+  appendAcpSystemMessage(session, `ACP warning: ${clean}`);
+  broadcast('acp:event', session.chatId, { type: 'warning', text: clean });
+}
+
+function createPendingInteraction(session: AcpSession, interaction: AcpPendingInteraction): string {
+  const token = `${interaction.kind}-${Date.now()}-${session.nextInteractionId++}`;
+  session.pendingInteractions.set(token, interaction);
+  return token;
+}
+
+function clearPendingInteractions(session: AcpSession): void {
+  session.pendingInteractions.clear();
 }
 
 function setSessionMode(session: AcpSession, modeId: string, forceRpc = false): void {
@@ -116,6 +152,8 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
     configOptions: [],
     currentModeId: initialModeId,
     queuedPrompts: [],
+    pendingInteractions: new Map(),
+    nextInteractionId: 1,
   };
 
   sessions.set(chatId, session);
@@ -133,6 +171,10 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
       cwd: cwd || opts.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      env: {
+        ...process.env,
+        OPENCODE_ENABLE_QUESTION_TOOL: '1',
+      },
     });
 
     session.process = proc;
@@ -151,30 +193,33 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
     });
 
     proc.stderr?.on('data', (data) => {
-      const text = data.toString();
+      const rawText = data.toString();
+      const text = stripAnsi(rawText).trim();
       const now = Date.now();
       if (session.cancelGraceUntil && now < session.cancelGraceUntil) {
         // Suppress cancel-specific stderr noise
-        if (text.includes('Method not found') || text.includes('session/cancel') || text.includes('-32601')) {
+        if (rawText.includes('Method not found') || rawText.includes('session/cancel') || rawText.includes('-32601')) {
           return;
         }
       }
-      session.partialStderr = (session.partialStderr || '') + text;
-      const msg: AcpChatMessage = { role: 'system', text: `ACP stderr: ${text.trim()}`, timestamp: Date.now() };
-      session.messages.push(msg);
-      broadcast('acp:event', chatId, { type: 'error', text: text.trim() });
+      if (!text) return;
+      session.partialStderr = (session.partialStderr || '') + text + '\n';
+      const prefix = text.includes('Got response to unknown request') ? 'ACP warning' : 'ACP stderr';
+      appendAcpSystemMessage(session, `${prefix}: ${text}`);
+      broadcast('acp:event', chatId, { type: prefix === 'ACP warning' ? 'warning' : 'stderr', text });
     });
 
     proc.on('exit', (code) => {
       session.status = 'error';
+      clearPendingInteractions(session);
       broadcast('acp:event', chatId, { type: 'exit', code });
     });
 
     proc.on('error', (err) => {
       session.status = 'error';
+      clearPendingInteractions(session);
       const text = err.message;
-      const msg: AcpChatMessage = { role: 'system', text: `ACP spawn error: ${text}`, timestamp: Date.now() };
-      session.messages.push(msg);
+      appendAcpSystemMessage(session, `ACP spawn error: ${text}`);
       broadcast('acp:event', chatId, { type: 'error', text: `ACP spawn error: ${text}` });
     });
 
@@ -184,14 +229,17 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
       clientCapabilities: {
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
+        _meta: {
+          'opencode/question': { version: 1 },
+        },
       },
       clientInfo: { name: 'opencode-local-acp', title: 'OpenCode', version: '1.0.0' },
     });
   } catch (err) {
     session.status = 'error';
+    clearPendingInteractions(session);
     const text = err instanceof Error ? err.message : String(err);
-    const msg: AcpChatMessage = { role: 'system', text: `ACP spawn error: ${text}`, timestamp: Date.now() };
-    session.messages.push(msg);
+    appendAcpSystemMessage(session, `ACP spawn error: ${text}`);
     broadcast('acp:event', chatId, { type: 'error', text: `ACP spawn error: ${text}` });
   }
 
@@ -203,21 +251,21 @@ function handleAcpLine(session: AcpSession, line: string): void {
     const msg = JSON.parse(line) as Record<string, unknown>;
     const method = msg.method as string | undefined;
     const result = msg.result as Record<string, unknown> | undefined;
-    const id = msg.id as number | string | undefined;
+    const id = msg.id;
     const error = msg.error as Record<string, unknown> | undefined;
 
     // Handle JSON-RPC error responses first
     if (error) {
       session.status = 'error';
+      clearPendingInteractions(session);
       const text = (error.message as string) || JSON.stringify(error);
-      const errMsg: AcpChatMessage = { role: 'system', text: `ACP error: ${text}`, timestamp: Date.now() };
-      session.messages.push(errMsg);
+      appendAcpSystemMessage(session, `ACP error: ${text}`);
       broadcast('acp:event', session.chatId, { type: 'error', text: `ACP error: ${text}` });
       return;
     }
 
     // Responses (have result + id)
-    if (id !== undefined && result) {
+    if (isJsonRpcId(id) && result) {
       // Response to initialize -> send session/new
       if (result.protocolVersion !== undefined) {
         sendRpc(session, 'session/new', {
@@ -261,6 +309,7 @@ function handleAcpLine(session: AcpSession, line: string): void {
       // session/prompt response (turn complete)
       if (result.stopReason !== undefined || result.text !== undefined) {
         session.status = 'idle';
+        clearPendingInteractions(session);
         updateAcpStandbyStatus(session.chatId, 'idle');
         broadcast('acp:event', session.chatId, { type: 'promptResponse', stopReason: result.stopReason, text: result.text, queuedPrompts: session.queuedPrompts.length });
         // Flush queued prompts one at a time
@@ -272,7 +321,7 @@ function handleAcpLine(session: AcpSession, line: string): void {
     }
 
     // Requests from agent (have id and method, no result)
-    if (id !== undefined && method) {
+    if (isJsonRpcId(id) && method) {
       if (method === 'session/request_permission') {
         const params = msg.params as Record<string, unknown>;
         const optionsRaw = (params.options as Array<Record<string, unknown>>) || [];
@@ -280,19 +329,24 @@ function handleAcpLine(session: AcpSession, line: string): void {
           id: (o.optionId as string) || '',
           label: (o.name as string) || '',
         }));
-        const requestId = permissionRequestIdFromRpc(id, params);
+        const requestId = permissionRequestIdFromRpc(id);
         const autoOptionId = firstAutoApproveOptionId(options, loadConfig().opencode.acpAutoApprovePermissions);
         if (requestId && autoOptionId) {
-          sendRawRpc(session, buildAcpPermissionResponse(requestId, autoOptionId));
+          sendRawRpc(session, buildAcpPermissionResponse(id, autoOptionId));
           session.status = 'running';
           updateAcpStandbyStatus(session.chatId, 'running');
           broadcast('acp:event', session.chatId, { type: 'permissionResponse', requestId, rejected: false, autoApproved: true, status: 'running', queuedPrompts: session.queuedPrompts.length });
         } else {
+          const token = createPendingInteraction(session, {
+            kind: 'permission',
+            rpcId: id,
+            optionIds: new Set(options.map((option) => option.id).filter((optionId) => optionId.length > 0)),
+          });
           session.status = 'permission';
           updateAcpStandbyStatus(session.chatId, 'permission');
           broadcast('acp:event', session.chatId, {
             type: 'permission',
-            requestId,
+            requestId: token,
             message: params.message,
             options,
             multiple: params.multiple,
@@ -303,6 +357,49 @@ function handleAcpLine(session: AcpSession, line: string): void {
         }
         return;
       }
+      if (method === 'opencode/question') {
+        const params = msg.params as Record<string, unknown>;
+        const questionsRaw = (params.questions as Array<Record<string, unknown>>) || [];
+        const questions = questionsRaw.map((q) => {
+          const optionsRaw = (q.options as Array<Record<string, unknown>>) || [];
+          return {
+            header: (q.header as string) || 'Question',
+            question: (q.question as string) || '',
+            options: optionsRaw.map((o, idx) => {
+              const label = (o.label as string) || (o.name as string) || String(idx + 1);
+              return {
+                id: String(idx),
+                label,
+                description: (o.description as string) || '',
+              };
+            }),
+          };
+        });
+        const token = createPendingInteraction(session, {
+          kind: 'question',
+          rpcId: id,
+          questionCount: Math.max(questions.length, 1),
+        });
+        const first = questions[0] || { header: 'Question', question: '', options: [] };
+        session.status = 'permission';
+        updateAcpStandbyStatus(session.chatId, 'permission');
+        broadcast('acp:event', session.chatId, {
+          type: 'question',
+          requestId: token,
+          header: first.header,
+          question: first.question,
+          options: first.options,
+          questions,
+          sessionId: session.sessionId,
+          status: 'permission',
+        });
+        return;
+      }
+      return;
+    }
+
+    if ((method === 'session/request_permission' || method === 'opencode/question') && !isJsonRpcId(id)) {
+      broadcastAcpWarning(session, `ACP ${method} request did not include a valid JSON-RPC id.`);
       return;
     }
 
@@ -468,6 +565,7 @@ export function cancelAcpPrompt(chatId: string): void {
   if (!session || !session.sessionId) return;
 
   session.cancelGraceUntil = Date.now() + 2000;
+  clearPendingInteractions(session);
   sendRpc(session, 'session/cancel', { sessionId: session.sessionId });
   session.status = 'idle';
   updateAcpStandbyStatus(session.chatId, 'idle');
@@ -495,14 +593,52 @@ export function setAcpConfigOption(chatId: string, configId: string, value: stri
   }
 }
 
-export function sendAcpPermissionResponse(chatId: string, requestId: string | number, answers: string[], rejected: boolean): void {
+export function sendAcpPermissionResponse(chatId: string, requestId: string, answers: string[], rejected: boolean): boolean {
   const session = sessions.get(chatId);
-  if (!session || !session.sessionId) return;
+  if (!session || !session.sessionId) return false;
 
-  sendRawRpc(session, buildAcpPermissionResponse(requestId, answers[0] || '', rejected));
+  const interaction = session.pendingInteractions.get(requestId);
+  if (!interaction || interaction.kind !== 'permission') {
+    broadcastAcpWarning(session, 'Ignoring stale ACP permission response.');
+    return false;
+  }
+
+  const optionId = answers.find((answer) => answer.length > 0) || '';
+  if (!rejected && (!optionId || !interaction.optionIds.has(optionId))) {
+    broadcastAcpWarning(session, 'Ignoring ACP permission response with no valid selected option.');
+    return false;
+  }
+
+  session.pendingInteractions.delete(requestId);
+  sendRawRpc(session, buildAcpPermissionResponse(interaction.rpcId, optionId, rejected));
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
-  broadcast('acp:event', chatId, { type: 'permissionResponse', requestId: String(requestId), rejected });
+  broadcast('acp:event', chatId, { type: 'permissionResponse', requestId, rejected, status: 'running', queuedPrompts: session.queuedPrompts.length });
+  return true;
+}
+
+export function sendAcpQuestionResponse(chatId: string, requestId: string, answers: string[][], rejected: boolean): boolean {
+  const session = sessions.get(chatId);
+  if (!session || !session.sessionId) return false;
+
+  const interaction = session.pendingInteractions.get(requestId);
+  if (!interaction || interaction.kind !== 'question') {
+    broadcastAcpWarning(session, 'Ignoring stale ACP question response.');
+    return false;
+  }
+
+  const normalizedAnswers = answers.map((answer) => answer.filter((value) => value.length > 0));
+  if (!rejected && (normalizedAnswers.length < interaction.questionCount || normalizedAnswers.some((answer) => answer.length === 0))) {
+    broadcastAcpWarning(session, 'Ignoring ACP question response with incomplete answers.');
+    return false;
+  }
+
+  session.pendingInteractions.delete(requestId);
+  sendRawRpc(session, buildAcpQuestionResponse(interaction.rpcId, normalizedAnswers, rejected));
+  session.status = 'running';
+  updateAcpStandbyStatus(session.chatId, 'running');
+  broadcast('acp:event', chatId, { type: 'questionResponse', requestId, rejected, status: 'running', queuedPrompts: session.queuedPrompts.length });
+  return true;
 }
 
 export function getAcpSession(chatId: string): AcpChatSession | undefined {

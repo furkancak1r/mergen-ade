@@ -2,6 +2,31 @@
   
 ---
 
+#### Electron OpenCode ACP question cevabi unknown request hatasina dusuyordu {#electron-acp-question-unknown-request}
+- Date: 2026-06-10
+- Context: User reported that answering an ACP question/permission card after a `bash (execute)` tool call showed raw `ACP stderr: Got response to unknown request 0` in the chat UI.
+- Error signature:
+  1. Electron ACP converted JSON-RPC response ids to strings before writing permission responses.
+  2. The renderer sent the displayed `requestId` back directly, with no main-process pending-request guard.
+  3. Stderr ANSI color codes were stored and broadcast as fatal ACP `error` events.
+- Symptoms/Impact:
+  - OpenCode rejected the response as an unknown request and the turn could remain stuck.
+  - The chat displayed raw ANSI escape sequences instead of readable text.
+  - Non-fatal protocol stderr could incorrectly clear ACP running state.
+- Root cause:
+  - ACP permission/question responses must use the exact JSON-RPC request id for the inbound request, while UI state should only carry an opaque local token.
+- Resolution:
+  - Preserve JSON-RPC id type in ACP response builders.
+  - Track pending permission/question interactions in the Electron main process and reject stale UI tokens without writing to OpenCode.
+  - Add OpenCode `opencode/question` capability support and route question answers through the correct response shape.
+  - Strip ANSI from ACP stderr and downgrade non-fatal stderr to warning/stderr UI events.
+- Prevent recurrence:
+  - Add regression tests for numeric id preservation, question response shape, strict id handling, ANSI stripping, and non-fatal stderr activity state.
+- Files/Commands touched: `electron/shared/acpProtocol.ts`, `electron/main/acpService.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, ACP protocol/UI tests
+- References: User report 2026-06-10
+
+---
+
 #### OpenCode terminal build mode izin sorma (Strict Kimi permissions) {#opencode-build-permissions-ask}
 - Date: 2026-06-08
 - Context: User reported that OpenCode build mode inside a Mergen terminal asks for permission approvals even though they want full automatic permission.

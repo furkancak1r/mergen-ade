@@ -6,6 +6,28 @@ import { actionControlsEnabled, hasConfigSelectorOptions, optionValues, shouldSh
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
+interface AcpPanelEvent {
+  type: string;
+  text?: string;
+  role?: string;
+  options?: OpenCodeQuestion['options'];
+  questions?: OpenCodeQuestion['questions'];
+  multiple?: boolean;
+  custom?: boolean;
+  requestId?: string;
+  sessionId?: string;
+  message?: string;
+  header?: string;
+  question?: string;
+  count?: number;
+  modeId?: string;
+  commands?: unknown;
+  toolCallId?: string;
+  title?: string;
+  kind?: string;
+  status?: string;
+}
+
 interface AcpChatPanelProps {
   project: ProjectRecord;
   chatId: string;
@@ -23,11 +45,19 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [pendingQuestion, setPendingQuestion] = useState<OpenCodeQuestion | null>(null);
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
   const [customAnswer, setCustomAnswer] = useState('');
+  const [questionAnswers, setQuestionAnswers] = useState<Record<number, string>>({});
   const [slashHints, setSlashHints] = useState<string[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modeDropdownRef = useRef<HTMLDivElement>(null);
   const customInputRef = useRef<HTMLInputElement>(null);
+
+  const clearPendingInteraction = useCallback(() => {
+    setPendingQuestion(null);
+    setSelectedOptions([]);
+    setCustomAnswer('');
+    setQuestionAnswers({});
+  }, []);
 
   const refreshSession = useCallback(async () => {
     const s = await api.invoke('acp:getSession', chatId) as AcpChatSession | null;
@@ -36,7 +66,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   useEffect(() => {
     refreshSession();
-    const unsub = api.on('acp:event', (eventChatId: string, event: { type: string; text?: string; role?: string; options?: OpenCodeQuestion['options']; multiple?: boolean; custom?: boolean; requestId?: string; sessionId?: string; message?: string; header?: string; question?: string; count?: number; modeId?: string; commands?: unknown; toolCallId?: string; title?: string; kind?: string; status?: string }) => {
+    const unsub = api.on('acp:event', (eventChatId: string, event: AcpPanelEvent) => {
       if (eventChatId !== chatId) return;
 
       // Handle high-frequency message chunks locally without re-fetching session
@@ -69,6 +99,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       refreshSession();
       if (event.type === 'permission') {
         setPendingQuestion({
+          kind: 'permission',
           header: 'Permission Required',
           question: event.message || '',
           options: event.options || [],
@@ -77,11 +108,35 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
           requestId: event.requestId || '',
           sessionId: event.sessionId || '',
         });
-      }
-      if (event.type === 'promptResponse' || event.type === 'cancelled') {
-        setPendingQuestion(null);
         setSelectedOptions([]);
         setCustomAnswer('');
+        setQuestionAnswers({});
+      }
+      if (event.type === 'question') {
+        const questions = event.questions && event.questions.length > 0
+          ? event.questions
+          : [{
+              header: event.header || 'Question',
+              question: event.question || '',
+              options: event.options || [],
+            }];
+        setPendingQuestion({
+          kind: 'question',
+          header: event.header || questions[0]?.header || 'Question',
+          question: event.question || questions[0]?.question || '',
+          options: event.options || questions[0]?.options || [],
+          questions,
+          multiple: false,
+          custom: questions.some((q) => q.options.length === 0),
+          requestId: event.requestId || '',
+          sessionId: event.sessionId || '',
+        });
+        setSelectedOptions([]);
+        setCustomAnswer('');
+        setQuestionAnswers({});
+      }
+      if (event.type === 'promptResponse' || event.type === 'cancelled' || event.type === 'permissionResponse' || event.type === 'questionResponse') {
+        clearPendingInteraction();
       }
       if (event.type === 'commands' && event.commands) {
         setSlashHints(slashCommandHints(event.commands, ''));
@@ -89,17 +144,15 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       }
     });
     return () => { unsub(); };
-  }, [chatId, refreshSession]);
+  }, [chatId, refreshSession, clearPendingInteraction]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [session?.messages]);
 
   useEffect(() => {
-    setPendingQuestion(null);
-    setSelectedOptions([]);
-    setCustomAnswer('');
-  }, [chatId]);
+    clearPendingInteraction();
+  }, [chatId, clearPendingInteraction]);
 
   // Update slash hints when input changes
   useEffect(() => {
@@ -220,6 +273,59 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   const isWelcome = shouldShowAcpWelcome(session?.messages, session?.queuedPrompts);
 
+  const submitPendingInteraction = async () => {
+    if (!pendingQuestion) return;
+    if (pendingQuestion.kind === 'question') {
+      const questions = pendingQuestion.questions && pendingQuestion.questions.length > 0
+        ? pendingQuestion.questions
+        : [{ header: pendingQuestion.header, question: pendingQuestion.question, options: pendingQuestion.options }];
+      const answers = questions.map((q, idx) => {
+        const answer = (questionAnswers[idx] || '').trim();
+        if (q.options.length === 0) return answer ? [answer] : [];
+        const selected = q.options.find((opt) => opt.id === answer);
+        return selected ? [selected.label] : [];
+      });
+      const accepted = await api.invoke('acp:questionResponse', {
+        chatId,
+        requestId: pendingQuestion.requestId,
+        answers,
+        rejected: false,
+      }) as boolean;
+      if (accepted) clearPendingInteraction();
+      return;
+    }
+
+    const answers = pendingQuestion.custom ? [...selectedOptions, customAnswer.trim()] : selectedOptions;
+    const accepted = await api.invoke('acp:permissionResponse', {
+      chatId,
+      requestId: pendingQuestion.requestId,
+      answers: answers.filter((a) => a.length > 0),
+      rejected: false,
+    }) as boolean;
+    if (accepted) clearPendingInteraction();
+  };
+
+  const rejectPendingInteraction = async () => {
+    if (!pendingQuestion) return;
+    const channel = pendingQuestion.kind === 'question' ? 'acp:questionResponse' : 'acp:permissionResponse';
+    const payload = pendingQuestion.kind === 'question'
+      ? { chatId, requestId: pendingQuestion.requestId, answers: [], rejected: true }
+      : { chatId, requestId: pendingQuestion.requestId, answers: [], rejected: true };
+    const accepted = await api.invoke(channel, payload) as boolean;
+    if (accepted) clearPendingInteraction();
+  };
+
+  const pendingQuestionSubmitEnabled = (() => {
+    if (!pendingQuestion) return false;
+    if (pendingQuestion.kind !== 'question') {
+      return pendingQuestion.custom ? selectedOptions.length > 0 || customAnswer.trim().length > 0 : selectedOptions.length > 0;
+    }
+    const questions = pendingQuestion.questions && pendingQuestion.questions.length > 0
+      ? pendingQuestion.questions
+      : [{ header: pendingQuestion.header, question: pendingQuestion.question, options: pendingQuestion.options }];
+    return questions.every((_, idx) => (questionAnswers[idx] || '').trim().length > 0);
+  })();
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', background: '#0c0c0c' }}>
       {/* Header */}
@@ -275,55 +381,84 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       {pendingQuestion && (
         <div style={{ padding: '8px 12px', borderTop: '1px solid #222', background: '#1a1a1a', flexShrink: 0 }}>
           <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>{pendingQuestion.header}</div>
-          <div style={{ fontSize: 12, color: '#aaa', marginBottom: 8 }}>{pendingQuestion.question}</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            {pendingQuestion.options.map((opt) => (
-              <label key={opt.id} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#ccc', cursor: 'pointer' }}>
+          {pendingQuestion.kind === 'question' ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {(pendingQuestion.questions && pendingQuestion.questions.length > 0 ? pendingQuestion.questions : [{ header: pendingQuestion.header, question: pendingQuestion.question, options: pendingQuestion.options }]).map((q, idx) => (
+                <div key={idx} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {idx > 0 && <div style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>{q.header}</div>}
+                  <div style={{ fontSize: 12, color: '#aaa' }}>{q.question}</div>
+                  {q.options.length > 0 ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      {q.options.map((opt) => (
+                        <label key={`${idx}-${opt.label}`} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, fontSize: 12, color: '#ccc', cursor: 'pointer' }}>
+                          <input
+                            type="radio"
+                            name={`acp-question-${idx}`}
+                            checked={questionAnswers[idx] === opt.id}
+                            onChange={() => setQuestionAnswers((prev) => ({ ...prev, [idx]: opt.id }))}
+                            style={{ marginTop: 2 }}
+                          />
+                          <span>
+                            <span>{opt.label}</span>
+                            {opt.description && <span style={{ display: 'block', color: '#777', fontSize: 11 }}>{opt.description}</span>}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  ) : (
+                    <input
+                      value={questionAnswers[idx] || ''}
+                      onChange={(e) => setQuestionAnswers((prev) => ({ ...prev, [idx]: e.target.value }))}
+                      placeholder="Your answer..."
+                      style={{ width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', fontSize: 12, padding: '4px 8px', borderRadius: 4 }}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <>
+              <div style={{ fontSize: 12, color: '#aaa', marginBottom: 8 }}>{pendingQuestion.question}</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {pendingQuestion.options.map((opt) => (
+                  <label key={opt.id} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#ccc', cursor: 'pointer' }}>
+                    <input
+                      type={pendingQuestion.multiple ? 'checkbox' : 'radio'}
+                      name="acp-permission"
+                      checked={selectedOptions.includes(opt.id)}
+                      onChange={() => {
+                        if (pendingQuestion.multiple) {
+                          setSelectedOptions((prev) => prev.includes(opt.id) ? prev.filter((x) => x !== opt.id) : [...prev, opt.id]);
+                        } else {
+                          setSelectedOptions([opt.id]);
+                        }
+                      }}
+                    />
+                    {opt.label}
+                  </label>
+                ))}
+              </div>
+              {pendingQuestion.custom && (
                 <input
-                  type={pendingQuestion.multiple ? 'checkbox' : 'radio'}
-                  name="acp-permission"
-                  checked={selectedOptions.includes(opt.id)}
-                  onChange={() => {
-                    if (pendingQuestion.multiple) {
-                      setSelectedOptions((prev) => prev.includes(opt.id) ? prev.filter((x) => x !== opt.id) : [...prev, opt.id]);
-                    } else {
-                      setSelectedOptions([opt.id]);
-                    }
-                  }}
+                  ref={customInputRef}
+                  value={customAnswer}
+                  onChange={(e) => setCustomAnswer(e.target.value)}
+                  placeholder="Your answer..."
+                  style={{ marginTop: 8, width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', fontSize: 12, padding: '4px 8px', borderRadius: 4 }}
                 />
-                {opt.label}
-              </label>
-            ))}
-          </div>
-          {pendingQuestion.custom && (
-            <input
-              ref={customInputRef}
-              value={customAnswer}
-              onChange={(e) => setCustomAnswer(e.target.value)}
-              placeholder="Your answer..."
-              style={{ marginTop: 8, width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', fontSize: 12, padding: '4px 8px', borderRadius: 4 }}
-            />
+              )}
+            </>
           )}
           <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
             <button
-              onClick={() => {
-                const answers = pendingQuestion.custom ? [...selectedOptions, customAnswer] : selectedOptions;
-                api.invoke('acp:permissionResponse', { chatId, requestId: pendingQuestion.requestId, answers: answers.filter((a) => a.length > 0), rejected: false });
-                setPendingQuestion(null);
-                setSelectedOptions([]);
-                setCustomAnswer('');
-              }}
-              style={{ fontSize: 12, padding: '4px 12px', borderRadius: 4, border: '1px solid #333', background: '#1f3a4c', color: '#ccc', cursor: 'pointer' }}
+              onClick={submitPendingInteraction}
+              disabled={!pendingQuestionSubmitEnabled}
+              style={{ fontSize: 12, padding: '4px 12px', borderRadius: 4, border: '1px solid #333', background: '#1f3a4c', color: '#ccc', cursor: pendingQuestionSubmitEnabled ? 'pointer' : 'not-allowed', opacity: pendingQuestionSubmitEnabled ? 1 : 0.55 }}
             >
               Submit
             </button>
             <button
-              onClick={() => {
-                api.invoke('acp:permissionResponse', { chatId, requestId: pendingQuestion.requestId, answers: [], rejected: true });
-                setPendingQuestion(null);
-                setSelectedOptions([]);
-                setCustomAnswer('');
-              }}
+              onClick={rejectPendingInteraction}
               style={{ fontSize: 12, padding: '4px 12px', borderRadius: 4, border: '1px solid #333', background: 'transparent', color: '#888', cursor: 'pointer' }}
             >
               Reject

@@ -648,6 +648,7 @@ export interface SmartInputTask {
 }
 
 export interface OpenCodeQuestion {
+  kind?: 'permission' | 'question';
   header: string;
   question: string;
   options: OpenCodeQuestionOption[];
@@ -655,11 +656,19 @@ export interface OpenCodeQuestion {
   custom: boolean;
   requestId: string;
   sessionId: string;
+  questions?: OpenCodeQuestionPrompt[];
 }
 
 export interface OpenCodeQuestionOption {
   id: string;
   label: string;
+  description?: string;
+}
+
+export interface OpenCodeQuestionPrompt {
+  header: string;
+  question: string;
+  options: OpenCodeQuestionOption[];
 }
 
 export interface DirectoryNode {
@@ -823,7 +832,8 @@ export interface IpcChannels {
   'acp:send': (opts: { chatId: string; promptText: string; attachments: string[]; modeId?: string }) => Promise<void>;
   'acp:cancel': (chatId: string) => Promise<void>;
   'acp:setConfigOption': (opts: { chatId: string; configId: string; value: string }) => Promise<void>;
-  'acp:permissionResponse': (opts: { chatId: string; requestId: string | number; answers: string[]; rejected: boolean }) => Promise<void>;
+  'acp:permissionResponse': (opts: { chatId: string; requestId: string; answers: string[]; rejected: boolean }) => Promise<boolean>;
+  'acp:questionResponse': (opts: { chatId: string; requestId: string; answers: string[][]; rejected: boolean }) => Promise<boolean>;
   'acp:getSession': (chatId: string) => Promise<AcpChatSession | undefined>;
   'acp:event': (chatId: string, event: unknown) => void;
   'acp:standby:warm': (projectId: number, cwd: string) => Promise<void>;
@@ -904,7 +914,7 @@ export interface BrowserMcpAuthScope {
   sessionId: string;
 }
 
-export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'acp:spawn' | 'acp:send' | 'acp:cancel' | 'acp:setConfigOption' | 'acp:permissionResponse' | 'acp:getSession' | 'acp:kill' | 'acp:standby:warm' | 'acp:standby:get' | 'acp:standby:clear' | 'acp:standby:promote' | 'acp:standby:clearAll' | 'hook:answer' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'notify:show' | 'window:confirmClose'>;
+export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'acp:spawn' | 'acp:send' | 'acp:cancel' | 'acp:setConfigOption' | 'acp:permissionResponse' | 'acp:questionResponse' | 'acp:getSession' | 'acp:kill' | 'acp:standby:warm' | 'acp:standby:get' | 'acp:standby:clear' | 'acp:standby:promote' | 'acp:standby:clearAll' | 'hook:answer' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'notify:show' | 'window:confirmClose'>;
 
 export type IpcSendChannel = keyof Pick<IpcChannels, 'pty:data' | 'pty:exit' | 'hook:status' | 'acp:event' | 'browser:urlChanged' | 'browser:designElementClicked' | 'window:closeRequest' | 'window:focused'>;
 

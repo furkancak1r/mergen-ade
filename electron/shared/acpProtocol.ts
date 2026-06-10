@@ -19,8 +19,12 @@ export function jsonRpcIdToString(id: unknown): string {
   return '';
 }
 
-export function permissionRequestIdFromRpc(id: unknown, params: Record<string, unknown>): string {
-  return jsonRpcIdToString(id) || jsonRpcIdToString(params.requestId);
+export function isJsonRpcId(id: unknown): id is JsonRpcId {
+  return (typeof id === 'string' && id.length > 0) || (typeof id === 'number' && Number.isFinite(id));
+}
+
+export function permissionRequestIdFromRpc(id: unknown): string {
+  return jsonRpcIdToString(id);
 }
 
 export function permissionOptionId(option: AcpPermissionOptionLike | undefined): string {
@@ -36,7 +40,7 @@ export function firstAutoApproveOptionId(options: AcpPermissionOptionLike[], ena
 export function buildAcpPermissionResponse(requestId: JsonRpcId, optionId: string, rejected = false) {
   return {
     jsonrpc: '2.0',
-    id: String(requestId),
+    id: requestId,
     result: {
       outcome: rejected
         ? { outcome: 'cancelled' }
@@ -46,4 +50,18 @@ export function buildAcpPermissionResponse(requestId: JsonRpcId, optionId: strin
           },
     },
   };
+}
+
+export function buildAcpQuestionResponse(requestId: JsonRpcId, answers: string[][], rejected = false) {
+  return {
+    jsonrpc: '2.0',
+    id: requestId,
+    result: rejected
+      ? { rejected: true }
+      : { answers },
+  };
+}
+
+export function stripAnsi(text: string): string {
+  return text.replace(/[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g, '');
 }

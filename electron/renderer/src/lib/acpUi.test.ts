@@ -25,6 +25,11 @@ describe('acpUi', () => {
     expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'cancelled' }).running).toBe(false);
   });
 
+  it('keeps ACP running for non-fatal stderr and warning events', () => {
+    expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'stderr' }).running).toBe(true);
+    expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'warning' }).running).toBe(true);
+  });
+
   it('does not show welcome while queued prompts are visible', () => {
     expect(shouldShowAcpWelcome([], [{ text: 'queued' }])).toBe(false);
     expect(shouldShowAcpWelcome([], [])).toBe(true);

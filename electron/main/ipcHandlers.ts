@@ -5,7 +5,7 @@ import path from 'path';
 import { loadConfig, saveConfig, loadHistory, saveHistory, repairMojibakePath } from './config';
 import { createTerminal, writeTerminal, resizeTerminal, killTerminal, getTerminalState } from './pty';
 import { discoverWorktrees, createWorktree, removeWorktree, getGitStatus } from './worktree';
-import { spawnAcpChat, sendAcpPrompt, cancelAcpPrompt, setAcpConfigOption, sendAcpPermissionResponse, getAcpSession, killAcpChat, warmAcpStandby, getAcpStandby, clearAcpStandby, promoteAcpStandby, clearAllAcpStandby } from './acpService';
+import { spawnAcpChat, sendAcpPrompt, cancelAcpPrompt, setAcpConfigOption, sendAcpPermissionResponse, sendAcpQuestionResponse, getAcpSession, killAcpChat, warmAcpStandby, getAcpStandby, clearAcpStandby, promoteAcpStandby, clearAllAcpStandby } from './acpService';
 import { submitAnswer } from './hookService';
 import {
   createBrowserView,
@@ -157,8 +157,11 @@ export function registerIpcHandlers() {
   ipcMain.handle('acp:setConfigOption', async (_event, opts: { chatId: string; configId: string; value: string }) => {
     setAcpConfigOption(opts.chatId, opts.configId, opts.value);
   });
-  ipcMain.handle('acp:permissionResponse', async (_event, opts: { chatId: string; requestId: string | number; answers: string[]; rejected: boolean }) => {
-    sendAcpPermissionResponse(opts.chatId, opts.requestId, opts.answers, opts.rejected);
+  ipcMain.handle('acp:permissionResponse', async (_event, opts: { chatId: string; requestId: string; answers: string[]; rejected: boolean }) => {
+    return sendAcpPermissionResponse(opts.chatId, opts.requestId, opts.answers, opts.rejected);
+  });
+  ipcMain.handle('acp:questionResponse', async (_event, opts: { chatId: string; requestId: string; answers: string[][]; rejected: boolean }) => {
+    return sendAcpQuestionResponse(opts.chatId, opts.requestId, opts.answers, opts.rejected);
   });
   ipcMain.handle('acp:getSession', async (_event, chatId: string) => {
     return getAcpSession(chatId);
