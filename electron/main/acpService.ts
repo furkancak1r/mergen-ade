@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { BrowserWindow } from 'electron';
-import type { AcpChatSession, AcpConfigOption, AcpAvailableCommand, AcpChatMessage, OpenCodeModelConfig } from '../shared/types';
+import type { AcpChatSession, AcpConfigOption, AcpAvailableCommand, AcpChatMessage, OpenCodeModelConfig, QueuedAcpPrompt } from '../shared/types';
 import { activeBuildModel, effectivePlanModel, effectivePlanEffort, mergeAcpKnownModels } from '../shared/types';
 import {
   acpUnknownResponseWarningText,
@@ -52,7 +52,7 @@ interface AcpSession {
   currentModel?: string;
   currentEffort?: string;
   availableCommands?: AcpAvailableCommand[];
-  queuedPrompts: { text: string; attachments: string[]; modeId: string; finalPromptText: string }[];
+  queuedPrompts: QueuedAcpPrompt[];
   partialStderr?: string;
   cancelGraceUntil?: number;
   cancelUnsupported?: boolean;
@@ -596,6 +596,22 @@ export function deleteAcpQueuedPrompt(chatId: string, index: number): boolean {
   if (!session || !isValidQueueIndex(session, index)) return false;
 
   session.queuedPrompts.splice(index, 1);
+  broadcastQueueUpdated(session);
+  return true;
+}
+
+export function restoreAcpQueuedPrompt(chatId: string, index: number, prompt: QueuedAcpPrompt): boolean {
+  const session = sessions.get(chatId);
+  if (!session || !Number.isInteger(index) || index < 0) return false;
+
+  const restored: QueuedAcpPrompt = {
+    text: prompt.text,
+    attachments: [...prompt.attachments],
+    modeId: prompt.modeId,
+    finalPromptText: prompt.finalPromptText,
+  };
+  const insertIndex = Math.min(index, session.queuedPrompts.length);
+  session.queuedPrompts.splice(insertIndex, 0, restored);
   broadcastQueueUpdated(session);
   return true;
 }

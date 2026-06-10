@@ -1,17 +1,27 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import type { AcpChatSession, AcpChatMessage, ProjectRecord, AcpConfigOption, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
-import { defaultAppConfig } from '../../../shared/types';
+import { activeBuildModel, defaultAppConfig, effectivePlanModel } from '../../../shared/types';
 import { removeMentionFromInput } from '../lib/acpParser';
 import {
+  ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS,
   actionControlsEnabled,
+  acpComposerHintText,
+  acpKimiProtectionBadge,
   acpModeUiLabel,
+  acpQueuedPromptDraftEditBlockedMessage,
+  acpQueuedPromptAttachmentLabel,
+  acpQueuedPromptHeaderLabel,
+  acpQueuedPromptIndexLabel,
+  acpQueuedPromptPlanCount,
+  acpQueuedPromptVisibleRowCount,
+  acpStatusText,
   hasConfigSelectorOptions,
   openCodeAcpPanelTitle,
   openCodeAcpWelcomeText,
   optionValues,
   queuedPromptPreview,
   shouldShowAcpWelcome,
-  slashCommandItemsForInput,
+  slashCommandItemsForComposer,
   type AcpSlashCommandItem,
 } from '../lib/acpUi';
 
@@ -48,6 +58,11 @@ interface AcpChatPanelProps {
   branchName?: string;
 }
 
+interface QueuedPromptEditReturn {
+  index: number;
+  prompt: QueuedAcpPrompt;
+}
+
 export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, config, onClose, disabled = false, branchName }) => {
   const [session, setSession] = useState<AcpChatSession | null>(null);
   const [input, setInput] = useState('');
@@ -58,6 +73,9 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [customAnswer, setCustomAnswer] = useState('');
   const [questionAnswers, setQuestionAnswers] = useState<Record<number, string>>({});
   const [slashCommandItemsState, setSlashCommandItemsState] = useState<AcpSlashCommandItem[]>([]);
+  const [queuedPromptEditReturn, setQueuedPromptEditReturn] = useState<QueuedPromptEditReturn | null>(null);
+  const [queueStatusMessage, setQueueStatusMessage] = useState<string | null>(null);
+  const [queueExpanded, setQueueExpanded] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modeDropdownRef = useRef<HTMLDivElement>(null);
@@ -77,6 +95,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   useEffect(() => {
     refreshSession();
+    const controlsReady = actionControlsEnabled(session);
     const unsub = api.on('acp:event', (eventChatId: string, event: AcpPanelEvent) => {
       if (eventChatId !== chatId) return;
 
@@ -151,14 +170,14 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       }
       if (event.type === 'commands' && event.commands) {
         setSlashCommandItemsState((prev) => {
-          const next = slashCommandItemsForInput(event.commands, inputRef.current?.value ?? '');
+          const next = slashCommandItemsForComposer(event.commands, inputRef.current?.value ?? '', controlsReady);
           return next.length === prev.length && next.every((item, index) => item.hint === prev[index]?.hint && item.description === prev[index]?.description) ? prev : next;
         });
         return;
       }
     });
     return () => { unsub(); };
-  }, [chatId, refreshSession, clearPendingInteraction]);
+  }, [chatId, refreshSession, clearPendingInteraction, session?.sessionId]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -166,6 +185,9 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   useEffect(() => {
     clearPendingInteraction();
+    setQueuedPromptEditReturn(null);
+    setQueueStatusMessage(null);
+    setQueueExpanded(true);
   }, [chatId, clearPendingInteraction]);
 
   // Update slash hints when input changes
@@ -175,8 +197,8 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       return;
     }
     const availableCommands = session?.availableCommands ?? [];
-    setSlashCommandItemsState(slashCommandItemsForInput(availableCommands, input));
-  }, [input, session?.availableCommands]);
+    setSlashCommandItemsState(slashCommandItemsForComposer(availableCommands, input, actionControlsEnabled(session)));
+  }, [input, session?.availableCommands, session?.sessionId]);
 
   useEffect(() => {
     if (disabled) return;
@@ -218,6 +240,8 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     await api.invoke('acp:send', { chatId, promptText: text, attachments, modeId: session?.currentModeId });
     setInput('');
     setAttachments([]);
+    setQueuedPromptEditReturn(null);
+    setQueueStatusMessage(null);
   }, [chatId, input, attachments, session?.currentModeId]);
 
   const cancelAcp = useCallback(async () => {
@@ -285,6 +309,21 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const branchNameDisplay = branchName || 'main';
 
   const isWelcome = shouldShowAcpWelcome(session?.messages, session?.queuedPrompts);
+  const composerHint = acpComposerHintText({
+    welcomeCenter: isWelcome,
+    sessionReady: controlsEnabled,
+    activeMode: currentMode,
+  });
+  const statusText = session ? acpStatusText(session.status) : 'Loading...';
+  const statusModel = session?.currentModel?.trim()
+    || (currentMode === 'plan' ? effectivePlanModel(resolvedConfig.opencode) : activeBuildModel(resolvedConfig.opencode));
+  const kimiProtectionBadge = acpKimiProtectionBadge(statusModel, resolvedConfig.opencode.loopProtectionEnabled);
+  const queuedPrompts = session?.queuedPrompts ?? [];
+  const queuePanelVisible = queuedPrompts.length > 0 || queuedPromptEditReturn !== null;
+  const queuePlanCount = acpQueuedPromptPlanCount(queuedPrompts);
+  const queueHeaderLabel = acpQueuedPromptHeaderLabel(queuedPrompts.length, queuedPromptEditReturn?.index);
+  const queueVisibleRows = acpQueuedPromptVisibleRowCount(queuedPrompts.length, queueExpanded);
+  const queueRowsMaxHeight = queueVisibleRows * 48;
 
   const submitPendingInteraction = async () => {
     if (!pendingQuestion) return;
@@ -343,6 +382,49 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     await api.invoke('clipboard:writeText', text);
   }, []);
 
+  const editQueuedPrompt = useCallback(async (index: number, prompt: QueuedAcpPrompt) => {
+    const blockedMessage = acpQueuedPromptDraftEditBlockedMessage({
+      input,
+      attachments,
+      editingQueuedPrompt: queuedPromptEditReturn !== null,
+    });
+    if (blockedMessage) {
+      setQueueStatusMessage(blockedMessage);
+      inputRef.current?.focus();
+      return;
+    }
+
+    const accepted = await api.invoke('acp:queueDelete', { chatId, index }) as boolean;
+    if (!accepted) return;
+
+    setInput(prompt.text);
+    setAttachments([...prompt.attachments]);
+    setQueuedPromptEditReturn({ index, prompt: { ...prompt, attachments: [...prompt.attachments] } });
+    setQueueStatusMessage(null);
+    if (prompt.modeId && prompt.modeId !== session?.currentModeId) {
+      await api.invoke('acp:setConfigOption', { chatId, configId: 'mode', value: prompt.modeId });
+    }
+    await refreshSession();
+    inputRef.current?.focus();
+  }, [attachments, chatId, input, queuedPromptEditReturn, refreshSession, session?.currentModeId]);
+
+  const cancelQueuedPromptEdit = useCallback(async () => {
+    if (!queuedPromptEditReturn) return;
+    const accepted = await api.invoke('acp:queueRestore', {
+      chatId,
+      index: queuedPromptEditReturn.index,
+      prompt: queuedPromptEditReturn.prompt,
+    }) as boolean;
+    if (!accepted) return;
+
+    setInput('');
+    setAttachments([]);
+    setQueuedPromptEditReturn(null);
+    setQueueStatusMessage(null);
+    await refreshSession();
+    inputRef.current?.focus();
+  }, [chatId, queuedPromptEditReturn, refreshSession]);
+
   const pendingQuestionSubmitEnabled = (() => {
     if (!pendingQuestion) return false;
     if (pendingQuestion.kind !== 'question') {
@@ -362,7 +444,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
           {openCodeAcpPanelTitle(project.name)}
         </span>
         <span style={{ fontSize: 11, color: '#888' }}>
-          {session?.status || 'Loading...'}
+          {statusText}
         </span>
         {onClose && (
           <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 14 }}>
@@ -390,18 +472,46 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       </div>
 
       {/* Queued prompts — pinned above input */}
-      {session?.queuedPrompts && session.queuedPrompts?.length > 0 && (
+      {queuePanelVisible && (
         <div style={{ padding: '4px 12px', flexShrink: 0 }}>
-          {session.queuedPrompts.map((qp, i) => (
-            <QueuedPromptRow
-              key={i}
-              index={i}
-              prompt={qp}
-              onRunNext={runQueuedPromptNext}
-              onCopy={copyQueuedPrompt}
-              onDelete={deleteQueuedPrompt}
-            />
-          ))}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '0 2px 5px', color: '#ffc864', fontSize: 11 }}>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+              <span style={{ fontWeight: 700 }}>{queueHeaderLabel}</span>
+              {queuePlanCount > 0 && <span style={{ color: '#777' }}>{queuePlanCount} Plan</span>}
+            </span>
+            {queuedPromptEditReturn ? (
+              <button
+                onClick={cancelQueuedPromptEdit}
+                title="Cancel queued message edit"
+                style={queuedPromptHeaderButtonStyle}
+              >
+                Cancel
+              </button>
+            ) : queuedPrompts.length > 0 ? (
+              <button
+                onClick={() => setQueueExpanded((value) => !value)}
+                title="Collapse or expand queued ACP messages"
+                style={queuedPromptHeaderButtonStyle}
+              >
+                {queueExpanded ? 'Hide' : 'Show'}
+              </button>
+            ) : null}
+          </div>
+          {queueExpanded && queuedPrompts.length > 0 && (
+            <div style={{ maxHeight: queueRowsMaxHeight, overflowY: queuedPrompts.length > ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS ? 'auto' : 'hidden' }}>
+              {queuedPrompts.map((qp, i) => (
+                <QueuedPromptRow
+                  key={i}
+                  index={i}
+                  prompt={qp}
+                  onRunNext={runQueuedPromptNext}
+                  onCopy={copyQueuedPrompt}
+                  onEdit={editQueuedPrompt}
+                  onDelete={deleteQueuedPrompt}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -535,7 +645,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
                 setInput((prev) => prev + '\n');
               }
             }}
-            placeholder={isWelcome ? 'Type a message to start...' : 'Type a message...'}
+            placeholder={composerHint}
             style={{
               flex: 1,
               background: 'transparent',
@@ -582,6 +692,12 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
                 <button onClick={() => removeAttachment(i)} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}>✕</button>
               </span>
             ))}
+          </div>
+        )}
+
+        {queueStatusMessage && (
+          <div style={{ marginTop: 6, fontSize: 11, color: '#d0a35f' }}>
+            {queueStatusMessage}
           </div>
         )}
 
@@ -681,8 +797,9 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{branchNameDisplay}</span>
           <span>Local</span>
+          {kimiProtectionBadge && <span style={{ color: kimiProtectionBadge.color }}>{kimiProtectionBadge.label}</span>}
         </span>
-        <span>{session?.status || 'Idle'}</span>
+        <span>{statusText}</span>
       </div>
     </div>
   );
@@ -717,13 +834,19 @@ const QueuedPromptRow: React.FC<{
   prompt: QueuedAcpPrompt;
   onRunNext: (index: number) => void;
   onCopy: (prompt: QueuedAcpPrompt) => void;
+  onEdit: (index: number, prompt: QueuedAcpPrompt) => void;
   onDelete: (index: number) => void;
-}> = ({ index, prompt, onRunNext, onCopy, onDelete }) => {
+}> = ({ index, prompt, onRunNext, onCopy, onEdit, onDelete }) => {
   const modeLabel = acpModeUiLabel(prompt.modeId);
+  const indexLabel = acpQueuedPromptIndexLabel(index);
+  const attachmentLabel = acpQueuedPromptAttachmentLabel(prompt.attachments.length);
   const preview = queuedPromptPreview(prompt);
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 44, padding: '8px 10px', background: '#1a1a1a', borderRadius: 8, marginBottom: 4, fontSize: 12, color: '#888' }}>
-      <span style={{ color: '#666', fontWeight: 600, flexShrink: 0 }}>Queued</span>
+      {indexLabel && <span style={{ color: '#666', fontWeight: 600, flexShrink: 0 }}>{indexLabel}</span>}
+      {modeLabel && (
+        <span style={{ fontSize: 10, color: '#dca046', flexShrink: 0 }}>{modeLabel}</span>
+      )}
       <button
         onClick={() => onCopy(prompt)}
         title="Copy queued prompt"
@@ -731,11 +854,8 @@ const QueuedPromptRow: React.FC<{
       >
         {preview}
       </button>
-      {modeLabel && (
-        <span style={{ fontSize: 10, color: '#666', background: '#222', padding: '2px 6px', borderRadius: 3, flexShrink: 0 }}>{modeLabel}</span>
-      )}
-      {prompt.attachments.length > 0 && (
-        <span style={{ fontSize: 10, color: '#666', background: '#222', padding: '2px 6px', borderRadius: 3, flexShrink: 0 }}>+{prompt.attachments.length}</span>
+      {attachmentLabel && (
+        <span style={{ fontSize: 10, color: '#666', flexShrink: 0 }}>{attachmentLabel}</span>
       )}
       <button
         onClick={() => onRunNext(index)}
@@ -745,11 +865,11 @@ const QueuedPromptRow: React.FC<{
         ⇧
       </button>
       <button
-        onClick={() => onCopy(prompt)}
-        title="Copy"
+        onClick={() => onEdit(index, prompt)}
+        title="Edit queued prompt"
         style={queuedPromptActionStyle}
       >
-        ⧉
+        ✎
       </button>
       <button
         onClick={() => onDelete(index)}
@@ -774,6 +894,16 @@ const queuedPromptActionStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
+  flexShrink: 0,
+};
+
+const queuedPromptHeaderButtonStyle: React.CSSProperties = {
+  border: 'none',
+  background: 'transparent',
+  color: '#aaa',
+  cursor: 'pointer',
+  fontSize: 11,
+  padding: '2px 4px',
   flexShrink: 0,
 };
 

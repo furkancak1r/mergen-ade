@@ -1,10 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS,
   OPENCODE_ACP_CLOSE_TOOLTIP,
   OPENCODE_ACP_LABEL,
   OPENCODE_ACP_OPEN_BUTTON_LABEL,
   actionControlsEnabled,
+  acpComposerHintText,
+  acpKimiProtectionBadge,
   acpModeUiLabel,
+  acpQueuedPromptDraftEditBlockedMessage,
+  acpQueuedPromptAttachmentLabel,
+  acpQueuedPromptHeaderLabel,
+  acpQueuedPromptIndexLabel,
+  acpQueuedPromptPlanCount,
+  acpQueuedPromptVisibleRowCount,
+  acpStatusText,
   hasConfigSelectorOptions,
   moveQueuedPromptToFront,
   nextAcpActivityState,
@@ -16,6 +26,7 @@ import {
   slashCommandHint,
   slashCommandHints,
   slashCommandItems,
+  slashCommandItemsForComposer,
   slashCommandItemsForInput,
 } from './acpUi';
 
@@ -49,6 +60,17 @@ describe('acpUi', () => {
     expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'warning' }).running).toBe(true);
   });
 
+  it('maps ACP status values to Rust-style display text', () => {
+    expect(acpStatusText('starting')).toBe('Starting...');
+    expect(acpStatusText('connected')).toBe('Starting...');
+    expect(acpStatusText('session_created')).toBe('Starting...');
+    expect(acpStatusText('idle')).toBe('Idle');
+    expect(acpStatusText('running')).toBe('Running...');
+    expect(acpStatusText('permission')).toBe('Permission');
+    expect(acpStatusText('error')).toBe('Error');
+    expect(acpStatusText(undefined)).toBe('Idle');
+  });
+
   it('does not show welcome while queued prompts are visible', () => {
     expect(shouldShowAcpWelcome([], [{ text: 'queued' }])).toBe(false);
     expect(shouldShowAcpWelcome([], [])).toBe(true);
@@ -73,6 +95,26 @@ describe('acpUi', () => {
     expect(acpModeUiLabel('custom')).toBe('custom');
   });
 
+  it('matches Rust ACP composer hint text priority', () => {
+    expect(acpComposerHintText({ welcomeCenter: true, sessionReady: false, activeMode: 'plan' })).toBe('Waiting for session...');
+    expect(acpComposerHintText({ welcomeCenter: true, sessionReady: true, activeMode: 'build' })).toBe('Plan, Build, / for skills, @ for context');
+    expect(acpComposerHintText({ welcomeCenter: false, sessionReady: true, activeMode: 'plan' })).toBe('Plan and design before coding...');
+    expect(acpComposerHintText({ welcomeCenter: false, sessionReady: true, activeMode: 'build' })).toBe('Type a message...');
+  });
+
+  it('shows Kimi loop-protection badge only for risky OpenCode models', () => {
+    expect(acpKimiProtectionBadge('fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo', true)).toEqual({
+      label: 'Kimi protected',
+      color: 'rgb(100, 195, 140)',
+    });
+    expect(acpKimiProtectionBadge('provider/k2p6-fast', false)).toEqual({
+      label: 'Kimi unprotected',
+      color: 'rgb(220, 170, 60)',
+    });
+    expect(acpKimiProtectionBadge('openai/gpt-5.5-fast', true)).toBeUndefined();
+    expect(acpKimiProtectionBadge(undefined, true)).toBeUndefined();
+  });
+
   it('uses Rust-style ACP queued prompt previews', () => {
     expect(queuedPromptPreview({ text: '  Build this  ', finalPromptText: 'ignored' })).toBe('Build this');
     expect(queuedPromptPreview({ text: '', finalPromptText: 'Attached file paths:\n- a.png' })).toBe('Attached file paths:\n- a.png');
@@ -93,6 +135,35 @@ describe('acpUi', () => {
     expect(removeQueuedPromptAt(queue, 1)).toEqual(['first', 'third']);
     expect(queue).toEqual(['first', 'second', 'third']);
     expect(removeQueuedPromptAt(queue, 99)).toEqual(queue);
+  });
+
+  it('blocks queued ACP prompt edit while the composer draft is occupied', () => {
+    const message = 'Input is not empty; send or clear it before editing queued message';
+    expect(acpQueuedPromptDraftEditBlockedMessage({ input: 'draft', attachments: [], editingQueuedPrompt: false })).toBe(message);
+    expect(acpQueuedPromptDraftEditBlockedMessage({ input: '', attachments: ['a.png'], editingQueuedPrompt: false })).toBe(message);
+    expect(acpQueuedPromptDraftEditBlockedMessage({ input: '', attachments: [], editingQueuedPrompt: true })).toBe(message);
+    expect(acpQueuedPromptDraftEditBlockedMessage({ input: '  ', attachments: [], editingQueuedPrompt: false })).toBeUndefined();
+  });
+
+  it('matches Rust queued prompt panel header and visible-row rules', () => {
+    const prompts = [
+      { modeId: 'build' },
+      { modeId: 'plan' },
+      { modeId: 'plan' },
+    ];
+
+    expect(ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS).toBe(2);
+    expect(acpQueuedPromptHeaderLabel(prompts.length)).toBe('Queued 3');
+    expect(acpQueuedPromptHeaderLabel(prompts.length, 1)).toBe('Editing queued #2');
+    expect(acpQueuedPromptPlanCount(prompts)).toBe(2);
+    expect(acpQueuedPromptVisibleRowCount(prompts.length, true)).toBe(2);
+    expect(acpQueuedPromptVisibleRowCount(prompts.length, false)).toBe(0);
+    expect(acpQueuedPromptIndexLabel(0)).toBe('1.');
+    expect(acpQueuedPromptIndexLabel(2)).toBe('3.');
+    expect(acpQueuedPromptIndexLabel(-1)).toBe('');
+    expect(acpQueuedPromptAttachmentLabel(0)).toBeUndefined();
+    expect(acpQueuedPromptAttachmentLabel(1)).toBe('1 file');
+    expect(acpQueuedPromptAttachmentLabel(2)).toBe('2 file');
   });
 
   it('normalizes slash command hints from id or name', () => {
@@ -150,6 +221,15 @@ describe('acpUi', () => {
     expect(slashCommandItemsForInput(commands, '')).toEqual([]);
     expect(slashCommandItemsForInput(commands, 'init')).toEqual([]);
     expect(slashCommandItemsForInput(commands, '/')).toEqual([
+      { hint: '/init', description: 'Create project memory' },
+    ]);
+  });
+
+  it('keeps slash command popup hidden until composer controls are enabled', () => {
+    const commands = [{ id: 'init', name: 'Initialize', description: 'Create project memory' }];
+
+    expect(slashCommandItemsForComposer(commands, '/', false)).toEqual([]);
+    expect(slashCommandItemsForComposer(commands, '/', true)).toEqual([
       { hint: '/init', description: 'Create project memory' },
     ]);
   });

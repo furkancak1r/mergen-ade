@@ -5387,3 +5387,163 @@
   - Keep ACP fatality rules in shared protocol helpers and cover session-state combinations in tests before changing main-process error handling.
 - Files/Commands touched: `electron/shared/acpProtocol.ts`, `electron/main/acpService.ts`, `electron/renderer/src/lib/acpProtocol.test.ts`, `KNOWN_ISSUES.md`
 - References: Original Rust `handle_acp_error_event`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP slash popup session hazir olmadan acilabiliyordu {#electron-acp-slash-popup-controls-parity}
+- Date: 2026-06-11
+- Context: Rust hides ACP slash command popup content while composer action controls are disabled, using `acp_composer_slash_popup_height_for_controls(..., false) == 0`.
+- Error signature:
+  1. Electron derived slash popup rows from input and available commands only.
+  2. If stale/early command data existed before `sessionId`, typing `/` could show the command popup while other composer actions were disabled.
+- Symptoms/Impact:
+  - The ACP composer could expose command UI before the session was ready.
+  - This drifted from Rust's disabled-controls state and made startup/error states look less deterministic.
+- Root cause:
+  - Slash popup item generation did not include the shared action-control readiness gate.
+- Resolution:
+  - Added `slashCommandItemsForComposer()` to gate popup rows on composer controls.
+  - Updated `AcpChatPanel` command-event and input-change paths to use the gated helper.
+  - Added regression coverage for disabled vs enabled composer controls.
+- Prevent recurrence:
+  - Keep slash popup visibility derived from input, available commands, and action-control readiness together.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_composer_slash_popup_height_for_controls`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP composer hint metni Rust durum siralamasi ile eslesmiyordu {#electron-acp-composer-hint-parity}
+- Date: 2026-06-11
+- Context: Rust selects ACP composer hint text by priority: session readiness, welcome center, plan mode, then default message mode.
+- Error signature:
+  1. Electron used `Type a message to start...` for the welcome composer.
+  2. Electron did not show `Waiting for session...` before `sessionId`.
+  3. Electron did not show the plan-mode hint `Plan and design before coding...`.
+- Symptoms/Impact:
+  - The ACP composer gave weaker startup feedback while the session was still warming.
+  - Plan mode and welcome mode looked less like the original Rust UI.
+- Root cause:
+  - Composer placeholder text was inline in `AcpChatPanel` instead of using the Rust parity state order.
+- Resolution:
+  - Added `acpComposerHintText()` with Rust's hint priority and strings.
+  - Updated `AcpChatPanel` to use the helper for textarea placeholder text.
+  - Added regression coverage for waiting, welcome, plan, and default hints.
+- Prevent recurrence:
+  - Keep ACP composer text state in shared UI helpers and test the priority order whenever composer modes change.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_composer_hint_text`, `ACP_WELCOME_HINT`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP status row Kimi koruma ve Rust status metinlerini gostermiyordu {#electron-acp-status-row-kimi-parity}
+- Date: 2026-06-11
+- Context: Rust ACP status row shows branch, `Local`, an optional `Kimi protected` / `Kimi unprotected` badge for risky Kimi-family models, and user-facing status text such as `Running...`.
+- Error signature:
+  1. Electron showed raw ACP status ids like `running` / `idle` instead of Rust-style display text.
+  2. Electron did not show Kimi loop-protection state in the ACP status row.
+- Symptoms/Impact:
+  - The ACP panel looked less like the original Rust UI.
+  - Users could not see whether the active Kimi-risk model was protected directly from the ACP chat panel.
+- Root cause:
+  - Status row rendering was inline and lacked shared parity helpers for status text and Kimi risk classification.
+- Resolution:
+  - Added `acpStatusText()`, `opencodeModelHasKimiLoopRisk()`, and `acpKimiProtectionBadge()`.
+  - Updated `AcpChatPanel` to use Rust-style status text in header/status row.
+  - Added the Kimi protection badge beside `Local` when the active/fallback model is risky.
+  - Added regression coverage for status mapping and Kimi badge classification.
+- Prevent recurrence:
+  - Keep status display and model-risk labels in shared UI helpers, not inline JSX.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `opencode_model_has_kimi_loop_risk`, ACP status row rendering near `Kimi protected`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt edit aksiyonu eksikti {#electron-acp-queued-prompt-edit-parity}
+- Date: 2026-06-11
+- Context: Rust ACP queued prompt rows include Run Next, Copy, Edit, and Delete actions. Editing moves the queued item back into the composer draft and keeps a return target so Cancel can restore it.
+- Error signature:
+  1. Electron queued prompt rows had Run Next, Copy, and Delete but no Edit action.
+  2. A queued prompt could not be moved back to the composer for correction without deleting and recreating it manually.
+- Symptoms/Impact:
+  - Users had a slower correction path for queued ACP prompts.
+  - Electron queued prompt interaction did not match the original Rust ACP panel.
+- Root cause:
+  - ACP queue IPC exposed reorder/delete only; no restore path existed for queued-draft edit cancellation.
+- Resolution:
+  - Added `acp:queueRestore` IPC and `restoreAcpQueuedPrompt()` in the ACP service.
+  - Added a queued row Edit action that moves the prompt into the composer when the draft is empty.
+  - Added `Editing queued #N` with Cancel to restore the original queued item.
+  - Added helper coverage for the Rust-style draft-occupied edit guard message.
+- Prevent recurrence:
+  - Keep queued prompt row actions aligned with Rust's Run Next / Copy / Edit / Delete set.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `AcpQueuedPromptRowAction::Edit`, `move_acp_queued_prompt_to_draft_for_edit`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt panel basligi ve daraltma davranisi eksikti {#electron-acp-queued-prompt-panel-header-parity}
+- Date: 2026-06-11
+- Context: Rust ACP queued prompt panel renders a header (`Queued N` or `Editing queued #N`), optional `{count} Plan` metadata, a `Hide` / `Show` toggle, and caps visible rows to two while allowing scroll.
+- Error signature:
+  1. Electron rendered queued prompt rows directly above the composer with no panel header.
+  2. Electron had no `Hide` / `Show` toggle and no plan-count metadata.
+  3. Long queues could expand the composer area instead of using Rust's two-row visible cap.
+- Symptoms/Impact:
+  - The queued prompt area looked and behaved differently from Rust.
+  - Larger queues consumed more vertical space in the ACP chat panel.
+- Root cause:
+  - Queued prompt UI was implemented as a simple row list, not as a Rust-style panel with header state.
+- Resolution:
+  - Added shared queued-panel helpers for header labels, plan counts, and visible-row count.
+  - Updated `AcpChatPanel` to render the Rust-style header with `Hide` / `Show` or edit `Cancel`.
+  - Capped the visible queued prompt rows to two with scrolling for longer queues.
+  - Added regression coverage for the header and visible-row rules.
+- Prevent recurrence:
+  - Keep queued prompt panel layout state in shared helpers and preserve `ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS = 2`.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `draw_acp_queued_prompt_panel`, `acp_queued_prompt_visible_rows`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt satirlari tekrar eden Queued etiketi kullaniyordu {#electron-acp-queued-row-index-label-parity}
+- Date: 2026-06-11
+- Context: Rust queued prompt rows use compact row metadata (`1.`, optional `Plan`) before the preview. The `Queued N` label belongs to the panel header.
+- Error signature:
+  1. Electron displayed `Queued` inside every queued prompt row.
+  2. Plan mode metadata was rendered as a late pill after the preview instead of row metadata before the prompt text.
+- Symptoms/Impact:
+  - The queued prompt area repeated redundant text and looked less like Rust after adding the panel header.
+  - Rows were harder to scan by queue order.
+- Root cause:
+  - Electron row markup predated the Rust-style queued panel header and kept the old row label.
+- Resolution:
+  - Added `acpQueuedPromptIndexLabel()`.
+  - Updated queued rows to show `1.`, `2.`, etc. and place `Plan` metadata before the preview.
+  - Added regression coverage for row index labels.
+- Prevent recurrence:
+  - Keep queued-row metadata distinct from queued-panel header labels.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `draw_acp_queued_prompt_panel_row`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt satirinda ekstra kopya ikonu ve farkli ek etiketi vardi {#electron-acp-queued-row-actions-attachment-parity}
+- Date: 2026-06-11
+- Context: Rust queued prompt rows copy by clicking the preview text and reserve the icon buttons for Run Next, Edit, and Delete. Attachment metadata is rendered as `{count} file`.
+- Error signature:
+  1. Electron rendered an extra copy icon button in each queued row.
+  2. Electron rendered attachment metadata as `+N` in a pill instead of Rust's `N file` text.
+- Symptoms/Impact:
+  - Queued row actions did not match Rust's three-icon layout.
+  - Attachment rows had different visual weight and wording.
+- Root cause:
+  - Electron row UI carried a standalone copy button from the earlier simple-list implementation.
+- Resolution:
+  - Added `acpQueuedPromptAttachmentLabel()`.
+  - Updated queued rows to keep preview-click copy behavior and remove the explicit copy icon.
+  - Changed attachment metadata to Rust-style `N file`.
+  - Added regression coverage for attachment label formatting.
+- Prevent recurrence:
+  - Keep queued row action buttons limited to Run Next, Edit, and Delete; preview click remains the copy affordance.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `draw_acp_queued_prompt_panel_row`, Electron parity goal 2026-06-11

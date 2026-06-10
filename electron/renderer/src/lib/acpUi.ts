@@ -23,6 +23,12 @@ export interface AcpSlashCommandItem {
   description: string;
 }
 
+export interface AcpKimiProtectionBadge {
+  label: 'Kimi protected' | 'Kimi unprotected';
+  color: string;
+}
+
+export const ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS = 2;
 export const OPENCODE_ACP_LABEL = 'OpenCode ACP';
 export const OPENCODE_ACP_OPEN_BUTTON_LABEL = '+ ACP';
 export const OPENCODE_ACP_CLOSE_TOOLTIP = `Close ${OPENCODE_ACP_LABEL}`;
@@ -37,6 +43,25 @@ export function openCodeAcpWelcomeText(): string {
 
 export function isAcpRunningStatus(status: AcpChatSession['status'] | undefined): boolean {
   return status === 'running' || status === 'permission';
+}
+
+export function acpStatusText(status: AcpChatSession['status'] | undefined): string {
+  switch (status) {
+    case 'starting':
+    case 'connected':
+    case 'session_created':
+      return 'Starting...';
+    case 'idle':
+      return 'Idle';
+    case 'running':
+      return 'Running...';
+    case 'permission':
+      return 'Permission';
+    case 'error':
+      return 'Error';
+    default:
+      return 'Idle';
+  }
 }
 
 export function nextAcpActivityState(previous: AcpActivityState, event: AcpEventLike): AcpActivityState {
@@ -77,6 +102,32 @@ export function acpModeUiLabel(modeId: string | undefined): string | undefined {
   return modeId;
 }
 
+export function acpComposerHintText(options: {
+  welcomeCenter: boolean;
+  sessionReady: boolean;
+  activeMode?: string;
+}): string {
+  if (!options.sessionReady) return 'Waiting for session...';
+  if (options.welcomeCenter) return 'Plan, Build, / for skills, @ for context';
+  if (options.activeMode === 'plan') return 'Plan and design before coding...';
+  return 'Type a message...';
+}
+
+export function opencodeModelHasKimiLoopRisk(model: string | undefined): boolean {
+  const normalized = model?.toLowerCase() ?? '';
+  return normalized.includes('kimi') || normalized.includes('k2p6');
+}
+
+export function acpKimiProtectionBadge(
+  model: string | undefined,
+  loopProtectionEnabled: boolean,
+): AcpKimiProtectionBadge | undefined {
+  if (!opencodeModelHasKimiLoopRisk(model)) return undefined;
+  return loopProtectionEnabled
+    ? { label: 'Kimi protected', color: 'rgb(100, 195, 140)' }
+    : { label: 'Kimi unprotected', color: 'rgb(220, 170, 60)' };
+}
+
 export function queuedPromptPreview(prompt: { text?: string; finalPromptText?: string; attachments?: unknown[] }): string {
   const directText = prompt.text?.trim();
   if (directText) return directText;
@@ -96,6 +147,41 @@ export function moveQueuedPromptToFront<T>(queue: readonly T[], index: number): 
 export function removeQueuedPromptAt<T>(queue: readonly T[], index: number): T[] {
   if (!Number.isInteger(index) || index < 0 || index >= queue.length) return [...queue];
   return queue.filter((_, itemIndex) => itemIndex !== index);
+}
+
+export function acpQueuedPromptDraftEditBlockedMessage(options: {
+  input: string;
+  attachments?: unknown[];
+  editingQueuedPrompt: boolean;
+}): string | undefined {
+  if (options.input.trim().length > 0 || (options.attachments?.length ?? 0) > 0 || options.editingQueuedPrompt) {
+    return 'Input is not empty; send or clear it before editing queued message';
+  }
+  return undefined;
+}
+
+export function acpQueuedPromptPlanCount(prompts: readonly { modeId?: string }[]): number {
+  return prompts.filter((prompt) => prompt.modeId === 'plan').length;
+}
+
+export function acpQueuedPromptHeaderLabel(queueCount: number, editingIndex?: number): string {
+  if (editingIndex !== undefined) return `Editing queued #${editingIndex + 1}`;
+  return `Queued ${Math.max(0, queueCount)}`;
+}
+
+export function acpQueuedPromptVisibleRowCount(queueCount: number, expanded: boolean): number {
+  if (!expanded) return 0;
+  return Math.min(Math.max(0, queueCount), ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS);
+}
+
+export function acpQueuedPromptIndexLabel(index: number): string {
+  if (!Number.isInteger(index) || index < 0) return '';
+  return `${index + 1}.`;
+}
+
+export function acpQueuedPromptAttachmentLabel(count: number): string | undefined {
+  if (!Number.isInteger(count) || count <= 0) return undefined;
+  return `${count} file`;
 }
 
 function commandText(value: unknown): string {
@@ -147,4 +233,14 @@ export function slashCommandItemsForInput(commands: unknown, input: string, limi
   const query = input.trim();
   if (!query.startsWith('/')) return [];
   return slashCommandItems(commands, query.slice(1), limit);
+}
+
+export function slashCommandItemsForComposer(
+  commands: unknown,
+  input: string,
+  controlsEnabled: boolean,
+  limit = 6,
+): AcpSlashCommandItem[] {
+  if (!controlsEnabled) return [];
+  return slashCommandItemsForInput(commands, input, limit);
 }
