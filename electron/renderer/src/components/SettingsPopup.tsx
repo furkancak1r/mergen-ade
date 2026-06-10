@@ -8,8 +8,24 @@ import type {
   AcpModeToggleShortcut,
   AcpStartupMode,
   MainVisibilityMode,
+  LauncherEntry,
 } from '../../../shared/types';
-import { AcpStartupModeLabel } from '../../../shared/types';
+import {
+  AcpStartupModeLabel,
+  BuiltinLauncherKind,
+  BuiltinLauncherKindDefaultDisplayName,
+  BuiltinLauncherKindDefaultLaunchCommand,
+  LauncherIconKey,
+  LauncherIconKeyCustomPresets,
+  LauncherIconKeyLabel,
+} from '../../../shared/types';
+import {
+  addSavedMessage,
+  removeSavedMessage,
+  replaceProjectSavedMessages,
+  savedMessageOwnerProjectId,
+  updateSavedMessage,
+} from '../lib/savedMessages';
 
 interface SettingsPopupProps {
   config: AppConfig;
@@ -17,11 +33,13 @@ interface SettingsPopupProps {
   onClose: () => void;
 }
 
-type SettingsTab = 'general' | 'opencode' | 'shortcuts' | 'notifications';
+type SettingsTab = 'general' | 'launchers' | 'opencode' | 'saved' | 'shortcuts' | 'notifications';
 
 const tabs: { id: SettingsTab; label: string }[] = [
   { id: 'general', label: 'General' },
+  { id: 'launchers', label: 'Launchers' },
   { id: 'opencode', label: 'OpenCode' },
+  { id: 'saved', label: 'Saved Messages' },
   { id: 'shortcuts', label: 'Shortcuts' },
   { id: 'notifications', label: 'Notifications' },
 ];
@@ -31,6 +49,12 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, onSave, on
   const [draft, setDraft] = useState<AppConfig>({ ...config });
   const [recordingShortcutIndex, setRecordingShortcutIndex] = useState<number | null>(null);
   const [recordingAcpShortcut, setRecordingAcpShortcut] = useState(false);
+  const [launcherDraft, setLauncherDraft] = useState({
+    displayName: '',
+    launchCommand: '',
+    iconKey: LauncherIconKey.Terminal,
+  });
+  const [savedMessageDrafts, setSavedMessageDrafts] = useState<Record<number, string>>({});
 
   const updateUi = useCallback((partial: Partial<AppConfig['ui']>) => {
     setDraft((prev) => ({ ...prev, ui: { ...prev.ui, ...partial } }));
@@ -72,6 +96,79 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, onSave, on
       terminalShortcuts: prev.terminalShortcuts.filter((_, i) => i !== index),
     }));
   }, []);
+
+  const updateLauncher = useCallback((index: number, partial: Partial<LauncherEntry>) => {
+    setDraft((prev) => {
+      const next = [...prev.launchers];
+      const current = next[index];
+      if (!current) return prev;
+      next[index] = { ...current, ...partial };
+      return { ...prev, launchers: next };
+    });
+  }, []);
+
+  const removeLauncher = useCallback((index: number) => {
+    setDraft((prev) => {
+      const launcher = prev.launchers[index];
+      if (!launcher || launcher.builtin) return prev;
+      return { ...prev, launchers: prev.launchers.filter((_, i) => i !== index) };
+    });
+  }, []);
+
+  const addLauncher = useCallback(() => {
+    const displayName = launcherDraft.displayName.trim();
+    const launchCommand = launcherDraft.launchCommand.trim();
+    if (!displayName || !launchCommand) return;
+    setDraft((prev) => ({
+      ...prev,
+      launchers: [
+        ...prev.launchers,
+        {
+          id: nextCustomLauncherId(prev.launchers),
+          builtin: undefined,
+          displayName,
+          launchCommand,
+          enabled: true,
+          iconKey: launcherDraft.iconKey,
+          bypassPermissions: false,
+        },
+      ],
+    }));
+    setLauncherDraft({ displayName: '', launchCommand: '', iconKey: LauncherIconKey.Terminal });
+  }, [launcherDraft]);
+
+  const setProjectSavedMessages = useCallback((ownerProjectId: number, messages: string[]) => {
+    setDraft((prev) => ({
+      ...prev,
+      projects: replaceProjectSavedMessages(prev.projects, ownerProjectId, messages),
+    }));
+  }, []);
+
+  const addProjectSavedMessage = useCallback((ownerProjectId: number) => {
+    const draftText = savedMessageDrafts[ownerProjectId] ?? '';
+    setDraft((prev) => {
+      const owner = prev.projects.find((project) => project.id === ownerProjectId);
+      if (!owner) return prev;
+      const nextMessages = addSavedMessage(owner.savedMessages, draftText);
+      if (nextMessages === owner.savedMessages) return prev;
+      return {
+        ...prev,
+        projects: replaceProjectSavedMessages(prev.projects, ownerProjectId, nextMessages),
+      };
+    });
+    setSavedMessageDrafts((prev) => ({ ...prev, [ownerProjectId]: '' }));
+  }, [savedMessageDrafts]);
+
+  const duplicateBuiltinStems = (() => {
+    const counts = new Map<string, number>();
+    for (const launcher of draft.launchers) {
+      if (!launcher.builtin) continue;
+      const stem = launcherCommandStem(launcher.launchCommand);
+      if (!stem) continue;
+      counts.set(stem, (counts.get(stem) ?? 0) + 1);
+    }
+    return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([stem]) => stem));
+  })();
 
   const handleSave = useCallback(() => {
     onSave(draft);
@@ -258,6 +355,174 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, onSave, on
             </div>
           )}
 
+          {activeTab === 'launchers' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>Foreground Launchers</div>
+              {draft.launchers.map((launcher, i) => {
+                const isBuiltin = Boolean(launcher.builtin);
+                const isClaude = launcher.builtin === BuiltinLauncherKind.Claude;
+                const stem = launcherCommandStem(launcher.launchCommand);
+                const displayNameMissing = launcher.displayName.trim().length === 0;
+                const commandMissing = launcher.launchCommand.trim().length === 0;
+                const duplicateBuiltinCommand = Boolean(launcher.builtin && stem && duplicateBuiltinStems.has(stem));
+                const warning = duplicateBuiltinCommand
+                  ? 'Built-in commands must stay unique.'
+                  : commandMissing
+                    ? 'Command cannot be empty.'
+                    : displayNameMissing
+                      ? 'Menu label cannot be empty.'
+                      : '';
+                return (
+                  <div key={launcher.id} style={{ display: 'flex', gap: 10, padding: 10, background: '#1a1a1a', border: '1px solid #262626', borderRadius: 6 }}>
+                    <div
+                      title={LauncherIconKeyLabel[launcher.iconKey]}
+                      style={{
+                        width: 30,
+                        height: 30,
+                        borderRadius: 6,
+                        background: launcherIconColor(launcher.iconKey),
+                        color: '#f2f2f2',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontSize: 11,
+                        fontWeight: 700,
+                        flex: '0 0 auto',
+                      }}
+                    >
+                      {LauncherIconKeyLabel[launcher.iconKey].slice(0, 2)}
+                    </div>
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>{launcher.displayName || 'Unnamed'}</span>
+                        <span style={{ fontSize: 10, color: '#888' }}>{isBuiltin ? 'Built-in' : 'Custom'}</span>
+                        {isClaude && <span style={{ fontSize: 10, color: '#a8c7ff' }}>Bypass permissions</span>}
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 0.36fr) minmax(180px, 1fr)', gap: 8 }}>
+                        <div>
+                          <div style={{ fontSize: 10, color: '#888', marginBottom: 4 }}>Menu label</div>
+                          <input
+                            value={launcher.displayName}
+                            onChange={(e) => updateLauncher(i, { displayName: e.target.value })}
+                            placeholder="Launcher name"
+                            style={{ width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', padding: '4px 8px', fontSize: 11, borderRadius: 4 }}
+                          />
+                        </div>
+                        <div>
+                          <div style={{ fontSize: 10, color: '#888', marginBottom: 4 }}>Command to type and submit</div>
+                          <input
+                            value={launcher.launchCommand}
+                            onChange={(e) => updateLauncher(i, { launchCommand: e.target.value })}
+                            placeholder="Example: codex, cc, droid, opencode"
+                            style={{ width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', padding: '4px 8px', fontSize: 11, borderRadius: 4 }}
+                          />
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#ccc' }}>
+                          <input
+                            type="checkbox"
+                            checked={launcher.enabled}
+                            onChange={(e) => updateLauncher(i, { enabled: e.target.checked })}
+                          />
+                          Show in foreground launcher menu
+                        </label>
+                        {isClaude && (
+                          <label title="Claude launches always use bypass permissions" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#777' }}>
+                            <input type="checkbox" checked readOnly disabled />
+                            Bypass permissions
+                          </label>
+                        )}
+                        {!isBuiltin && (
+                          <select
+                            value={launcher.iconKey}
+                            onChange={(e) => updateLauncher(i, { iconKey: e.target.value as LauncherIconKey })}
+                            style={{ background: '#0c0c0c', border: '1px solid #333', color: '#ccc', padding: '4px 8px', fontSize: 11, borderRadius: 4 }}
+                          >
+                            {LauncherIconKeyCustomPresets.map((iconKey) => (
+                              <option key={iconKey} value={iconKey}>{LauncherIconKeyLabel[iconKey]}</option>
+                            ))}
+                          </select>
+                        )}
+                        {isBuiltin && (
+                          <button
+                            onClick={() => {
+                              const builtin = launcher.builtin!;
+                              updateLauncher(i, {
+                                displayName: BuiltinLauncherKindDefaultDisplayName(builtin),
+                                launchCommand: BuiltinLauncherKindDefaultLaunchCommand(builtin),
+                              });
+                            }}
+                            style={{ padding: '4px 10px', fontSize: 11, background: '#0c0c0c', border: '1px solid #333', color: '#ccc', borderRadius: 4, cursor: 'pointer' }}
+                          >
+                            Reset
+                          </button>
+                        )}
+                        {!isBuiltin && (
+                          <button
+                            onClick={() => removeLauncher(i)}
+                            style={{ padding: '4px 10px', fontSize: 11, background: 'transparent', border: '1px solid #4a2a2a', color: '#d47a7a', borderRadius: 4, cursor: 'pointer', marginLeft: 'auto' }}
+                          >
+                            Remove
+                          </button>
+                        )}
+                      </div>
+                      {warning && <div style={{ fontSize: 11, color: '#dcb43c' }}>{warning}</div>}
+                    </div>
+                  </div>
+                );
+              })}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 10, background: '#161616', border: '1px solid #262626', borderRadius: 6 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>Add Custom Launcher</div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 0.32fr) minmax(180px, 1fr) 120px auto', gap: 8, alignItems: 'end' }}>
+                  <div>
+                    <div style={{ fontSize: 10, color: '#888', marginBottom: 4 }}>Menu label</div>
+                    <input
+                      value={launcherDraft.displayName}
+                      onChange={(e) => setLauncherDraft((prev) => ({ ...prev, displayName: e.target.value }))}
+                      placeholder="Example: Gemini"
+                      style={{ width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', padding: '4px 8px', fontSize: 11, borderRadius: 4 }}
+                    />
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 10, color: '#888', marginBottom: 4 }}>Command to type and submit</div>
+                    <input
+                      value={launcherDraft.launchCommand}
+                      onChange={(e) => setLauncherDraft((prev) => ({ ...prev, launchCommand: e.target.value }))}
+                      placeholder="Example: gemini"
+                      style={{ width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', padding: '4px 8px', fontSize: 11, borderRadius: 4 }}
+                    />
+                  </div>
+                  <select
+                    value={launcherDraft.iconKey}
+                    onChange={(e) => setLauncherDraft((prev) => ({ ...prev, iconKey: e.target.value as LauncherIconKey }))}
+                    style={{ background: '#0c0c0c', border: '1px solid #333', color: '#ccc', padding: '4px 8px', fontSize: 11, borderRadius: 4 }}
+                  >
+                    {LauncherIconKeyCustomPresets.map((iconKey) => (
+                      <option key={iconKey} value={iconKey}>{LauncherIconKeyLabel[iconKey]}</option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={addLauncher}
+                    disabled={!launcherDraft.displayName.trim() || !launcherDraft.launchCommand.trim()}
+                    style={{
+                      padding: '5px 12px',
+                      fontSize: 11,
+                      background: launcherDraft.displayName.trim() && launcherDraft.launchCommand.trim() ? '#1f3a4c' : '#181818',
+                      border: '1px solid #333',
+                      color: '#ccc',
+                      borderRadius: 4,
+                      cursor: launcherDraft.displayName.trim() && launcherDraft.launchCommand.trim() ? 'pointer' : 'not-allowed',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    + Add
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {activeTab === 'opencode' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
               <div>
@@ -398,6 +663,84 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, onSave, on
             </div>
           )}
 
+          {activeTab === 'saved' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {draft.projects.length === 0 ? (
+                <div style={{ padding: 10, background: '#1a1a1a', border: '1px solid #262626', borderRadius: 6, fontSize: 12, color: '#888' }}>
+                  Add a project from the Directory panel to manage saved messages here.
+                </div>
+              ) : (
+                draft.projects.map((project) => {
+                  const ownerProjectId = savedMessageOwnerProjectId(draft.projects, project);
+                  const ownerProject = draft.projects.find((candidate) => candidate.id === ownerProjectId) ?? project;
+                  const messages = ownerProject.savedMessages;
+                  const draftText = savedMessageDrafts[ownerProjectId] ?? '';
+                  const inherited = ownerProjectId !== project.id;
+                  return (
+                    <div key={project.id} style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 10, background: '#1a1a1a', border: '1px solid #262626', borderRadius: 6 }}>
+                      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                        <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>{project.name}</span>
+                        <span style={{ fontSize: 10, color: '#888' }}>{messages.length} saved</span>
+                        {inherited && <span style={{ fontSize: 10, color: '#888' }}>Uses {ownerProject.name}</span>}
+                      </div>
+                      <div style={{ fontSize: 10, color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{project.path}</div>
+                      {messages.length === 0 ? (
+                        <div style={{ fontSize: 11, color: '#777' }}>No saved messages for this project.</div>
+                      ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                          {messages.map((message, index) => (
+                            <div key={`${ownerProjectId}-${index}`} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <input
+                                value={message}
+                                onChange={(e) => setProjectSavedMessages(ownerProjectId, updateSavedMessage(messages, index, e.target.value))}
+                                style={{ flex: 1, background: '#0c0c0c', border: '1px solid #333', color: '#ccc', padding: '4px 8px', fontSize: 11, borderRadius: 4 }}
+                              />
+                              <button
+                                onClick={() => setProjectSavedMessages(ownerProjectId, removeSavedMessage(messages, index))}
+                                style={{ padding: '4px 8px', fontSize: 11, background: 'transparent', border: '1px solid #4a2a2a', color: '#d47a7a', borderRadius: 4, cursor: 'pointer' }}
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <input
+                          value={draftText}
+                          onChange={(e) => setSavedMessageDrafts((prev) => ({ ...prev, [ownerProjectId]: e.target.value }))}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              addProjectSavedMessage(ownerProjectId);
+                            }
+                          }}
+                          placeholder="Add a saved message for this project"
+                          style={{ flex: 1, background: '#0c0c0c', border: '1px solid #333', color: '#ccc', padding: '4px 8px', fontSize: 11, borderRadius: 4 }}
+                        />
+                        <button
+                          onClick={() => addProjectSavedMessage(ownerProjectId)}
+                          disabled={!draftText.trim()}
+                          style={{
+                            padding: '4px 12px',
+                            fontSize: 11,
+                            background: draftText.trim() ? '#1f3a4c' : '#181818',
+                            border: '1px solid #333',
+                            color: '#ccc',
+                            borderRadius: 4,
+                            cursor: draftText.trim() ? 'pointer' : 'not-allowed',
+                          }}
+                        >
+                          + Add
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
+
           {activeTab === 'shortcuts' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               {duplicateShortcuts.length > 0 && (
@@ -523,6 +866,61 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, onSave, on
     </div>
   );
 };
+
+function nextCustomLauncherId(launchers: LauncherEntry[]): string {
+  let suffix = launchers.length + 1;
+  let candidate = `custom-${suffix}`;
+  while (launchers.some((launcher) => launcher.id === candidate)) {
+    suffix += 1;
+    candidate = `custom-${suffix}`;
+  }
+  return candidate;
+}
+
+function launcherCommandStem(command: string): string | null {
+  const trimmed = command.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+    const quote = trimmed[0];
+    const end = trimmed.indexOf(quote, 1);
+    if (end > 1) return commandBasename(trimmed.slice(1, end));
+  }
+  const firstToken = trimmed.split(/\s+/)[0];
+  return firstToken ? commandBasename(firstToken) : null;
+}
+
+function commandBasename(command: string): string {
+  const withoutExtension = command.replace(/\.(cmd|exe|ps1|bat)$/i, '');
+  const parts = withoutExtension.split(/[\\/]/);
+  return (parts[parts.length - 1] || withoutExtension).toLowerCase();
+}
+
+function launcherIconColor(iconKey: LauncherIconKey): string {
+  switch (iconKey) {
+    case LauncherIconKey.Codex:
+      return '#3b4f6f';
+    case LauncherIconKey.Claude:
+      return '#6d4a35';
+    case LauncherIconKey.Droid:
+      return '#385f4a';
+    case LauncherIconKey.OpenCode:
+      return '#315d66';
+    case LauncherIconKey.Terminal:
+      return '#404040';
+    case LauncherIconKey.Spark:
+      return '#735c2e';
+    case LauncherIconKey.Message:
+      return '#4d5b76';
+    case LauncherIconKey.Bot:
+      return '#445f46';
+    case LauncherIconKey.Code:
+      return '#4b5574';
+    case LauncherIconKey.Wrench:
+      return '#5c5963';
+    case LauncherIconKey.Rocket:
+      return '#693f52';
+  }
+}
 
 function formatShortcut(key: string, modifiers: ShortcutModifiers): string {
   const parts: string[] = [];

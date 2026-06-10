@@ -3549,6 +3549,146 @@
 
 ---
 
+#### Electron Claude launcher bypass permission modu eksikti {#electron-claude-launcher-bypass-permissions}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app had Claude launcher handling that preserved configured aliases while forcing bypass permission mode, but the Electron port sent the raw launcher command.
+- Error signature:
+  1. `LauncherEntry` in Electron config had no `bypassPermissions` field.
+  2. Terminal Manager used `launchCommand` directly for the built-in Claude launcher.
+  3. Existing `--permission-mode` values were not normalized to `bypassPermissions`.
+- Symptoms/Impact:
+  - Launching Claude from Electron could start in the default permission mode instead of the original app's bypass mode.
+  - Users with a working alias such as `cc` needed manual flags each time.
+  - Quoted PowerShell executable paths were not guarded with the call operator when flags were appended.
+- Root cause:
+  - The Electron launcher model and command path lagged behind the original Rust `sanitized_claude_launch_command` behavior.
+- Resolution:
+  - Add `LauncherEntry.bypassPermissions` and default it to true for the Claude built-in launcher.
+  - Preserve the field during config launcher normalization.
+  - Route built-in Claude launch commands through a testable sanitizer that clears stale Anthropic env vars, preserves aliases, and appends or replaces `--permission-mode bypassPermissions`.
+- Prevent recurrence:
+  - Add renderer regression tests for default launcher flags, PowerShell/CMD/zsh command generation, existing permission-mode replacement, and custom launcher non-rewrite behavior.
+- Files/Commands touched: `electron/shared/types.ts`, `electron/main/config.ts`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/launcher.ts`, launcher tests
+- References: Original commit `d618cec`, parity audit 2026-06-10
+
+---
+
+#### Electron Settings icinde Launchers sekmesi eksikti {#electron-settings-launchers-tab-missing}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app exposed Settings > Launchers for foreground launcher catalog management, while the Electron port only exposed General, OpenCode, Shortcuts, and Notifications tabs.
+- Error signature:
+  1. `SettingsPopup` did not render or edit `config.launchers`.
+  2. Built-in launcher labels/commands could only be changed by editing config outside the UI.
+  3. Custom foreground launchers could not be created or removed from Electron Settings.
+- Symptoms/Impact:
+  - Electron users could launch configured entries, but could not manage the launcher catalog from the app.
+  - The Settings surface looked less complete than the original app.
+- Root cause:
+  - The Electron port had implemented launcher use in Terminal Manager before porting the original Settings > Launchers editor.
+- Resolution:
+  - Add a Launchers tab to Electron Settings.
+  - Support editing built-in launcher labels/commands/enabled state, resetting built-ins, showing Claude bypass behavior, adding/removing custom launchers, and selecting custom launcher icon presets.
+- Prevent recurrence:
+  - Keep launcher config fields wired through both Settings and Terminal Manager whenever the catalog model changes.
+- Files/Commands touched: `electron/renderer/src/components/SettingsPopup.tsx`, `KNOWN_ISSUES.md`
+- References: Original `draw_settings_launchers_section`, parity audit 2026-06-10
+
+---
+
+#### Electron Smart Input Build/Plan secici eksikti {#electron-smart-input-build-plan-selector}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app had a compact Build/Plan selector directly beside the Smart Input draft field for OpenCode terminal sessions. The Electron port only exposed Steer Now/After Done delivery controls and always wrote queued Smart Input tasks with `modeId: build`.
+- Error signature:
+  1. `SmartInputFooter` had no Build/Plan draft mode state.
+  2. Plain Tab in the Smart Input draft sent `\t` to the PTY instead of toggling the draft mode.
+  3. `usePty` ignored queued task `modeId` during OpenCode Smart Input dispatch.
+- Symptoms/Impact:
+  - Users could not queue or immediately send a Plan-mode Smart Input prompt from the Electron terminal UI.
+  - The Smart Input footer layout looked different from the original app.
+- Root cause:
+  - The Electron Smart Input implementation kept only delivery timing (`Steer Now` vs `After Done`) and did not port the OpenCode Build/Plan mode selector/dispatch path.
+- Resolution:
+  - Add a compact Build/Plan segmented control to the left of the Smart Input draft field.
+  - Make Tab toggle Build/Plan while Smart Input owns focus.
+  - Store the selected mode on new queued tasks and pass it through immediate sends.
+  - Add mode-aware OpenCode terminal dispatch that sends a TUI Tab before Plan-mode payloads when the tracked mode differs.
+- Prevent recurrence:
+  - Add mode helper tests for normalization, toggling, Plan-only queue labels, and OpenCode mode-toggle decisions.
+- Files/Commands touched: `electron/renderer/src/components/SmartInputFooter.tsx`, `electron/renderer/src/components/MainArea.tsx`, `electron/renderer/src/App.tsx`, `electron/renderer/src/hooks/usePty.ts`, `electron/renderer/src/lib/smartInputMode.ts`, Smart Input mode tests
+- References: Original commit `8e1105c`, parity audit 2026-06-10
+
+---
+
+#### Electron Smart Input text paste eski clipboard gorselini attachment yapabiliyordu {#electron-smart-input-paste-stale-image}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app had a clipboard image paste safety fix that only converts image paste into Smart Input attachments for explicit image/file paste triggers. The Electron Smart Input paste handlers still read native file paths and bitmap images before checking whether the actual paste event carried image/file data.
+- Error signature:
+  1. `SmartInputFooter` called `clipboard:readFilePaths` and `clipboard:readImage` for every paste event.
+  2. Normal text paste could still inspect native clipboard image state.
+  3. Draft and queued-task edit paste handlers duplicated the same unsafe ordering.
+- Symptoms/Impact:
+  - Pasting ordinary text into Smart Input could create an unexpected image/file attachment if the native clipboard still exposed image or file formats.
+  - The Electron behavior differed from the original app's guarded image paste flow.
+- Root cause:
+  - The Electron renderer did not classify `ClipboardEvent.clipboardData` before calling native clipboard readers.
+- Resolution:
+  - Add a testable paste snapshot/classification helper.
+  - Read native file paths only when the paste event carries files or path-like text.
+  - Read native bitmap images only when the paste event carries an image item/type.
+  - Keep normal text paste as a text-only operation.
+- Prevent recurrence:
+  - Add regression tests covering normal text paste, image item paste, text path lists, and absolute path detection.
+- Files/Commands touched: `electron/renderer/src/components/SmartInputFooter.tsx`, `electron/renderer/src/lib/clipboardPaste.ts`, clipboard paste tests
+- References: Original commit `03eeb0d`, parity audit 2026-06-10
+
+---
+
+#### Electron terminal wheel overlay acikken yakalanabiliyordu {#electron-terminal-wheel-overlay-popups}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app disables terminal output wheel handling while UI overlays such as Terminal Manager history and foreground-message popups are open. The Electron port only disabled terminal wheel forwarding for Settings and checklist overlays.
+- Error signature:
+  1. `MainArea` passed `wheelEnabled={!settingsOpen && !checklistVisible}`.
+  2. `TerminalManager` popup state stayed local and was not visible to `App`.
+  3. OpenCode terminal wheel forwarding could still prevent popup scrolling while a Terminal Manager popup was open.
+- Symptoms/Impact:
+  - Mouse wheel over an open Terminal Manager popup could be intercepted by the terminal pane instead of scrolling the popup naturally.
+  - Electron behavior differed from the original app's overlay-aware terminal wheel gate.
+- Root cause:
+  - Terminal Manager overlay state was not included in the terminal wheel enabled calculation.
+- Resolution:
+  - Add a small `terminalWheelEnabled` helper.
+  - Report Terminal Manager launcher/history/saved/foreground popup visibility to `App`.
+  - Disable terminal wheel handling while any Terminal Manager popup is open.
+- Prevent recurrence:
+  - Add regression tests for Settings, checklist, and Terminal Manager overlay wheel gating.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/terminalWheel.ts`, terminal wheel tests
+- References: Original terminal wheel overlay guideline, parity audit 2026-06-10
+
+---
+
+#### Electron Settings icinde Saved Messages sekmesi eksikti {#electron-settings-saved-messages-tab-missing}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app exposed Settings > Saved Messages for project-scoped saved message catalog management. The Electron port could send saved messages from Terminal Manager, but Settings did not expose the catalog.
+- Error signature:
+  1. `SettingsPopup` tabs omitted Saved Messages.
+  2. Project `savedMessages` could not be edited centrally from Electron Settings.
+  3. Worktree rows did not show that saved messages are owned by the root project family.
+- Symptoms/Impact:
+  - Users had to manage saved snippets outside Settings or through narrower Terminal Manager flows.
+  - Electron Settings looked less complete than the original app.
+- Root cause:
+  - Saved message catalog editing was not ported when the initial Electron Settings tabs were implemented.
+- Resolution:
+  - Add a Saved Messages tab to Electron Settings.
+  - Support adding, editing, and removing project saved messages.
+  - Keep worktree saved-message edits tied to the root project owner, matching the Terminal Manager inheritance model.
+- Prevent recurrence:
+  - Add helper tests for saved-message add/update/remove and root/worktree ownership replacement.
+- Files/Commands touched: `electron/renderer/src/components/SettingsPopup.tsx`, `electron/renderer/src/lib/savedMessages.ts`, saved message tests
+- References: Original `SettingsSection::SavedMessages`, parity audit 2026-06-10
+
+---
+
 #### Electron ACP protocol/status drift ve bildirim IPC uyumsuzlugu {#electron-acp-protocol-status-notify-drift}
 - Date: 2026-06-10
 - Context: User requested investigation and fixes for five critical bugs in the Electron worktree.

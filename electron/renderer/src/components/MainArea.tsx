@@ -5,6 +5,7 @@ import { computeTileGrid } from '../lib/layout';
 import type { TerminalInstance } from '../hooks/usePty';
 import type { SmartInputState, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
 import { AiCliTool as AiCliToolEnum } from '../../../shared/types';
+import type { SmartInputModeId } from '../lib/smartInputMode';
 
 interface MainAreaProps {
   terminals: TerminalInstance[];
@@ -13,7 +14,7 @@ interface MainAreaProps {
   width: number;
   height: number;
   onUpdateSmartInputState: (terminalId: number, state: Partial<SmartInputState>) => void;
-  onSendToTerminal: (terminalId: number, text: string, attachments: SmartInputAttachment[]) => void;
+  onSendToTerminal: (terminalId: number, text: string, attachments: SmartInputAttachment[], modeId: SmartInputModeId) => void;
   onUpdateQuestionState?: (terminalId: number, updates: { focusIndex?: number; selectedOptions?: string[]; customText?: string }) => void;
   onTerminalOutputClick?: (terminalId: number) => void;
   onClearTerminalOutputFocusOverride?: (terminalId: number) => void;
@@ -105,7 +106,7 @@ export const MainArea: React.FC<MainAreaProps> = ({ terminals, activeTerminalId,
                 questionSelectedOptions={t.opencodeQuestionSelectedOptions}
                 questionCustomText={t.opencodeQuestionCustomText}
                 onUpdateState={(state) => onUpdateSmartInputState(t.id, state)}
-                onSendToTerminal={(terminalId, text, attachments) => onSendToTerminal(terminalId, text, attachments)}
+                onSendToTerminal={(terminalId, text, attachments, modeId) => onSendToTerminal(terminalId, text, attachments, modeId)}
                 onUpdateQuestionState={(updates) => onUpdateQuestionState?.(t.id, updates)}
                 onClearTerminalOutputFocusOverride={() => onClearTerminalOutputFocusOverride?.(t.id)}
                 disabled={disabled}

@@ -1,6 +1,9 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import type { SmartInputState, SmartInputTask, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
 import { removeMentionFromInput } from '../lib/acpParser';
+import { shouldReadNativeClipboardFilePaths, shouldReadNativeClipboardImage, snapshotClipboardPaste } from '../lib/clipboardPaste';
+import type { SmartInputModeId } from '../lib/smartInputMode';
+import { smartInputModeLabel, toggleSmartInputModeId } from '../lib/smartInputMode';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).mergenApi;
 
@@ -12,7 +15,7 @@ interface SmartInputFooterProps {
   questionSelectedOptions: string[];
   questionCustomText: string;
   onUpdateState: (state: SmartInputState) => void;
-  onSendToTerminal: (terminalId: number, text: string, attachments: SmartInputAttachment[]) => void;
+  onSendToTerminal: (terminalId: number, text: string, attachments: SmartInputAttachment[], modeId: SmartInputModeId) => void;
   onUpdateQuestionState?: (updates: { focusIndex?: number; selectedOptions?: string[]; customText?: string }) => void;
   onClearTerminalOutputFocusOverride?: () => void;
   disabled?: boolean;
@@ -31,7 +34,8 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
   onClearTerminalOutputFocusOverride,
   disabled = false,
 }) => {
-  const [mode, setMode] = useState<'now' | 'after'>('now');
+  const [deliveryMode, setDeliveryMode] = useState<'now' | 'after'>('now');
+  const [draftMode, setDraftMode] = useState<SmartInputModeId>('build');
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
   const [resizing, setResizing] = useState(false);
@@ -47,8 +51,8 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
     const task: SmartInputTask = {
       text: state.draftText.trim(),
       attachments: [...state.draftAttachments],
-      modeId: 'build',
-      afterDone: mode === 'after',
+      modeId: draftMode,
+      afterDone: deliveryMode === 'after',
     };
     onUpdateState({
       ...state,
@@ -56,13 +60,13 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
       draftText: '',
       draftAttachments: [],
     });
-  }, [state, mode, onUpdateState]);
+  }, [state, draftMode, deliveryMode, onUpdateState]);
 
   const sendNow = useCallback(() => {
     if (!state.draftText.trim() && state.draftAttachments.length === 0) return;
-    onSendToTerminal(terminalId, state.draftText.trim(), state.draftAttachments);
+    onSendToTerminal(terminalId, state.draftText.trim(), state.draftAttachments, draftMode);
     onUpdateState({ ...state, draftText: '', draftAttachments: [] });
-  }, [state, terminalId, onSendToTerminal, onUpdateState]);
+  }, [state, terminalId, draftMode, onSendToTerminal, onUpdateState]);
 
   const removeTask = useCallback((index: number) => {
     const queue = state.queue.filter((_, i) => i !== index);
@@ -77,12 +81,12 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
   }, [state, onUpdateState]);
 
   const submit = useCallback(() => {
-    if (mode === 'now') {
+    if (deliveryMode === 'now') {
       sendNow();
     } else {
       addTask();
     }
-  }, [mode, sendNow, addTask]);
+  }, [deliveryMode, sendNow, addTask]);
 
   // Footer resize handling
   useEffect(() => {
@@ -390,16 +394,16 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
         <>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
             <span style={{ fontSize: 11, color: '#888', fontWeight: 600 }}>Smart Input</span>
-            <div style={{ display: 'flex', gap: 4 }}>
+            <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
               <button
-                onClick={() => setMode('now')}
-                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 3, border: '1px solid #333', background: mode === 'now' ? '#1f3a4c' : 'transparent', color: '#ccc', cursor: 'pointer' }}
+                onClick={() => setDeliveryMode('now')}
+                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 3, border: '1px solid #333', background: deliveryMode === 'now' ? '#1f3a4c' : 'transparent', color: '#ccc', cursor: 'pointer' }}
               >
                 Steer Now
               </button>
               <button
-                onClick={() => setMode('after')}
-                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 3, border: '1px solid #333', background: mode === 'after' ? '#1f3a4c' : 'transparent', color: '#ccc', cursor: 'pointer' }}
+                onClick={() => setDeliveryMode('after')}
+                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 3, border: '1px solid #333', background: deliveryMode === 'after' ? '#1f3a4c' : 'transparent', color: '#ccc', cursor: 'pointer' }}
               >
                 After Done
               </button>
@@ -433,6 +437,11 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
                   >
                     <span style={{ color: '#666', cursor: 'grab' }}>⋮⋮</span>
                     <span style={{ color: '#666' }}>{i + 1}.</span>
+                    {smartInputModeLabel(task.modeId) && (
+                      <span style={{ color: '#dcb43c', fontSize: 10, border: '1px solid #5d4722', borderRadius: 3, padding: '1px 4px', background: '#281c10' }}>
+                        {smartInputModeLabel(task.modeId)}
+                      </span>
+                    )}
                     {state.editIndex === i ? (
                       <textarea
                         ref={editRef}
@@ -460,30 +469,35 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
                         onContextMenu={handleEditContextMenu}
                         onPaste={async (e) => {
                           e.preventDefault();
-                          const paths = await api.invoke('clipboard:readFilePaths') as string[] | undefined;
-                          if (paths && paths.length > 0) {
-                            let newText = state.editText;
-                            const newAttachments = [...state.editAttachments];
-                            for (const p of paths) {
-                              const name = p.split(/[/\\]/).pop() || p;
-                              newAttachments.push({ path: p, name });
-                              newText = newText ? `${newText} @${name}` : `@${name}`;
+                          const paste = snapshotClipboardPaste(e.clipboardData);
+                          if (shouldReadNativeClipboardFilePaths(paste)) {
+                            const paths = await api.invoke('clipboard:readFilePaths') as string[] | undefined;
+                            if (paths && paths.length > 0) {
+                              let newText = state.editText;
+                              const newAttachments = [...state.editAttachments];
+                              for (const p of paths) {
+                                const name = p.split(/[/\\]/).pop() || p;
+                                newAttachments.push({ path: p, name });
+                                newText = newText ? `${newText} @${name}` : `@${name}`;
+                              }
+                              onUpdateState({ ...state, editAttachments: newAttachments, editText: newText });
+                              return;
                             }
-                            onUpdateState({ ...state, editAttachments: newAttachments, editText: newText });
-                            return;
                           }
-                          const imgResult = await api.invoke('clipboard:readImage') as { path?: string; dataUrl?: string } | undefined;
-                          if (imgResult?.path) {
-                            const p = imgResult.path;
-                            const name = p.split(/[/\\]/).pop() || p;
-                            onUpdateState({
-                              ...state,
-                              editAttachments: [...state.editAttachments, { path: p, name }],
-                              editText: state.editText ? `${state.editText} @${name}` : `@${name}`,
-                            });
-                            return;
+                          if (shouldReadNativeClipboardImage(paste)) {
+                            const imgResult = await api.invoke('clipboard:readImage') as { path?: string; dataUrl?: string } | undefined;
+                            if (imgResult?.path) {
+                              const p = imgResult.path;
+                              const name = p.split(/[/\\]/).pop() || p;
+                              onUpdateState({
+                                ...state,
+                                editAttachments: [...state.editAttachments, { path: p, name }],
+                                editText: state.editText ? `${state.editText} @${name}` : `@${name}`,
+                              });
+                              return;
+                            }
                           }
-                          const text = e.clipboardData?.getData('text') || '';
+                          const text = paste.text;
                           if (text) {
                             onUpdateState({ ...state, editText: state.editText + text });
                           }
@@ -587,6 +601,43 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
           )}
 
           <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
+            <div
+              title="Tab toggles Build/Plan"
+              style={{
+                width: 58,
+                height: 24,
+                display: 'grid',
+                gridTemplateColumns: '1fr 1fr',
+                border: '1px solid #333',
+                borderRadius: 6,
+                overflow: 'hidden',
+                background: '#141414',
+                flexShrink: 0,
+                marginBottom: 4,
+              }}
+            >
+              {(['build', 'plan'] as SmartInputModeId[]).map((candidate) => {
+                const active = draftMode === candidate;
+                const plan = candidate === 'plan';
+                return (
+                  <button
+                    key={candidate}
+                    onClick={() => setDraftMode(candidate)}
+                    style={{
+                      border: 'none',
+                      borderRight: candidate === 'build' ? '1px solid #333' : 'none',
+                      background: active ? (plan ? '#281c10' : '#222') : '#141414',
+                      color: active ? (plan ? '#dcb43c' : '#d6d6d6') : '#777',
+                      fontSize: 9,
+                      padding: 0,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {plan ? 'Plan' : 'Build'}
+                  </button>
+                );
+              })}
+            </div>
             <textarea
               ref={draftRef}
               data-smart-input={terminalId}
@@ -611,43 +662,44 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
                     // Shift+Tab blocked to prevent reverse focus traversal
                     return;
                   }
-                  // Plain Tab sends \t to terminal while keeping Smart Input focus
-                  api.invoke('pty:write', terminalId, '\t');
+                  setDraftMode((current) => toggleSmartInputModeId(current));
                 }
               }}
               onPaste={async (e) => {
                 e.preventDefault();
-                // Check for image file paths first (CF_HDROP or text paths)
-                const paths = await api.invoke('clipboard:readFilePaths') as string[] | undefined;
-                if (paths && paths.length > 0) {
-                  let newDraft = state.draftText;
-                  const newAttachments = [...state.draftAttachments];
-                  for (const p of paths) {
-                    const name = p.split(/[/\\]/).pop() || p;
-                    newAttachments.push({ path: p, name });
-                    newDraft = newDraft ? `${newDraft} @${name}` : `@${name}`;
+                const paste = snapshotClipboardPaste(e.clipboardData);
+                if (shouldReadNativeClipboardFilePaths(paste)) {
+                  const paths = await api.invoke('clipboard:readFilePaths') as string[] | undefined;
+                  if (paths && paths.length > 0) {
+                    let newDraft = state.draftText;
+                    const newAttachments = [...state.draftAttachments];
+                    for (const p of paths) {
+                      const name = p.split(/[/\\]/).pop() || p;
+                      newAttachments.push({ path: p, name });
+                      newDraft = newDraft ? `${newDraft} @${name}` : `@${name}`;
+                    }
+                    onUpdateState({
+                      ...state,
+                      draftAttachments: newAttachments,
+                      draftText: newDraft,
+                    });
+                    return;
                   }
-                  onUpdateState({
-                    ...state,
-                    draftAttachments: newAttachments,
-                    draftText: newDraft,
-                  });
-                  return;
                 }
-                // Check for bitmap images (save to screenshots and paste path)
-                const imgResult = await api.invoke('clipboard:readImage') as { path?: string; dataUrl?: string } | undefined;
-                if (imgResult?.path) {
-                  const p = imgResult.path;
-                  const name = p.split(/[/\\]/).pop() || p;
-                  onUpdateState({
-                    ...state,
-                    draftAttachments: [...state.draftAttachments, { path: p, name }],
-                    draftText: state.draftText ? `${state.draftText} @${name}` : `@${name}`,
-                  });
-                  return;
+                if (shouldReadNativeClipboardImage(paste)) {
+                  const imgResult = await api.invoke('clipboard:readImage') as { path?: string; dataUrl?: string } | undefined;
+                  if (imgResult?.path) {
+                    const p = imgResult.path;
+                    const name = p.split(/[/\\]/).pop() || p;
+                    onUpdateState({
+                      ...state,
+                      draftAttachments: [...state.draftAttachments, { path: p, name }],
+                      draftText: state.draftText ? `${state.draftText} @${name}` : `@${name}`,
+                    });
+                    return;
+                  }
                 }
-                // Fall back to text paste
-                const text = e.clipboardData?.getData('text') || '';
+                const text = paste.text;
                 if (text) {
                   updateDraft(state.draftText + text);
                 }

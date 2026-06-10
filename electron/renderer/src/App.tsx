@@ -15,6 +15,8 @@ import { InputHistory } from './components/InputHistory';
 import { usePty } from './hooks/usePty';
 import { activeBrowserScope as resolveActiveBrowserScope, scopeKeyString } from './lib/browserScope';
 import { nextAcpActivityState, type AcpEventLike } from './lib/acpUi';
+import type { SmartInputModeId } from './lib/smartInputMode';
+import { terminalWheelEnabled } from './lib/terminalWheel';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -47,6 +49,7 @@ function App() {
   const [isResizingBrowser, setIsResizingBrowser] = useState(false);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [terminalManagerOverlayOpen, setTerminalManagerOverlayOpen] = useState(false);
   const [branchNameByProject, setBranchNameByProject] = useState<Map<number, string>>(new Map());
 
   const [activeBrowserScope, setActiveBrowserScope] = useState<BrowserScopeKey | null>(null);
@@ -617,8 +620,8 @@ function App() {
     pty.updateSmartInputState(terminalId, state);
   }, [pty]);
 
-  const handleSendToTerminal = useCallback((terminalId: number, text: string, attachments: SmartInputAttachment[]) => {
-    pty.sendSmartInputToTerminal(terminalId, text, attachments);
+  const handleSendToTerminal = useCallback((terminalId: number, text: string, attachments: SmartInputAttachment[], modeId: SmartInputModeId) => {
+    pty.sendSmartInputToTerminal(terminalId, text, attachments, modeId);
   }, [pty]);
 
   const handleUpdateQuestionState = useCallback((terminalId: number, updates: { focusIndex?: number; selectedOptions?: string[]; customText?: string }) => {
@@ -824,6 +827,7 @@ function App() {
             onActivateAcpChat={restoreActiveAcpForProject}
             onRemoveAcpChat={removeAcpChatForProject}
             onOpenAcpChat={openAcpChat}
+            onOverlayOpenChange={setTerminalManagerOverlayOpen}
           />
         )}
         {activeTab === LeftSidebarTabEnum.SourceControl && selectedProject && config && (
@@ -961,7 +965,7 @@ function App() {
             onTerminalOutputClick={handleTerminalOutputClick}
             onClearTerminalOutputFocusOverride={handleClearTerminalOutputFocusOverride}
             onScrollDetached={handleScrollDetached}
-            wheelEnabled={!settingsOpen && !checklistVisible}
+            wheelEnabled={terminalWheelEnabled({ settingsOpen, checklistVisible, terminalManagerOverlayOpen })}
             disabled={settingsOpen || checklistVisible}
           />
         )}

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useCallback } from 'react';
 import type { TerminalKind, ShellKind, AiHookEvent, AiCliTool, SmartInputState, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
 import { AiCliStatus as AiCliStatusEnum } from '../../../shared/types';
+import type { SmartInputModeId } from '../lib/smartInputMode';
+import { normalizeSmartInputModeId, shouldSendOpenCodeModeToggle } from '../lib/smartInputMode';
 
 const SMART_INPUT_AUTO_DISPATCH_SETTLE_MS = 300;
 const OPENCODE_RUNNING_GRACE_MS = 2000;
@@ -36,6 +38,7 @@ export interface TerminalInstance {
   opencodeThoughtLoopBlocked: boolean;
   opencodeLoopLimitEmitted: boolean;
   opencodeThinkingGuard?: string;
+  opencodeLastKnownMode?: SmartInputModeId;
   smartInputState: SmartInputState;
   terminalOutputFocusOverride: boolean;
   pendingDelayedEnters: number[];
@@ -103,6 +106,7 @@ export function usePty() {
       opencodeLeadingBlankRows: 0,
       opencodeThoughtLoopBlocked: false,
       opencodeLoopLimitEmitted: false,
+      opencodeLastKnownMode: 'build',
       smartInputState: defaultSmartInputState(),
       terminalOutputFocusOverride: false,
       pendingDelayedEnters: [],
@@ -354,6 +358,30 @@ export function usePty() {
     };
   }, [notify]);
 
+  const writeSmartInputPayload = useCallback((terminal: TerminalInstance, text: string, attachments: SmartInputAttachment[], modeId?: string): number => {
+    const targetMode = normalizeSmartInputModeId(modeId);
+    const writePayload = () => {
+      for (const a of attachments) {
+        api.invoke('pty:write', terminal.id, `\x1b[200~${a.path}\x1b[201~`);
+      }
+      if (text) {
+        api.invoke('pty:write', terminal.id, `\x1b[200~${text}\x1b[201~`);
+      }
+      api.invoke('pty:write', terminal.id, '\r');
+    };
+
+    if (terminal.aiTool === 'opencode' && terminal.opencodeSessionActive && shouldSendOpenCodeModeToggle(terminal.opencodeLastKnownMode, targetMode)) {
+      api.invoke('pty:write', terminal.id, '\t');
+      terminal.opencodeLastKnownMode = targetMode;
+      window.setTimeout(writePayload, 150);
+      return 150;
+    }
+
+    terminal.opencodeLastKnownMode = targetMode;
+    writePayload();
+    return 0;
+  }, []);
+
   // Auto-dispatch timer for Smart Input After Done tasks + delayed enters
   useEffect(() => {
     const interval = setInterval(() => {
@@ -436,23 +464,16 @@ export function usePty() {
         // Clear previous delayed enters
         t.pendingDelayedEnters = [];
 
-        // Send each attachment as a separate bracketed-paste event, then text, then Enter
-        for (const a of task.attachments) {
-          api.invoke('pty:write', t.id, `\x1b[200~${a.path}\x1b[201~`);
-        }
-        if (task.text) {
-          api.invoke('pty:write', t.id, `\x1b[200~${task.text}\x1b[201~`);
-        }
-        api.invoke('pty:write', t.id, '\r');
+        const payloadDelay = writeSmartInputPayload(t, task.text, task.attachments, task.modeId);
 
         // Schedule two confirmation Enters after 600ms and 1200ms
-        t.pendingDelayedEnters.push(now + 600);
-        t.pendingDelayedEnters.push(now + 1200);
+        t.pendingDelayedEnters.push(now + payloadDelay + 600);
+        t.pendingDelayedEnters.push(now + payloadDelay + 1200);
         notify();
       }
     }, 100);
     return () => clearInterval(interval);
-  }, [notify]);
+  }, [notify, writeSmartInputPayload]);
 
   const getTerminals = useCallback(() => {
     return Array.from(terminalsRef.current.values());
@@ -505,7 +526,7 @@ export function usePty() {
     notify();
   }, [notify]);
 
-  const sendSmartInputToTerminal = useCallback((terminalId: number, text: string, attachments: SmartInputAttachment[]) => {
+  const sendSmartInputToTerminal = useCallback((terminalId: number, text: string, attachments: SmartInputAttachment[], modeId: SmartInputModeId = 'build') => {
     const t = terminalsRef.current.get(terminalId);
     if (!t) return;
     const now = Date.now();
@@ -517,14 +538,7 @@ export function usePty() {
     // Clear previous delayed enters
     t.pendingDelayedEnters = [];
 
-    // Send each attachment as a separate bracketed-paste event
-    for (const a of attachments) {
-      api.invoke('pty:write', terminalId, `\x1b[200~${a.path}\x1b[201~`);
-    }
-    if (text) {
-      api.invoke('pty:write', terminalId, `\x1b[200~${text}\x1b[201~`);
-    }
-    api.invoke('pty:write', terminalId, '\r');
+    const payloadDelay = writeSmartInputPayload(t, text, attachments, modeId);
 
     // Record recent input directly (bracketed paste is filtered from PTY history tracking)
     if (text.trim()) {
@@ -532,10 +546,10 @@ export function usePty() {
     }
 
     // Schedule two confirmation Enters (600ms and 1200ms) for all Smart Input dispatches
-    t.pendingDelayedEnters.push(now + 600);
-    t.pendingDelayedEnters.push(now + 1200);
+    t.pendingDelayedEnters.push(now + payloadDelay + 600);
+    t.pendingDelayedEnters.push(now + payloadDelay + 1200);
     notify();
-  }, [notify, pushRecentInput]);
+  }, [notify, pushRecentInput, writeSmartInputPayload]);
 
   const sendShortcutToTerminal = useCallback((terminalId: number, command: string) => {
     const t = terminalsRef.current.get(terminalId);

@@ -2,6 +2,7 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry } from '../../../shared/types';
 import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalManagerFilterEnum, BuiltinLauncherKind, activeBuildModel } from '../../../shared/types';
 import type { TerminalInstance } from '../hooks/usePty';
+import { effectiveLauncherCommand } from '../lib/launcher';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
 
@@ -68,6 +69,7 @@ interface TerminalManagerProps {
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number) => void;
+  onOverlayOpenChange?: (open: boolean) => void;
 }
 
 export const TerminalManager: React.FC<TerminalManagerProps> = ({
@@ -86,6 +88,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onActivateAcpChat,
   onRemoveAcpChat,
   onOpenAcpChat,
+  onOverlayOpenChange,
 }) => {
   const [filter, setFilter] = useState<TerminalManagerFilter>(config.ui.terminalManagerFilter ?? TerminalManagerFilterEnum.Foreground);
   const [expandedProjects, setExpandedProjects] = useState<Set<number>>(new Set(config.projects.map((p) => p.id)));
@@ -98,6 +101,17 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   const [historyPopupTerminalId, setHistoryPopupTerminalId] = useState<number | null>(null);
   const [historyPopupJustOpened, setHistoryPopupJustOpened] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
+
+  const overlayOpen = showSavedMessages !== null
+    || showFgMessages !== null
+    || showLauncherMenu !== null
+    || fgMessagePopupProject !== null
+    || historyPopupTerminalId !== null;
+
+  useEffect(() => {
+    onOverlayOpenChange?.(overlayOpen);
+    return () => onOverlayOpenChange?.(false);
+  }, [overlayOpen, onOverlayOpenChange]);
 
   const toggleProject = useCallback((projectId: number) => {
     setExpandedProjects((prev) => {
@@ -682,7 +696,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                     key={l.id}
                     onClick={async () => {
                       setShowLauncherMenu(null);
-                      const cmd = l.launchCommand;
+                      const cmd = effectiveLauncherCommand(l, config.defaultShell);
                       if (l.builtin === BuiltinLauncherKind.OpenCode) {
                         const model = activeBuildModel(config.opencode);
                         await api.invoke('opencode:generateTerminalConfig', {

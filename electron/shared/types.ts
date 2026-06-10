@@ -117,6 +117,7 @@ export interface LauncherEntry {
   launchCommand: string;
   enabled: boolean;
   iconKey: LauncherIconKey;
+  bypassPermissions?: boolean;
 }
 
 export const defaultLaunchers = (): LauncherEntry[] =>
@@ -134,6 +135,7 @@ export const defaultLaunchers = (): LauncherEntry[] =>
         case BuiltinLauncherKind.OpenCode: return LauncherIconKey.OpenCode;
       }
     })(),
+    bypassPermissions: kind === BuiltinLauncherKind.Claude,
   }));
 
 export enum TerminalKind {

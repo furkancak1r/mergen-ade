@@ -324,6 +324,7 @@ function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
             case BuiltinLauncherKind.OpenCode: return LauncherIconKey.OpenCode;
           }
         })(),
+        bypassPermissions: existing.bypassPermissions,
       });
     } else {
       normalized.push({
@@ -340,6 +341,7 @@ function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
             case BuiltinLauncherKind.OpenCode: return LauncherIconKey.OpenCode;
           }
         })(),
+        bypassPermissions: builtin === BuiltinLauncherKind.Claude,
       });
     }
   }
@@ -354,6 +356,7 @@ function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
       launchCommand: entry.launchCommand.trim(),
       enabled: entry.enabled,
       iconKey: entry.iconKey || LauncherIconKey.Rocket,
+      bypassPermissions: entry.bypassPermissions,
     });
   }
   return normalized;
@@ -411,4 +414,3 @@ function normalizeTerminalShortcutEntries(entries: TerminalShortcutEntry[]): Ter
   }
   return normalized;
 }
-
