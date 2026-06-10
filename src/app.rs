@@ -18348,7 +18348,6 @@ impl AdeApp {
                     terminal.ai_session.tool == Some(AiCliTool::Claude)
                         && terminal.claude_session_active
                         && terminal.claude_normalized_status == Some(ClaudeTransportStatus::Idle)
-                        && terminal.claude_attention_pending
                         && !Self::is_stale_claude_completion(terminal)
                 })
             })
@@ -40627,6 +40626,7 @@ mod tests {
         TRANSIENT_TOAST_SECS,
     };
     use crate::browser_video::BrowserVideoEncodeResult;
+    use crate::claude_codex_hook::TestCommandResult;
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
     use crate::config;
     use crate::hooks::{
@@ -42337,6 +42337,142 @@ mod tests {
             .plan_path
             .starts_with(project_root.join(".claude").join("plans")));
         assert!(session.plan_path.is_file());
+
+        let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[test]
+    fn raw_claude_prompt_starts_new_codex_hook_after_completed_session() {
+        let ctx = Context::default();
+        let project_root = test_temp_path("mergen-raw-claude-hook-repeat", "dir");
+        fs::create_dir_all(&project_root).expect("create project root");
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        app.config.claude_code_codex_hook_enabled = true;
+        app.projects.insert(
+            7,
+            test_project(
+                7,
+                "Hook Repeat",
+                project_root.to_string_lossy().as_ref(),
+                &[],
+                &[],
+            ),
+        );
+        seed_claude_attention_idle(&mut app, 1);
+
+        let previous_session_id = "mergen-1-old-1".to_owned();
+        app.claude_codex_hook_sessions.insert(
+            1,
+            ClaudeCodexHookSession {
+                terminal_id: 1,
+                project_id: 7,
+                project_path: project_root.clone(),
+                session_id: previous_session_id.clone(),
+                original_prompt: "first prompt".to_owned(),
+                plan_path: project_root
+                    .join(".claude")
+                    .join("plans")
+                    .join("mergen-1-old-1.md"),
+                phase: ClaudeCodexHookPhase::Done,
+                review_round: 1,
+                plan: Some("Old plan".to_owned()),
+                plan_error: None,
+                test_results: Vec::new(),
+                test_note: None,
+                review_output: Some("No findings.".to_owned()),
+                review_error: None,
+                ui_changed_files: Vec::new(),
+                ui_verification: None,
+                final_note: Some("Done".to_owned()),
+            },
+        );
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("second prompt".to_owned())]);
+        capture.drain();
+        capture.clear();
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+        capture.drain();
+
+        assert_eq!(capture.bytes(), vec![0x15]);
+        let session = app
+            .claude_codex_hook_sessions
+            .get(&1)
+            .expect("new hook session");
+        assert_ne!(session.session_id, previous_session_id);
+        assert_eq!(session.original_prompt, "second prompt");
+        assert_eq!(session.phase, ClaudeCodexHookPhase::Planning);
+
+        let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[test]
+    fn claude_codex_advance_detects_idle_after_attention_acknowledged() {
+        let ctx = Context::default();
+        let project_root = test_temp_path("mergen-claude-hook-acknowledged", "dir");
+        fs::create_dir_all(&project_root).expect("create project root");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_claude_attention_idle(&mut app, 1);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.ai_session.status = AiCliStatus::Inactive;
+            terminal.claude_attention_pending = false;
+        }
+
+        let session_id = "mergen-1-ack-1".to_owned();
+        let plan_path = project_root
+            .join(".claude")
+            .join("plans")
+            .join("mergen-1-ack-1.md");
+        app.claude_codex_hook_sessions.insert(
+            1,
+            ClaudeCodexHookSession {
+                terminal_id: 1,
+                project_id: 7,
+                project_path: project_root.clone(),
+                session_id,
+                original_prompt: "make chess".to_owned(),
+                plan_path: plan_path.clone(),
+                phase: ClaudeCodexHookPhase::AwaitingImplementation,
+                review_round: 0,
+                plan: Some("Implement chess.".to_owned()),
+                plan_error: None,
+                test_results: vec![TestCommandResult {
+                    label: "old".to_owned(),
+                    success: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some("stale".to_owned()),
+                }],
+                test_note: Some("stale".to_owned()),
+                review_output: None,
+                review_error: None,
+                ui_changed_files: Vec::new(),
+                ui_verification: None,
+                final_note: None,
+            },
+        );
+
+        app.advance_claude_codex_hook_sessions(&ctx);
+
+        let session = app.claude_codex_hook_sessions.get(&1).expect("session");
+        assert_eq!(session.phase, ClaudeCodexHookPhase::Testing);
+        assert!(session.test_results.is_empty());
+        assert!(session.test_note.is_none());
+        let plan_text = fs::read_to_string(&plan_path).expect("plan file");
+        assert!(plan_text.contains("status: testing"));
 
         let _ = fs::remove_dir_all(project_root);
     }
