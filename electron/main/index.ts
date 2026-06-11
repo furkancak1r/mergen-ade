@@ -31,7 +31,7 @@ function createWindow() {
     const devPort = process.env.VITE_DEV_PORT || '5174';
     mainWindow.loadURL(`http://localhost:${devPort}`);
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../renderer/dist/index.html'));
+    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
 
   mainWindow.once('ready-to-show', () => {
