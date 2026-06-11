@@ -11,53 +11,35 @@
 
 ## Project Structure & Module Organization
 - `electron/`: primary Electron application, with `main/`, `preload/`, `renderer/`, and `shared/` TypeScript code.
-- `src/main.rs`: app entrypoint and native window startup.
-- `src/app.rs`: UI composition (top bar, activity rail, collapsible side panels, terminal manager, main tiled panes) and app state flow.
-- `src/terminal.rs`: terminal runtime, PTY integration, event forwarding, snapshot rendering data.
-- `src/layout.rs`: auto-tiling grid math and related unit tests.
-- `src/title.rs`: terminal title update/truncation logic and unit tests.
-- `src/config.rs` + `src/models.rs`: persisted TOML config schema and load/save behavior.
-- `src/worktree.rs`: git worktree discovery (`git worktree list --porcelain` parser), worktree metadata, and create/remove helpers.
-- `src/path_utils.rs`: cross-platform path helpers, including Windows verbatim/extended-length path normalization for shell compatibility.
-- `src/opencode_acp.rs`: OpenCode ACP Chat integration (terminal-less chat panel via `opencode acp`).
 - `.github/workflows/release.yml`: GitHub release pipeline for Electron Windows ZIP and signed/notarized macOS ARM64 DMG assets.
-- Build artifacts are in `target/`, `electron/out/`, `electron/renderer/dist/`, and `electron/renderer/dist-electron/` (do not commit).
+- Build artifacts are in `electron/out/`, `electron/renderer/dist/`, and `electron/renderer/dist-electron/` (do not commit).
 - **Do not watch the GitHub release workflow via CLI.** Once the release is triggered by pushing a version tag, the workflow runs asynchronously on GitHub Actions. There is no need to poll or watch it with `gh run watch` / `gh run list`; the user can track progress through the GitHub web interface if desired.
 
 ## Build, Test, and Development Commands
 - `cd electron && npm ci`: install primary Electron dependencies.
 - `cd electron && npx vitest run`: run Electron renderer/main/shared unit tests.
 - `cd electron && npm run build`: build and package the primary Electron app.
-- `cargo test`: run legacy Rust unit tests while the Rust app remains in the tree.
-- `cargo build --release`: optional legacy Rust production build.
-- `cargo fmt`: format Rust sources before commit.
-
-If `cargo` is not on PATH in PowerShell, use:
-`$env:USERPROFILE\.cargo\bin\cargo.exe <command>`.
 
 ## Coding Style & Naming Conventions
-- Rust 2021, 4-space indentation, UTF-8, LF/CRLF handled by Git.
+- TypeScript, UTF-8, LF/CRLF handled by Git.
 - Keep modules focused; prefer small functions over large mixed-responsibility blocks.
-- Naming: `snake_case` for functions/modules, `PascalCase` for types, `SCREAMING_SNAKE_CASE` for constants.
-- Avoid heavy dependencies; preserve the low-memory, native-first design.
+- Naming: `camelCase` for functions/variables, `PascalCase` for types/interfaces, `SCREAMING_SNAKE_CASE` for constants.
 - Keep UI controls visually lightweight; prefer minimal icon-first interactions over heavy bordered button chrome unless emphasis is required.
-- Run `cargo fmt` after edits; keep warnings minimal and intentional.
 
 ## Testing Guidelines
-- Use inline unit tests (`#[cfg(test)]`) in the same module where logic lives.
+- Use Vitest for unit tests in the Electron codebase.
 - Test behavior, not implementation details.
 - Prefer descriptive test names like `wide_viewport_prefers_more_columns`.
 - Minimum expectation for feature changes:
   1. Update/add tests in affected modules.
   2. Ensure `cd electron && npx vitest run` passes for Electron changes.
-  3. Ensure `cargo test` passes when Rust modules are touched.
 
 ## Commit & Pull Request Guidelines
 - Follow existing history style: short, imperative subject lines (examples: `Fix terminal input focus`, `Add release workflow`).
 - Keep commits scoped to one concern when possible.
 - PRs should include:
   1. What changed and why.
-  2. Validation steps (`cargo test`, manual run notes).
+  2. Validation steps (`cd electron && npx vitest run`, manual run notes).
   3. UI screenshots/GIFs for visible behavior changes.
   4. Any platform-specific assumptions or limitations, especially Windows-first runtime behavior and macOS signing/notarization requirements.
 
@@ -99,7 +81,7 @@ If `cargo` is not on PATH in PowerShell, use:
   - Clipboard image paths (both HDROP and text-fallback)
   - Worktree `display_label()` and `discover_worktrees()` path repair
   - Config-level project records via `repair_mojibake_in_projects`
-- **Non-UTF-8 path segments**: `repair_mojibake_path` converts `PathBuf` to `String` via `to_string_lossy()`, replacing non-UTF-8 segments with `U+FFFD`. This is a known limitation unlikely to matter in practice (Windows paths with NTFS are generally UTF-16 clean).
+- **Non-UTF-8 path segments**: `repair_mojibake_path` converts paths to strings via `to_string_lossy()`, replacing non-UTF-8 segments with `U+FFFD`. This is a known limitation unlikely to matter in practice (Windows paths with NTFS are generally UTF-16 clean).
 
 ## Cross-Tool Project Configuration
 - When a project is used in both Mergen and Zed, keep terminal commands in sync.

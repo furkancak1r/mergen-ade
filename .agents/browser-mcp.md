@@ -51,7 +51,7 @@
 ## Browser MCP Single-Binary Guidelines
 - **Browser MCP helper runs inside the main executable.** Browser MCP functionality must run via `mergen-ade(.exe) --browser-mcp-helper`, not as a separate sidecar binary.
 - **Do not ship a separate `mergen-browser-mcp(.exe)` binary.** Release ZIP/DMG must contain only the main Mergen executable; sidecar binaries are unsupported and must be removed.
-- **Do not place Browser MCP helper code under `src/bin/`.** Code under `src/bin/` creates implicit Cargo binary targets that produce separate release executables. Place helper code in `src/browser_mcp_helper.rs` as a regular module.
+- **Browser MCP helper code lives in the Electron main process.** The helper is implemented in `electron/main/browserMcpHelper.ts` and runs as a child process via `--browser-mcp-helper` flag.
 - **OpenCode runtime config must use the helper-mode argument.** The MCP command array must be `[current_exe, "--browser-mcp-helper", "--caps=devtools,vision,network,storage"]`.
 - **Release builds must target only `--bin mergen-ade`.** Do not use `--bins` in release workflows; it builds all binary targets including stale sidecars.
 - **Clean stale `mergen-browser-mcp(.exe)` artifacts.** Release scripts must remove any existing sidecar executable from previous builds to prevent accidental packaging.

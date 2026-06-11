@@ -1,16 +1,7 @@
-# Rust build artifacts
-/target/
-/target_test/
-/target_test_*/
-/.toolchain/
-
 # Local tool artifacts
 /.claude/
 /.opencode/
 /.firecrawl/
-
-# Cargo
-**/*.rs.bk
 
 # IDE/editor files
 .idea/

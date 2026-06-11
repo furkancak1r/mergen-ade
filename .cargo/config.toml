@@ -1,9 +1,0 @@
-# Default target: None — host-native builds are used for local development.
-# Windows release builds MUST use explicit --target x86_64-pc-windows-msvc.
-# macOS release builds MUST use explicit --target aarch64-apple-darwin.
-
-[target.x86_64-pc-windows-gnullvm]
-linker = ".toolchain/llvm-mingw-20260224-ucrt-x86_64/bin/x86_64-w64-mingw32-clang.exe"
-
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]

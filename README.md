@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="logo.png" alt="Mergen ADE logo" width="220">
-</p>
-
 <h1 align="center">Mergen ADE</h1>
 
 <p align="center">
@@ -32,7 +28,7 @@ It is not an IDE. There is no built-in editor, LSP, or debugger UI in this proje
 
 - Keep multiple terminals visible without turning your desktop into window clutter.
 - Group sessions by project so context switches stay fast and predictable.
-- Run a native Rust desktop app instead of a browser or Electron shell.
+- Run a native Electron desktop app with integrated terminal management.
 - Persist only the small amount of state that helps you get back to work quickly.
 
 ## Quick Start
@@ -52,44 +48,26 @@ Published assets currently target:
 
 ### Local build
 
-Preferred one-command build:
+Install dependencies and build the Electron app:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+cd electron
+npm ci
+npm run build
 ```
 
-This produces the portable Windows executable at:
-
-```text
-target\x86_64-pc-windows-msvc\release\mergen-ade.exe
-```
-
-For normal local development:
+For local development with hot-reload:
 
 ```powershell
-cargo build --release
-cargo test
+cd electron
+npm run dev
 ```
 
-`cargo build --release` and `cargo run --release` both use the repo's default Windows MSVC target, so they update the same portable EXE path shown above.
-
-For an experimental native macOS build, use an explicit target because the repo default target remains Windows-oriented:
-
-```bash
-cargo build --release --target aarch64-apple-darwin
-```
-
-This produces the macOS binary at:
-
-```text
-target/aarch64-apple-darwin/release/mergen-ade
-```
-
-If `cargo` is not on PATH in PowerShell:
+Run tests:
 
 ```powershell
-$env:USERPROFILE\.cargo\bin\cargo.exe build --release
-$env:USERPROFILE\.cargo\bin\cargo.exe test
+cd electron
+npx vitest run
 ```
 
 ### Factory Droid Setup (Windows-first)
@@ -150,19 +128,19 @@ Do not assume the Windows installer flow is available unchanged outside Windows.
 
 ## Core Features
 
-- Native Rust desktop app with a Windows-first release path
+- Native Electron desktop app with a Windows-first release path
 - Embedded terminal panes with tiled layout management
 - Project-aware terminal grouping in the side panel
-- ConPTY-backed shell sessions with responsive IO flow
-- Lightweight local TOML configuration
+- PTY-backed shell sessions with responsive IO flow
+- Lightweight local configuration
 - Portable Windows release pipeline through GitHub Actions
 - Signed and notarized macOS ARM64 DMG packaging in GitHub Actions
 
 ## How It Works
 
-- Terminal sessions are created through `portable-pty` using the native PTY backend of the current platform.
-- Terminal emulation and parsing are handled by `tattoy-wezterm-term`.
-- PTY reads, writes, and resize handling run off the UI thread to keep the app responsive.
+- Terminal sessions are created through `node-pty` using the native PTY backend of the current platform.
+- Terminal emulation and rendering are handled by `xterm.js` with WebGL acceleration.
+- PTY reads, writes, and resize handling run in the main process to keep the renderer responsive.
 - The main window combines an activity rail, collapsible side panels, and tiled terminal panes.
 
 ## UI Overview
@@ -175,24 +153,23 @@ Do not assume the Windows installer flow is available unchanged outside Windows.
 
 ## Build From Source
 
-The release script is the supported path for a portable Windows binary.
+The Electron build is the supported path for portable binaries.
 
 What it does:
 
-1. Builds a portable release for `x86_64-pc-windows-msvc`
-2. Ensures the `stable-x86_64-pc-windows-msvc` toolchain is available
-3. Resolves the local Visual Studio build environment when needed
-4. Statically links the MSVC CRT for a portable EXE workflow
-5. Verifies imports with repo-local `llvm-objdump.exe` when available, otherwise `dumpbin.exe`
-6. Produces `target\x86_64-pc-windows-msvc\release\mergen-ade.exe`
+1. Builds the Electron app with `electron-builder`
+2. Produces a portable Windows ZIP containing `mergen-ade.exe`
+3. Produces a signed and notarized macOS ARM64 DMG
 
-Regression check:
+Build commands:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
+cd electron
+npm ci
+npm run build
 ```
 
-For macOS release packaging, GitHub Actions builds `aarch64-apple-darwin`, wraps the binary in a minimal `.app`, signs it with a Developer ID Application certificate, notarizes the DMG through `notarytool`, and staples the notarization ticket onto the DMG before publishing. The blocking CI gates are notarization acceptance plus `stapler validate`; the prior headless `spctl --type open` check was removed because it produced runner-context-specific false negatives after successful notarization. The same script can still package locally without signing when the Apple credentials are not provided.
+For macOS release packaging, GitHub Actions builds the Electron app, signs it with a Developer ID Application certificate, notarizes the DMG through `notarytool`, and staples the notarization ticket onto the DMG before publishing. The blocking CI gates are notarization acceptance plus `stapler validate`. The same script can still package locally without signing when the Apple credentials are not provided.
 
 ## GitHub Releases
 
@@ -253,16 +230,17 @@ Not persisted:
 
 The project currently includes unit tests for:
 
-- tiling grid calculation in `src/layout.rs`
-- terminal title update logic in `src/title.rs`
-- platform-specific shell/config and file-open command behavior
-- Windows release helper regressions in `scripts/__tests__/build-release.tests.ps1`
+- Tiling grid calculation logic
+- Terminal title update logic
+- Platform-specific shell/config and file-open command behavior
+- ACP protocol parsers
+- Worktree management
 
 Run checks:
 
 ```powershell
-cargo test
-powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
+cd electron
+npx vitest run
 ```
 
 ## Non-goals
@@ -273,18 +251,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests
 
 ## Build Troubleshooting
 
-- `link.exe not found`
-  - Install Visual Studio Build Tools or Visual Studio 2022 with `Desktop development with C++`, then rerun the release script.
-- `Required x64 MSVC/SDK libraries were not found in LIB`
-  - Install the Windows SDK and MSVC CRT libraries that ship with the Desktop development with C++ workload, then rerun the release script.
-- `MSVC Rust toolchain not found`
-  - The release script provisions `stable-x86_64-pc-windows-msvc` automatically when `rustup` is available.
-- `toolchain 'stable-x86_64-pc-windows-msvc' is not installed`
-  - The release script installs it automatically through `rustup toolchain install ... --profile minimal`.
-- `dependency tool not found`
-  - The release script first checks repo-local `llvm-objdump.exe`, then resolves `dumpbin.exe` from Visual Studio or Build Tools even outside Developer PowerShell.
-- `x86_64-w64-mingw32-clang.exe not found`
-  - This only affects explicit `--target x86_64-pc-windows-gnullvm` builds. Plain local `cargo` builds now use the default MSVC target from `.cargo\config.toml`; make sure Visual Studio Build Tools and the Windows SDK are installed if the MSVC toolchain is missing.
+- `npm ci` fails
+  - Ensure Node.js 18+ is installed and `npm` is on PATH.
+  - Delete `node_modules` and `package-lock.json` in the `electron/` directory, then retry.
+- `npm run build` fails
+  - Ensure all dependencies are installed with `npm ci` first.
+  - Check that `electron-builder` is available in `node_modules/.bin/`.
+- Tests fail
+  - Run `npx vitest run` from the `electron/` directory to see detailed test output.
+  - Ensure the project compiles with `npm run build` before running tests.
 
 ## License
 

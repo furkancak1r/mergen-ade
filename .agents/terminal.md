@@ -4,7 +4,7 @@
 - **1-second delay on all tooltip text**: Global egui tooltips (`on_hover_text`, `on_hover_ui`) use `style.interaction.tooltip_delay = 1.0`. Custom `Area`-based tooltips (`show_tooltip_above_at`, `browser_toolbar_icon_button`, `browser_toolbar_toggle_button`) use `should_show_delayed_tooltip(ctx, widget_id, hovering)` with a 1-second threshold and per-widget timers stored in `ctx.data_mut()`.
 - **No delay on hover visuals**: Background color changes, icon color changes, and cursor changes must remain immediate. Only the tooltip text label is delayed.
 - **Timer reset on pointer leave**: When `hovering == false`, the timer is removed from `ctx.data_mut()` so the delay restarts on the next hover entry.
-- **Helper location**: `TooltipDelayState` struct and `should_show_delayed_tooltip` live in `src/app.rs` near the custom tooltip functions.
+- **Helper location**: Tooltip delay state and `shouldShowDelayedTooltip` helper live in the Electron renderer near the custom tooltip functions.
 
 ## Terminal Input & History Invariants
 - `pending_line_for_title` is for title/AI command detection only; it clears on newlines (\r or \n) since titles should reflect only the current logical line. This buffer is capped to `TERMINAL_PENDING_LINE_MAX_CHARS` (512) to prevent unbounded growth.
