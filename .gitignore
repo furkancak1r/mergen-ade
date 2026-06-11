@@ -7,6 +7,7 @@
 # Local tool artifacts
 /.claude/
 /.firecrawl/
+/.opencode/
 
 # Cargo
 **/*.rs.bk

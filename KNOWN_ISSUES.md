@@ -3748,3 +3748,27 @@
   - Added regression test `smart_input_mode_selector_in_draft_area_for_opencode` verifying both labels render and are positioned near each other.
   - Existing tests `smart_input_footer_hides_mode_pill_for_claude` and `smart_input_footer_omits_global_mode_buttons_and_shows_queue_count` continue to pass.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+
+---
+
+#### Claude Code launcher used stale wrapper and hook config after Mimo migration {#claude-code-mimo-wrapper-hook-migration}
+- Date: 2026-06-11
+- Context: User reported that launching Claude Code from Mergen broke after moving away from Kimi, and suspected hooks were still looking for Kimi.
+- Error signature:
+  1. Mergen's persisted Claude launcher used `cc`, which resolved to `C:\Users\furkan.cakir\bin\cc.cmd`.
+  2. `cc.cmd` called a MiniMax wrapper that injected `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and a MiniMax model before invoking Claude Code.
+  3. `~/.claude/settings.json` mixed the new Mimo config with stale Orca and Emdash hook commands.
+- Symptoms/Impact:
+  - Claude Code launched from Mergen could ignore the intended Mimo settings, route through an old wrapper/provider, or run stale hook commands during startup/tool events.
+- Root cause:
+  - The Claude builtin launcher preserved legacy shell aliases/wrappers instead of resolving to the real npm `claude.cmd` shim.
+  - The global Claude settings retained stale third-party hook commands after the provider/model migration.
+- Resolution:
+  - Migrate legacy Claude launcher commands (`cc`, `cc.cmd`, bare `claude`) to the platform default real Claude CLI shim.
+  - Keep bypass permission mode injection in Mergen while bypassing alias/wrapper command paths.
+  - Update Claude Code global settings to Mimo and remove stale Orca/Emdash hook commands while preserving Codex plugin settings.
+  - Move OpenCode build defaults from Kimi to `mimo/mimo-v2.5-pro`, leaving plan mode on the OpenAI/ChatGPT model.
+- Prevent recurrence:
+  - Regression tests cover legacy Claude launcher migration, alias bypass during sanitized launch command construction, Mimo OpenCode defaults, and Mimo provider injection in runtime configs.
+- Files/Commands touched: `src/models.rs`, `src/config.rs`, `src/app.rs`, `src/opencode_config.rs`, `AGENTS.md`, `~/.claude/settings.json`, `~/.claude/bin/mimo-key-helper.cmd`, Mergen user config, OpenCode user config
+- References: User request 2026-06-11

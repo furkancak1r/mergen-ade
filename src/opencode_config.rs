@@ -18,6 +18,11 @@ use crate::models::{
     DEFAULT_OPENCODE_PLAN_MODEL,
 };
 
+const MIMO_PROVIDER_ID: &str = "mimo";
+const MIMO_MODEL_ID: &str = "mimo-v2.5-pro";
+const MIMO_MODEL_NAME: &str = "Mimo v2.5 Pro";
+const MIMO_BASE_URL: &str = "https://token-plan-sgp.xiaomimimo.com/v1";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenCodeRuntimeDefaults {
     pub build_model: String,
@@ -322,6 +327,60 @@ fn apply_runtime_safety_to_config(
         changed |= set_json_u64_min(options, "timeout", defaults.fireworks_timeout_ms);
         changed |= set_json_u64_min(options, "chunkTimeout", defaults.fireworks_chunk_timeout_ms);
     }
+    if defaults.uses_mimo_provider() {
+        let provider = root
+            .entry("provider")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "provider must be an object")
+            })?;
+        let mimo = provider
+            .entry(MIMO_PROVIDER_ID)
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider.mimo must be an object",
+                )
+            })?;
+        let models = mimo
+            .entry("models")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider.mimo.models must be an object",
+                )
+            })?;
+        let model = models
+            .entry(MIMO_MODEL_ID)
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider.mimo.models.mimo-v2.5-pro must be an object",
+                )
+            })?;
+        changed |= set_json_string(model, "id", MIMO_MODEL_ID);
+        changed |= set_json_string(model, "name", MIMO_MODEL_NAME);
+
+        let options = mimo
+            .entry("options")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider.mimo.options must be an object",
+                )
+            })?;
+        changed |= set_json_string(options, "apiKey", "{env:MIMO_API_KEY}");
+        changed |= set_json_string(options, "baseURL", MIMO_BASE_URL);
+    }
 
     Ok(changed)
 }
@@ -429,6 +488,10 @@ impl OpenCodeRuntimeDefaults {
     fn uses_fireworks_provider(&self) -> bool {
         self.build_model.starts_with("fireworks-ai/")
             || self.plan_model.starts_with("fireworks-ai/")
+    }
+
+    fn uses_mimo_provider(&self) -> bool {
+        self.build_model.starts_with("mimo/") || self.plan_model.starts_with("mimo/")
     }
 }
 
@@ -771,16 +834,54 @@ mod tests {
             Some("allow")
         );
         assert_eq!(
-            parsed["provider"]["fireworks-ai"]["options"]["timeout"].as_u64(),
-            Some(DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS)
+            parsed["provider"]["mimo"]["models"]["mimo-v2.5-pro"]["id"].as_str(),
+            Some("mimo-v2.5-pro")
         );
         assert_eq!(
-            parsed["provider"]["fireworks-ai"]["options"]["chunkTimeout"].as_u64(),
-            Some(DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS)
+            parsed["provider"]["mimo"]["models"]["mimo-v2.5-pro"]["name"].as_str(),
+            Some("Mimo v2.5 Pro")
+        );
+        assert_eq!(
+            parsed["provider"]["mimo"]["options"]["apiKey"].as_str(),
+            Some("{env:MIMO_API_KEY}")
+        );
+        assert_eq!(
+            parsed["provider"]["mimo"]["options"]["baseURL"].as_str(),
+            Some("https://token-plan-sgp.xiaomimimo.com/v1")
         );
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_defaults_patch_adds_mimo_provider_for_mimo_model() {
+        let mut config = json!({});
+        let defaults = OpenCodeRuntimeDefaults::from_build_model("mimo/mimo-v2.5-pro");
+
+        let changed = apply_runtime_defaults_to_config(&mut config, &defaults).unwrap();
+
+        assert!(changed);
+        assert_eq!(
+            config["agent"]["build"]["model"].as_str(),
+            Some("mimo/mimo-v2.5-pro")
+        );
+        assert_eq!(
+            config["mode"]["build"]["model"].as_str(),
+            Some("mimo/mimo-v2.5-pro")
+        );
+        assert_eq!(
+            config["provider"]["mimo"]["models"]["mimo-v2.5-pro"]["name"].as_str(),
+            Some("Mimo v2.5 Pro")
+        );
+        assert_eq!(
+            config["provider"]["mimo"]["options"]["apiKey"].as_str(),
+            Some("{env:MIMO_API_KEY}")
+        );
+        assert_eq!(
+            config["provider"]["mimo"]["options"]["baseURL"].as_str(),
+            Some("https://token-plan-sgp.xiaomimimo.com/v1")
+        );
     }
 
     #[test]

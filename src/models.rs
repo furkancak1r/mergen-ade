@@ -116,7 +116,7 @@ impl BuiltinLauncherKind {
     pub const fn default_launch_command(self) -> &'static str {
         match self {
             Self::Codex => "codex",
-            Self::Claude => "claude",
+            Self::Claude => default_claude_launch_command(),
             Self::Droid => "droid",
             Self::OpenCode => "opencode",
         }
@@ -129,6 +129,18 @@ impl BuiltinLauncherKind {
             Self::Droid => LauncherIconKey::Droid,
             Self::OpenCode => LauncherIconKey::OpenCode,
         }
+    }
+}
+
+const fn default_claude_launch_command() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "claude.cmd"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        "claude"
     }
 }
 
@@ -238,11 +250,7 @@ pub fn normalize_launcher_entries(entries: &mut Vec<LauncherEntry>) {
                 } else {
                     existing.display_name.clone()
                 },
-                launch_command: if existing.launch_command.trim().is_empty() {
-                    builtin.default_launch_command().to_owned()
-                } else {
-                    existing.launch_command.clone()
-                },
+                launch_command: normalize_builtin_launch_command(builtin, &existing.launch_command),
                 enabled: existing.enabled,
                 icon_key: builtin.icon_key(),
                 bypass_permissions: existing.bypass_permissions,
@@ -278,6 +286,62 @@ pub fn normalize_launcher_entries(entries: &mut Vec<LauncherEntry>) {
     }
 
     *entries = normalized;
+}
+
+fn normalize_builtin_launch_command(builtin: BuiltinLauncherKind, command: &str) -> String {
+    if command.trim().is_empty() {
+        return builtin.default_launch_command().to_owned();
+    }
+
+    if builtin == BuiltinLauncherKind::Claude {
+        return normalize_claude_launch_command(command);
+    }
+
+    command.to_owned()
+}
+
+pub(crate) fn normalize_claude_launch_command(command: &str) -> String {
+    migrate_legacy_claude_launch_command(command).unwrap_or_else(|| command.to_owned())
+}
+
+fn migrate_legacy_claude_launch_command(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let trimmed = trimmed
+        .strip_prefix('&')
+        .or_else(|| trimmed.strip_prefix('.'))
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+    let (token, tail) = first_shell_token(trimmed)?;
+    let token = token.trim_matches(['"', '\'']);
+    let normalized = token.replace('\\', "/").to_ascii_lowercase();
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if !matches!(file_name, "cc" | "cc.cmd" | "claude" | "claude.ps1") {
+        return None;
+    }
+
+    Some(format!(
+        "{}{}",
+        BuiltinLauncherKind::Claude.default_launch_command(),
+        tail
+    ))
+}
+
+fn first_shell_token(command: &str) -> Option<(&str, &str)> {
+    let mut chars = command.char_indices();
+    let (_, first) = chars.next()?;
+    if first == '"' || first == '\'' {
+        let token_end = command[first.len_utf8()..]
+            .char_indices()
+            .find_map(|(offset, ch)| (ch == first).then_some(first.len_utf8() + offset))?;
+        let after_quote = token_end + first.len_utf8();
+        return Some((&command[..after_quote], &command[after_quote..]));
+    }
+
+    let token_end = command
+        .char_indices()
+        .find_map(|(offset, ch)| ch.is_whitespace().then_some(offset))
+        .unwrap_or(command.len());
+    Some((&command[..token_end], &command[token_end..]))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -514,8 +578,7 @@ impl OpenCodeAcpModelEntry {
 }
 
 pub const APP_CONFIG_VERSION: u32 = 2;
-pub const DEFAULT_OPENCODE_BUILD_MODEL: &str =
-    "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo";
+pub const DEFAULT_OPENCODE_BUILD_MODEL: &str = "mimo/mimo-v2.5-pro";
 pub const DEFAULT_OPENCODE_PLAN_MODEL: &str = "openai/gpt-5.5-fast";
 pub const DEFAULT_OPENCODE_PLAN_EFFORT: &str = "xhigh";
 pub const DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED: bool = true;
@@ -1049,8 +1112,9 @@ mod tests {
         default_launchers, default_terminal_shortcuts, normalize_launcher_entries,
         normalize_terminal_shortcut_entries, AcpStartupMode, AppConfig, BuiltinLauncherKind,
         LauncherEntry, LauncherIconKey, OpenCodeAcpModelEntry, OpenCodeModelConfig, ShellKind,
-        ShortcutModifiers, TerminalShortcutEntry, UiConfig, DEFAULT_OPENCODE_BUILD_STEPS_LIMIT,
-        DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS, DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
+        ShortcutModifiers, TerminalShortcutEntry, UiConfig, DEFAULT_OPENCODE_BUILD_MODEL,
+        DEFAULT_OPENCODE_BUILD_STEPS_LIMIT, DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS,
+        DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
     };
 
     #[test]
@@ -1483,7 +1547,8 @@ mod tests {
     #[test]
     fn opencode_model_config_defaults_include_build_and_plan_models() {
         let config = OpenCodeModelConfig::default();
-        assert!(config.build_model_slot_a.contains("kimi-k2p6-turbo"));
+        assert_eq!(config.build_model_slot_a, DEFAULT_OPENCODE_BUILD_MODEL);
+        assert_eq!(config.build_model_slot_a, "mimo/mimo-v2.5-pro");
         assert!(config.build_model_slot_b.contains("gpt-5.5-fast"));
         assert_eq!(config.plan_model, "openai/gpt-5.5-fast");
         assert_eq!(config.plan_effort, "xhigh");

@@ -63,9 +63,9 @@ use crate::hooks::{
 };
 use crate::layout;
 use crate::models::{
-    AppConfig, AppHistory, BuiltinLauncherKind, InputHistoryFilter, LauncherEntry, LauncherIconKey,
-    LeftSidebarTab, MainVisibilityMode, ProjectRecord, ShellKind, TerminalInputRecord,
-    TerminalKind, TerminalManagerFilter,
+    normalize_claude_launch_command, AppConfig, AppHistory, BuiltinLauncherKind,
+    InputHistoryFilter, LauncherEntry, LauncherIconKey, LeftSidebarTab, MainVisibilityMode,
+    ProjectRecord, ShellKind, TerminalInputRecord, TerminalKind, TerminalManagerFilter,
 };
 use crate::opencode::{
     self, CodexTransportStatus, OpenCodeNotifyInboxEvent, OpenCodeTransportStatus,
@@ -19325,11 +19325,14 @@ impl AdeApp {
 
     fn claude_command_with_bypass_permissions(configured_command: &str) -> String {
         let trimmed = configured_command.trim();
-        let command = if trimmed.is_empty() {
-            "claude"
+        let normalized = if trimmed.is_empty() {
+            BuiltinLauncherKind::Claude
+                .default_launch_command()
+                .to_owned()
         } else {
-            trimmed
+            normalize_claude_launch_command(trimmed)
         };
+        let command = normalized.as_str();
 
         if Self::contains_shell_flag(command, "--dangerously-skip-permissions") {
             return command.to_owned();
@@ -20772,9 +20775,7 @@ impl AdeApp {
                     ui.add_sized(
                         [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                         egui::TextEdit::singleline(&mut self.config.opencode.build_model_slot_a)
-                            .hint_text(
-                                "e.g., fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo",
-                            )
+                            .hint_text("e.g., mimo/mimo-v2.5-pro")
                             .desired_width(ui.available_width().max(0.0))
                             .vertical_align(Align::Center),
                     )
@@ -55857,19 +55858,19 @@ mod tests {
     }
 
     #[test]
-    fn sanitized_claude_launch_command_powershell_clears_env_and_uses_configured_alias() {
+    fn sanitized_claude_launch_command_powershell_clears_env_and_bypasses_legacy_alias() {
         let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::PowerShell, "cc");
         assert!(
             cmd.contains("Remove-Item Env:ANTHROPIC_AUTH_TOKEN"),
             "PowerShell command should clear ANTHROPIC_AUTH_TOKEN"
         );
         assert!(
-            cmd.ends_with("; cc --permission-mode bypassPermissions"),
-            "PowerShell command should invoke the configured Claude launcher command"
+            cmd.ends_with("; claude.cmd --permission-mode bypassPermissions"),
+            "PowerShell command should invoke the real Claude Code npm shim"
         );
         assert!(
-            !cmd.contains("claude.cmd"),
-            "PowerShell command should not bypass the configured launcher alias"
+            !cmd.contains("; cc "),
+            "PowerShell command should bypass the legacy cc wrapper"
         );
     }
 
@@ -55888,32 +55889,44 @@ mod tests {
     }
 
     #[test]
-    fn sanitized_claude_launch_command_cmd_clears_env_and_uses_configured_alias() {
+    fn sanitized_claude_launch_command_cmd_clears_env_and_bypasses_legacy_alias() {
         let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Cmd, "cc");
         assert!(
             cmd.contains("set ANTHROPIC_AUTH_TOKEN="),
             "CMD command should clear ANTHROPIC_AUTH_TOKEN"
         );
         assert!(
-            cmd.ends_with("& cc --permission-mode bypassPermissions"),
-            "CMD command should invoke the configured Claude launcher command"
+            cmd.ends_with("& claude.cmd --permission-mode bypassPermissions"),
+            "CMD command should invoke the real Claude Code npm shim"
         );
         assert!(
-            !cmd.contains("claude.cmd"),
-            "CMD command should not bypass the configured launcher alias"
+            !cmd.contains("& cc "),
+            "CMD command should bypass the legacy cc wrapper"
         );
     }
 
     #[test]
-    fn sanitized_claude_launch_command_zsh_appends_bypass_flag_to_configured_alias() {
+    fn sanitized_claude_launch_command_zsh_appends_bypass_flag_to_configured_command() {
         let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, "cc");
-        assert_eq!(cmd, "cc --permission-mode bypassPermissions");
+        assert_eq!(
+            cmd,
+            format!(
+                "{} --permission-mode bypassPermissions",
+                BuiltinLauncherKind::Claude.default_launch_command()
+            )
+        );
     }
 
     #[test]
     fn sanitized_claude_launch_command_defaults_to_claude_when_configured_command_is_empty() {
         let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, "  ");
-        assert_eq!(cmd, "claude --permission-mode bypassPermissions");
+        assert_eq!(
+            cmd,
+            format!(
+                "{} --permission-mode bypassPermissions",
+                BuiltinLauncherKind::Claude.default_launch_command()
+            )
+        );
     }
 
     #[test]
@@ -55922,7 +55935,13 @@ mod tests {
             ShellKind::Zsh,
             "cc --permission-mode bypassPermissions",
         );
-        assert_eq!(cmd, "cc --permission-mode bypassPermissions");
+        assert_eq!(
+            cmd,
+            format!(
+                "{} --permission-mode bypassPermissions",
+                BuiltinLauncherKind::Claude.default_launch_command()
+            )
+        );
         assert_eq!(cmd.matches("--permission-mode").count(), 1);
     }
 
@@ -55930,14 +55949,26 @@ mod tests {
     fn sanitized_claude_launch_command_replaces_non_bypass_permission_mode() {
         let cmd =
             AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, "cc --permission-mode ask");
-        assert_eq!(cmd, "cc --permission-mode bypassPermissions");
+        assert_eq!(
+            cmd,
+            format!(
+                "{} --permission-mode bypassPermissions",
+                BuiltinLauncherKind::Claude.default_launch_command()
+            )
+        );
     }
 
     #[test]
     fn sanitized_claude_launch_command_replaces_equals_permission_mode() {
         let cmd =
             AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, "cc --permission-mode=default");
-        assert_eq!(cmd, "cc --permission-mode=bypassPermissions");
+        assert_eq!(
+            cmd,
+            format!(
+                "{} --permission-mode=bypassPermissions",
+                BuiltinLauncherKind::Claude.default_launch_command()
+            )
+        );
     }
 
     #[test]
@@ -55950,7 +55981,13 @@ mod tests {
             !cmd.contains("--permission-mode"),
             "dangerously-skip-permissions already requests bypass behavior"
         );
-        assert_eq!(cmd, "cc --dangerously-skip-permissions");
+        assert_eq!(
+            cmd,
+            format!(
+                "{} --dangerously-skip-permissions",
+                BuiltinLauncherKind::Claude.default_launch_command()
+            )
+        );
     }
 
     #[test]
@@ -67554,6 +67591,9 @@ mod tests {
     fn seed_opencode_thought_loop_blocked(app: &mut AdeApp, terminal_id: u64) {
         seed_opencode_attention(app, terminal_id, OpenCodeAttentionReason::TurnComplete);
         app.config.opencode.loop_protection_enabled = true;
+        app.config.opencode.build_model_slot_a =
+            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo".to_owned();
+        app.config.opencode.active_build_model_slot = "a".to_owned();
         let sample = test_long_thought_line("loop");
         let Some(terminal) = app.terminals.get_mut(&terminal_id) else {
             return;
