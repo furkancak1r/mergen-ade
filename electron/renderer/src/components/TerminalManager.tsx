@@ -931,17 +931,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   }}
                 />
                 <IconButton
-                  icon="💬"
-                  tooltip={OPENCODE_ACP_LABEL}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (!expanded) {
-                      onToggle();
-                    }
-                    onOpenAcpChat?.(project.id);
-                  }}
-                />
-                <IconButton
                   icon="📁+"
                   tooltip="Create Worktree"
                   onClick={(e) => {
@@ -1250,25 +1239,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
               </button>
             </div>
           )}
-          {/* OpenCode ACP button */}
-          {showOpenCodeAcpButton && (
-            <div style={{ padding: isWorktree ? '2px 8px 2px 36px' : '2px 8px 2px 24px' }}>
-              <button
-                onClick={() => onOpenAcpChat?.(project.id)}
-                style={{
-                  padding: '2px 8px',
-                  fontSize: 11,
-                  background: SURFACE_BG_SOFT,
-                  border: `1px solid ${BORDER_COLOR}`,
-                  color: '#7ec0ee',
-                  borderRadius: 3,
-                  cursor: 'pointer',
-                }}
-              >
-                {OPENCODE_ACP_OPEN_BUTTON_LABEL}
-              </button>
-            </div>
-          )}
+          {/* OpenCode ACP button removed */}
 
           {/* Terminal rows */}
           {terminals.map((t) => {
