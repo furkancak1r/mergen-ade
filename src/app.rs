@@ -18452,7 +18452,7 @@ impl AdeApp {
             return true;
         }
 
-        if let Some(pending) = terminal.opencode_pending_mode_switch.clone() {
+        if terminal.opencode_pending_mode_switch.is_some() {
             if Self::opencode_mode_switch_settled(terminal) {
                 terminal.opencode_last_known_mode = Some(target.to_owned());
                 terminal.opencode_pending_mode_switch = None;
