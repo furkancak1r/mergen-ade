@@ -85,6 +85,19 @@ use crate::terminal::{
 use crate::title::{terminal_title_candidate, update_terminal_title};
 use crate::web_browser::{self, BrowserStatus};
 
+const MIMO_CLAUDE_ENV: [(&str, &str); 7] = [
+    (
+        "ANTHROPIC_BASE_URL",
+        "https://token-plan-sgp.xiaomimimo.com/anthropic",
+    ),
+    ("ANTHROPIC_MODEL", "mimo-v2.5-pro"),
+    ("ANTHROPIC_SMALL_FAST_MODEL", "mimo-v2.5-pro"),
+    ("ANTHROPIC_DEFAULT_SONNET_MODEL", "mimo-v2.5-pro"),
+    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "mimo-v2.5-pro"),
+    ("ANTHROPIC_DEFAULT_OPUS_MODEL", "mimo-v2.5-pro"),
+    ("CLAUDE_CODE_SUBAGENT_MODEL", "mimo-v2.5-pro"),
+];
+
 const TITLE_MAX_LEN: usize = 40;
 const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 512;
@@ -522,12 +535,17 @@ fn acp_composer_hint_text(
     welcome_center: bool,
     session_ready: bool,
     active_mode: &str,
+    is_claude_code: bool,
 ) -> &'static str {
     if !session_ready {
         "Waiting for session..."
     } else if welcome_center {
-        ACP_WELCOME_HINT
-    } else if crate::opencode_acp::mode_is_plan(active_mode) {
+        if is_claude_code {
+            "Ask Claude..."
+        } else {
+            ACP_WELCOME_HINT
+        }
+    } else if !is_claude_code && crate::opencode_acp::mode_is_plan(active_mode) {
         "Plan and design before coding..."
     } else {
         "Type a message..."
@@ -1986,6 +2004,8 @@ pub enum ForegroundLauncherAction {
     TerminalLauncher(String),
     /// Open a terminal-less OpenCode ACP session.
     OpenCodeChat,
+    /// Open a terminal-less Claude Code ACP session.
+    ClaudeCodeChat,
 }
 
 impl AppIcon {
@@ -4986,6 +5006,8 @@ fn acp_chat_has_started_state(session: &crate::opencode_acp::AcpChatSession) -> 
 fn acp_chat_display_title(session: &crate::opencode_acp::AcpChatSession) -> String {
     if acp_chat_has_started_state(session) {
         session.title.clone()
+    } else if session.is_claude_code() {
+        "Claude Code".to_owned()
     } else {
         "OpenCode ACP".to_owned()
     }
@@ -4993,8 +5015,13 @@ fn acp_chat_display_title(session: &crate::opencode_acp::AcpChatSession) -> Stri
 
 fn acp_terminal_manager_row_label(session: &crate::opencode_acp::AcpChatSession) -> String {
     let title = acp_chat_display_title(session);
+    let prefix = if session.is_claude_code() {
+        "Claude Code"
+    } else {
+        "OpenCode ACP"
+    };
     if acp_chat_has_started_state(session) {
-        format!("OpenCode ACP - {title}")
+        format!("{prefix} - {title}")
     } else {
         title
     }
@@ -11842,10 +11869,21 @@ impl AdeApp {
                 crate::opencode_acp::AcpChatEvent::Connected { chat_id } => {
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                         session.updated_at = Instant::now();
-                        // After initialize response, send session/new
-                        session.send_session_new();
+                        if !session.is_claude_code() {
+                            // After initialize response, send session/new (OpenCode only)
+                            session.send_session_new();
+                        }
                     }
-                    self.status_line = format!("OpenCode ACP {chat_id} connected");
+                    let label = if self
+                        .acp_chat_sessions
+                        .get(&chat_id)
+                        .is_some_and(|s| s.is_claude_code())
+                    {
+                        "Claude Code"
+                    } else {
+                        "OpenCode ACP"
+                    };
+                    self.status_line = format!("{label} {chat_id} connected");
                 }
                 crate::opencode_acp::AcpChatEvent::SessionCreated {
                     chat_id,
@@ -11853,27 +11891,38 @@ impl AdeApp {
                 } => {
                     self.acknowledge_acp_terminal_manager_attention(chat_id);
                     let mut queued_prompt_sent = false;
+                    let is_claude = self
+                        .acp_chat_sessions
+                        .get(&chat_id)
+                        .is_some_and(|s| s.is_claude_code());
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                         session.session_id = Some(session_id.clone());
                         session.status = crate::opencode_acp::AcpChatStatus::Idle;
                         session.is_running = false;
                         session.updated_at = Instant::now();
-                        if session.queue.is_empty() {
-                            changed |= Self::apply_acp_runtime_defaults_to_session(
-                                session,
-                                &runtime_defaults,
-                                true,
-                                bind_acp_model_to_mode,
-                            );
-                        } else {
-                            queued_prompt_sent = Self::dispatch_next_queued_acp_prompt(
-                                session,
-                                &runtime_defaults,
-                                bind_acp_model_to_mode,
-                            );
+                        if !is_claude {
+                            if session.queue.is_empty() {
+                                changed |= Self::apply_acp_runtime_defaults_to_session(
+                                    session,
+                                    &runtime_defaults,
+                                    true,
+                                    bind_acp_model_to_mode,
+                                );
+                            } else {
+                                queued_prompt_sent = Self::dispatch_next_queued_acp_prompt(
+                                    session,
+                                    &runtime_defaults,
+                                    bind_acp_model_to_mode,
+                                );
+                            }
                         }
                     }
-                    self.status_line = format!("OpenCode ACP {chat_id} session created");
+                    let label = if is_claude {
+                        "Claude Code"
+                    } else {
+                        "OpenCode ACP"
+                    };
+                    self.status_line = format!("{label} {chat_id} session created");
                     changed |= queued_prompt_sent;
                 }
                 crate::opencode_acp::AcpChatEvent::AgentMessageChunk { chat_id, text } => {
@@ -12038,16 +12087,22 @@ impl AdeApp {
                     stop_reason,
                 } => {
                     let mut queued_prompt_sent = false;
+                    let is_claude = self
+                        .acp_chat_sessions
+                        .get(&chat_id)
+                        .is_some_and(|s| s.is_claude_code());
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                         session.status = crate::opencode_acp::AcpChatStatus::Idle;
                         session.is_running = false;
                         Self::reset_acp_loop_guard(session);
                         session.updated_at = Instant::now();
-                        queued_prompt_sent = Self::dispatch_next_queued_acp_prompt(
-                            session,
-                            &runtime_defaults,
-                            bind_acp_model_to_mode,
-                        );
+                        if !is_claude {
+                            queued_prompt_sent = Self::dispatch_next_queued_acp_prompt(
+                                session,
+                                &runtime_defaults,
+                                bind_acp_model_to_mode,
+                            );
+                        }
                     }
                     if !queued_prompt_sent {
                         self.mark_acp_terminal_manager_attention(
@@ -12055,7 +12110,12 @@ impl AdeApp {
                             AcpTerminalManagerAttentionReason::TurnComplete,
                         );
                     }
-                    self.status_line = format!("OpenCode ACP {chat_id} stopped: {stop_reason}");
+                    let label = if is_claude {
+                        "Claude Code"
+                    } else {
+                        "OpenCode ACP"
+                    };
+                    self.status_line = format!("{label} {chat_id} stopped: {stop_reason}");
                     changed = true;
                 }
                 crate::opencode_acp::AcpChatEvent::PermissionRequest {
@@ -12101,19 +12161,35 @@ impl AdeApp {
                 }
                 crate::opencode_acp::AcpChatEvent::Disconnected { chat_id } => {
                     self.acknowledge_acp_terminal_manager_attention(chat_id);
+                    let is_claude = self
+                        .acp_chat_sessions
+                        .get(&chat_id)
+                        .is_some_and(|s| s.is_claude_code());
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
-                        session.status = crate::opencode_acp::AcpChatStatus::Exited;
+                        if is_claude {
+                            // Claude Code: process exits after each turn, session stays alive.
+                            session.status = crate::opencode_acp::AcpChatStatus::Idle;
+                        } else {
+                            session.status = crate::opencode_acp::AcpChatStatus::Exited;
+                        }
                         session.is_running = false;
                         Self::reset_acp_loop_guard(session);
                         session.updated_at = Instant::now();
                     }
-                    if self.acp_model_probe_chat == Some(chat_id) {
-                        self.acp_model_probe_chat = None;
+                    if !is_claude {
+                        if self.acp_model_probe_chat == Some(chat_id) {
+                            self.acp_model_probe_chat = None;
+                        }
+                        self.acp_pending_project_by_chat.remove(&chat_id);
+                        self.acp_standby_chat_by_project
+                            .retain(|_, &mut id| id != chat_id);
                     }
-                    self.acp_pending_project_by_chat.remove(&chat_id);
-                    self.acp_standby_chat_by_project
-                        .retain(|_, &mut id| id != chat_id);
-                    self.status_line = format!("OpenCode ACP {chat_id} disconnected");
+                    let label = if is_claude {
+                        "Claude Code"
+                    } else {
+                        "OpenCode ACP"
+                    };
+                    self.status_line = format!("{label} {chat_id} disconnected");
                     changed = true;
                 }
             }
@@ -12211,6 +12287,20 @@ impl AdeApp {
             browser_mcp_env,
             event_tx,
         )?;
+        self.acp_chat_sessions.insert(chat_id, session);
+        Ok(chat_id)
+    }
+
+    fn spawn_claude_code_process(
+        &mut self,
+        project_id: u64,
+        project_path: PathBuf,
+    ) -> Result<u64, std::io::Error> {
+        let chat_id = self.next_acp_chat_id;
+        self.next_acp_chat_id += 1;
+        let event_tx = self.acp_chat_events_tx.clone();
+        let session =
+            crate::claude_acp::spawn_claude_code(chat_id, project_id, project_path, event_tx);
         self.acp_chat_sessions.insert(chat_id, session);
         Ok(chat_id)
     }
@@ -12455,8 +12545,22 @@ impl AdeApp {
             }
         }
 
+        let is_claude = self
+            .acp_chat_sessions
+            .get(&chat_id)
+            .is_some_and(|s| s.is_claude_code());
         self.acknowledge_acp_terminal_manager_attention(chat_id);
         if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+            if is_claude && session.is_running {
+                // Claude Code: show stderr as system message, don't kill session.
+                session
+                    .messages
+                    .push(crate::opencode_acp::AcpChatMessage::System {
+                        text: format!("Error: {message}"),
+                    });
+                session.updated_at = Instant::now();
+                return true;
+            }
             session.status = crate::opencode_acp::AcpChatStatus::Error;
             Self::reset_acp_loop_guard(session);
             session
@@ -12466,13 +12570,20 @@ impl AdeApp {
                 });
             session.updated_at = Instant::now();
         }
-        if self.acp_model_probe_chat == Some(chat_id) {
-            self.acp_model_probe_chat = None;
+        if !is_claude {
+            if self.acp_model_probe_chat == Some(chat_id) {
+                self.acp_model_probe_chat = None;
+            }
+            self.acp_pending_project_by_chat.remove(&chat_id);
+            self.acp_standby_chat_by_project
+                .retain(|_, &mut id| id != chat_id);
         }
-        self.acp_pending_project_by_chat.remove(&chat_id);
-        self.acp_standby_chat_by_project
-            .retain(|_, &mut id| id != chat_id);
-        self.status_line = format!("OpenCode ACP {chat_id} error: {message}");
+        let label = if is_claude {
+            "Claude Code"
+        } else {
+            "OpenCode ACP"
+        };
+        self.status_line = format!("{label} {chat_id} error: {message}");
         true
     }
 
@@ -12932,7 +13043,38 @@ impl AdeApp {
         runtime_defaults: &crate::opencode_config::OpenCodeRuntimeDefaults,
         bind_model_to_mode: bool,
     ) -> bool {
-        if queued_prompt.prompt_text.trim().is_empty() || session.session_id.is_none() {
+        if queued_prompt.prompt_text.trim().is_empty() {
+            return false;
+        }
+        if session.is_claude_code() {
+            // Claude Code: spawn a per-turn process.
+            let event_tx = match session.event_tx.clone() {
+                Some(tx) => tx,
+                None => return false,
+            };
+            let session_id = session.session_id.clone();
+            let prompt_text = queued_prompt.prompt_text.clone();
+            let project_path = session.project_path.clone();
+            let chat_id = session.id;
+            let child_handle = std::sync::Arc::new(std::sync::Mutex::new(None));
+            session.claude_child = Some(child_handle.clone());
+            Self::append_acp_user_prompt_state(session, &prompt_text);
+            session.is_running = true;
+            session.status = crate::opencode_acp::AcpChatStatus::Running;
+            session.updated_at = Instant::now();
+            std::thread::spawn(move || {
+                let _ = crate::claude_acp::send_claude_code_prompt(
+                    chat_id,
+                    &project_path,
+                    session_id,
+                    &prompt_text,
+                    event_tx,
+                    child_handle,
+                );
+            });
+            return true;
+        }
+        if session.session_id.is_none() {
             return false;
         }
         session.selected_mode_id = Some(queued_prompt.mode_id.clone());
@@ -12956,8 +13098,10 @@ impl AdeApp {
         runtime_defaults: &crate::opencode_config::OpenCodeRuntimeDefaults,
         bind_model_to_mode: bool,
     ) -> bool {
+        // Claude Code doesn't need session_id before first prompt.
+        let needs_session_id = !session.is_claude_code();
         if session.queue.is_empty()
-            || session.session_id.is_none()
+            || (needs_session_id && session.session_id.is_none())
             || session.is_running
             || matches!(
                 session.status,
@@ -13271,10 +13415,42 @@ impl AdeApp {
         }
     }
 
+    fn spawn_claude_code_chat_for_project(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+    ) -> Option<u64> {
+        let project_name = self.projects.get(&project_id)?.name.clone();
+        let project_path = self.projects.get(&project_id)?.path.clone();
+        match self.spawn_claude_code_process(project_id, project_path) {
+            Ok(chat_id) => {
+                self.register_active_acp_chat(ctx, project_id, chat_id);
+                self.status_line = format!("Started Claude Code for {project_name}");
+                Some(chat_id)
+            }
+            Err(err) => {
+                self.status_line = format!("Claude Code başlatılamadı: {err}");
+                None
+            }
+        }
+    }
+
     fn kill_acp_chat(&mut self, chat_id: u64) {
         let project_id = self.acp_effective_project_for_chat(chat_id);
         if let Some(session) = self.acp_chat_sessions.remove(&chat_id) {
-            let _ = session.send_cancel();
+            if session.is_claude_code() {
+                // Kill the Claude Code child process if still running.
+                if let Some(ref child_handle) = session.claude_child {
+                    if let Ok(mut handle) = child_handle.lock() {
+                        if let Some(ref mut child) = *handle {
+                            let _ = child.kill();
+                        }
+                        *handle = None;
+                    }
+                }
+            } else {
+                let _ = session.send_cancel();
+            }
             if let Some(ref service) = self.browser_mcp_service {
                 service.revoke_acp_chat(chat_id);
             }
@@ -18930,13 +19106,40 @@ impl AdeApp {
     fn sanitized_claude_launch_command(shell: ShellKind) -> String {
         match shell {
             ShellKind::PowerShell => {
-                "Remove-Item Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY,Env:ANTHROPIC_BASE_URL,Env:ANTHROPIC_MODEL,Env:ANTHROPIC_SMALL_FAST_MODEL,Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:CLAUDE_CODE_SUBAGENT_MODEL -ErrorAction SilentlyContinue; & \"$env:APPDATA\\npm\\claude.cmd\"".to_owned()
+                let mimo_env = Self::powershell_mimo_claude_env_assignments();
+                format!(
+                    "Remove-Item Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue; {mimo_env}; & \"$env:APPDATA\\npm\\claude.cmd\" --permission-mode bypassPermissions"
+                )
             }
             ShellKind::Cmd => {
-                "set ANTHROPIC_AUTH_TOKEN= & set ANTHROPIC_API_KEY= & set ANTHROPIC_BASE_URL= & set ANTHROPIC_MODEL= & set ANTHROPIC_SMALL_FAST_MODEL= & set ANTHROPIC_DEFAULT_SONNET_MODEL= & set ANTHROPIC_DEFAULT_HAIKU_MODEL= & set ANTHROPIC_DEFAULT_OPUS_MODEL= & set CLAUDE_CODE_SUBAGENT_MODEL= & \"%APPDATA%\\npm\\claude.cmd\"".to_owned()
+                let mimo_env = Self::cmd_mimo_claude_env_assignments();
+                format!(
+                    "set ANTHROPIC_AUTH_TOKEN= & set ANTHROPIC_API_KEY= & {mimo_env} & \"%APPDATA%\\npm\\claude.cmd\" --permission-mode bypassPermissions"
+                )
             }
             ShellKind::Zsh => "claude".to_owned(),
         }
+    }
+
+    fn powershell_mimo_claude_env_assignments() -> String {
+        MIMO_CLAUDE_ENV
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "$env:{key}='{}'",
+                    Self::escape_powershell_single_quoted_string(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn cmd_mimo_claude_env_assignments() -> String {
+        MIMO_CLAUDE_ENV
+            .iter()
+            .map(|(key, value)| format!("set {key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" & ")
     }
 
     fn send_shortcut_command_to_terminal(
@@ -23599,6 +23802,10 @@ impl AdeApp {
                             self.spawn_acp_chat_for_project(ctx, project_id, false)
                                 .is_some()
                         }
+                        Some(ForegroundLauncherAction::ClaudeCodeChat) => {
+                            self.spawn_claude_code_chat_for_project(ctx, project_id)
+                                .is_some()
+                        }
                         None => false,
                     }
                 }
@@ -23687,6 +23894,10 @@ impl AdeApp {
                                         }
                                         Some(ForegroundLauncherAction::OpenCodeChat) => {
                                             self.spawn_acp_chat_for_project(ctx, wt_project_id, false)
+                                                .is_some()
+                                        }
+                                        Some(ForegroundLauncherAction::ClaudeCodeChat) => {
+                                            self.spawn_claude_code_chat_for_project(ctx, wt_project_id)
                                                 .is_some()
                                         }
                                         None => false,
@@ -24930,6 +25141,7 @@ impl AdeApp {
                 let project_id = self.acp_effective_project_for_chat(chat_id).unwrap_or(0);
 
                 let composer_height = if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
+                    let is_claude = session.is_claude_code();
                     let is_running = session.is_running
                         || matches!(
                             session.status,
@@ -24939,7 +25151,7 @@ impl AdeApp {
                         && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
                     let action_controls_enabled =
                         acp_composer_action_controls_enabled(is_running, session_ready);
-                    let slash_commands = if action_controls_enabled {
+                    let slash_commands = if !is_claude && action_controls_enabled {
                         acp_slash_command_matches(&session.available_commands, &session.prompt_input)
                     } else {
                         Vec::new()
@@ -24955,17 +25167,18 @@ impl AdeApp {
                         ui,
                         welcome_center,
                         &session.prompt_input,
-                        acp_composer_hint_text(welcome_center, session_ready, &active_mode),
+                        acp_composer_hint_text(welcome_center, session_ready, &active_mode, is_claude),
                         acp_composer_prompt_input_width(composer_width),
                     );
-                    acp_queued_prompt_panel_height(session)
+                    let queue_height = if is_claude { 0.0 } else { acp_queued_prompt_panel_height(session) };
+                    queue_height
                         + acp_composer_height(
                         welcome_center,
                         !session.attachments.is_empty(),
                         session.pending_permission.is_some(),
                         acp_composer_slash_popup_height_for_controls(
                             slash_commands.len(),
-                            action_controls_enabled,
+                            !is_claude && action_controls_enabled,
                         ),
                         prompt_input_height,
                     )
@@ -25091,8 +25304,13 @@ impl AdeApp {
                         .layout(Layout::left_to_right(Align::Center)),
                 );
                 header_ui.spacing_mut().item_spacing.x = 8.0;
+                let header_label = if self.acp_chat_sessions.get(&chat_id).is_some_and(|s| s.is_claude_code()) {
+                    "Claude Code"
+                } else {
+                    "OpenCode ACP"
+                };
                 header_ui.label(
-                    RichText::new(format!("{} OpenCode ACP", icons::CHAT_TEXT))
+                    RichText::new(format!("{} {}", icons::CHAT_TEXT, header_label))
                         .size(16.0)
                         .strong()
                         .color(TEXT_PRIMARY),
@@ -25237,6 +25455,7 @@ impl AdeApp {
                 let mut acp_queue_status_message: Option<String> = None;
                 let acp_context_project_id = project_id;
                 if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                    let is_claude = session.is_claude_code();
                     let mut request_current_input_focus = focus_input_this_frame;
                     let is_running = acp_chat_session_is_running(session);
                     let session_ready = session.session_id.is_some()
@@ -25245,19 +25464,22 @@ impl AdeApp {
                     let input_editable = acp_composer_input_editable(is_running);
                     let action_controls_enabled =
                         acp_composer_action_controls_enabled(is_running, session_ready);
-                    let mode_toggle_enabled = acp_composer_mode_toggle_enabled(is_running);
+                    let mode_toggle_enabled = if is_claude { false } else { acp_composer_mode_toggle_enabled(is_running) };
                     let draft = session.prompt_input.clone();
-                    let slash_commands = if action_controls_enabled {
+                    let slash_commands = if !is_claude && action_controls_enabled {
                         acp_slash_command_matches(&session.available_commands, &session.prompt_input)
                     } else {
                         Vec::new()
                     };
                     let slash_popup_height = acp_composer_slash_popup_height_for_controls(
                         slash_commands.len(),
-                        action_controls_enabled,
+                        !is_claude && action_controls_enabled,
                     );
-                    let queue_panel_height =
-                        acp_queued_prompt_panel_height(session).min(composer_rect.height());
+                    let queue_panel_height = if is_claude {
+                        0.0
+                    } else {
+                        acp_queued_prompt_panel_height(session).min(composer_rect.height())
+                    };
                     let (queue_panel_rect, composer_body_rect) = if queue_panel_height > 0.0 {
                         let queue_panel_rect = egui::Rect::from_min_size(
                             composer_rect.min,
@@ -25296,7 +25518,7 @@ impl AdeApp {
                     let prompt_input_width =
                         acp_composer_prompt_input_width(composer_body_rect.width());
                     let hint_text =
-                        acp_composer_hint_text(welcome_center, session_ready, &active_mode);
+                        acp_composer_hint_text(welcome_center, session_ready, &active_mode, is_claude);
                     let prompt_content_height = acp_composer_prompt_content_height(
                         &composer_ui,
                         &session.prompt_input,
@@ -25383,10 +25605,13 @@ impl AdeApp {
                     let response = acp_composer_control_response_cursor(response, input_editable);
                     let footer_rect = capsule_content_rects.footer_rect;
                     capsule_ui.allocate_rect(footer_rect, Sense::hover());
-                    let visible_mode_label = acp_mode_ui_label(&active_mode);
+                    let visible_mode_label = if is_claude { None } else { acp_mode_ui_label(&active_mode) };
                     let show_plan_pill = visible_mode_label.is_some();
-                    let model_label =
-                        acp_composer_model_label(session, &acp_runtime_defaults, &active_mode);
+                    let model_label = if is_claude {
+                        String::new()
+                    } else {
+                        acp_composer_model_label(session, &acp_runtime_defaults, &active_mode)
+                    };
                     let model_label_width =
                         acp_composer_model_label_width(&capsule_ui, &model_label);
                     let footer_rects = acp_composer_footer_widget_rects(
@@ -25517,6 +25742,7 @@ impl AdeApp {
                         }
                     }
 
+                    if !is_claude {
                     let mut selected_model = session
                         .config_option("model")
                         .map(|o| o.current_value.clone())
@@ -25681,6 +25907,7 @@ impl AdeApp {
                     if action_controls_enabled && selected_effort != current_effort {
                         Self::ensure_acp_config_option_value(session, "effort", &selected_effort);
                     }
+                    } // !is_claude
 
                     let plain_enter = ui.input(|i| {
                         i.events.iter().any(|e| {
@@ -26016,7 +26243,7 @@ impl AdeApp {
                             .unwrap_or_else(|| {
                                 acp_runtime_defaults.desired_model_for_mode(&active_mode)
                             });
-                        if opencode_model_has_kimi_loop_risk(model) {
+                        if !session.is_claude_code() && opencode_model_has_kimi_loop_risk(model) {
                             status_ui.add_space(8.0);
                             let (label, color) = if self.config.opencode.loop_protection_enabled {
                                 ("Kimi protected", Color32::from_rgb(100, 195, 140))
@@ -37828,12 +38055,17 @@ fn foreground_launcher_menu_content_height(total_rows: usize) -> f32 {
     }
 }
 
-fn foreground_launcher_menu_total_height(launcher_count: usize) -> f32 {
-    let total_rows = if launcher_count == 0 {
-        2 // OpenCode ACP + hint row
+fn foreground_launcher_menu_total_rows(launcher_count: usize) -> usize {
+    let builtin_rows = 2; // OpenCode ACP + Claude Code
+    if launcher_count == 0 {
+        builtin_rows + 1 // hint row
     } else {
-        launcher_count + 1 // OpenCode ACP + launchers
-    };
+        builtin_rows + launcher_count
+    }
+}
+
+fn foreground_launcher_menu_total_height(launcher_count: usize) -> f32 {
+    let total_rows = foreground_launcher_menu_total_rows(launcher_count);
     FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0 + foreground_launcher_menu_content_height(total_rows)
 }
 
@@ -37904,6 +38136,46 @@ fn draw_launcher_menu_contents(
     }
     if row_response.clicked() {
         selected_action = Some(ForegroundLauncherAction::OpenCodeChat);
+        ui.memory_mut(|mem| mem.close_popup());
+        ui.close_menu();
+    }
+
+    // Synthetic Claude Code ACP row (always shown, non-persisted)
+    ui.add_space(FOREGROUND_LAUNCHER_ROW_GAP);
+    let full_row_rect =
+        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
+    let row_rect = full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
+    let row_hovered = ui.rect_contains_pointer(row_rect);
+    ui.painter().rect_filled(row_rect, 6.0, SURFACE_BG_SOFT);
+
+    let inner_response = ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(row_rect)
+            .layout(Layout::left_to_right(Align::Center))
+            .sense(Sense::click()),
+        |ui| {
+            ui.add_space(6.0);
+            let _ =
+                app.draw_launcher_icon_with_hover(ui, LauncherIconKey::Claude, 16.0, row_hovered);
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(RichText::new("Claude Code").strong().color(if row_hovered {
+                    ACCENT
+                } else {
+                    TEXT_PRIMARY
+                }))
+                .selectable(false)
+                .truncate(),
+            );
+            ui.response()
+        },
+    );
+    let row_response = inner_response.inner;
+    if row_hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if row_response.clicked() {
+        selected_action = Some(ForegroundLauncherAction::ClaudeCodeChat);
         ui.memory_mut(|mem| mem.close_popup());
         ui.close_menu();
     }
@@ -43385,7 +43657,7 @@ mod tests {
         let hover_output = draw_foreground_launcher_menu_in_test_ui(
             &ctx,
             RawInput {
-                events: vec![Event::PointerMoved(pos2(60.0, 40.0))],
+                events: vec![Event::PointerMoved(pos2(60.0, 68.0))],
                 ..RawInput::default()
             },
             &launchers,
@@ -43693,11 +43965,7 @@ mod tests {
         output: &egui::FullOutput,
         launcher_count: usize,
     ) {
-        let expected_row_count = if launcher_count == 0 {
-            2 // OpenCode ACP + hint
-        } else {
-            launcher_count + 1 // OpenCode ACP + launchers
-        };
+        let expected_row_count = super::foreground_launcher_menu_total_rows(launcher_count);
         let expected_frame_height = super::foreground_launcher_menu_total_height(launcher_count);
         let frame_rect = collect_rects_matching(output, |rect_shape| {
             rect_shape.fill == super::SURFACE_BG
@@ -54824,7 +55092,17 @@ mod tests {
             "PowerShell command should clear ANTHROPIC_AUTH_TOKEN"
         );
         assert!(
-            cmd.contains("& \"$env:APPDATA\\npm\\claude.cmd\""),
+            cmd.contains(
+                "$env:ANTHROPIC_BASE_URL='https://token-plan-sgp.xiaomimimo.com/anthropic'"
+            ),
+            "PowerShell command should set the Mimo Claude base URL"
+        );
+        assert!(
+            cmd.contains("$env:ANTHROPIC_MODEL='mimo-v2.5-pro'"),
+            "PowerShell command should set the Mimo Claude model"
+        );
+        assert!(
+            cmd.contains("& \"$env:APPDATA\\npm\\claude.cmd\" --permission-mode bypassPermissions"),
             "PowerShell command should invoke real claude.cmd"
         );
     }
@@ -54837,7 +55115,15 @@ mod tests {
             "CMD command should clear ANTHROPIC_AUTH_TOKEN"
         );
         assert!(
-            cmd.contains("\"%APPDATA%\\npm\\claude.cmd\""),
+            cmd.contains("set ANTHROPIC_BASE_URL=https://token-plan-sgp.xiaomimimo.com/anthropic"),
+            "CMD command should set the Mimo Claude base URL"
+        );
+        assert!(
+            cmd.contains("set ANTHROPIC_MODEL=mimo-v2.5-pro"),
+            "CMD command should set the Mimo Claude model"
+        );
+        assert!(
+            cmd.contains("\"%APPDATA%\\npm\\claude.cmd\" --permission-mode bypassPermissions"),
             "CMD command should invoke real claude.cmd"
         );
     }
