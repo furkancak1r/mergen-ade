@@ -1,5 +1,24 @@
-  
-  
+#### Project-local Claude settings override forced Fireworks/Kimi despite Mimo env {#claude-project-local-settings-override}
+- Date: 2026-06-11
+- Context: User reported that launching Claude Code from the foreground launcher still opened as Kimi even though the launch command exported Mimo Anthropic env vars.
+- Error signature:
+  1. Global `~/.claude/settings.json` pointed to Mimo and `mimo-key-helper.cmd`.
+  2. The selected project had `.claude/settings.local.json` with `apiKeyHelper` pointing to `fireworks-firepass-key-helper.cmd`, Fireworks base URL, and Kimi model overrides.
+  3. Claude Code loaded the project-local settings after the global settings, so the local Fireworks/Kimi values won.
+- Symptoms/Impact:
+  - Claude Code startup failed with a missing Fireworks helper error.
+  - Foreground Claude sessions in that project used Kimi/Fireworks config instead of Mimo.
+- Root cause:
+  - Mergen repaired only global Claude settings before launching Claude Code and ignored existing project-local `.claude/settings.local.json` overrides.
+- Resolution:
+  - Added project-local Claude settings repair for existing `project/.claude/settings.local.json` files.
+  - Updated the foreground Claude launcher path to repair both global and selected-project local settings before submitting the launch command.
+  - Repaired the current ignored `.claude/settings.local.json` to Mimo and removed stale Emdash hooks.
+- Prevent recurrence:
+  - Added regression tests for missing local settings, local Fireworks/Kimi override repair, permission preservation, and stale hook cleanup.
+- Files/Commands touched: `src/claude_settings.rs`, `src/app.rs`, `.claude/settings.local.json`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-06-11
+
 ---
 
 #### Smart Input queue stuck on ACP stderr error and Claude fresh session not dispatching {#smart-input-queue-acp-claude-dispatch}

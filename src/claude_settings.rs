@@ -58,28 +58,40 @@ pub fn repair_user_claude_settings() -> io::Result<ClaudeSettingsRepairOutcome> 
     let path = home_dir.join(".claude").join("settings.json");
     let outcome = repair_claude_settings_file_with_helper(&path, &helper_path)?;
 
-    match (outcome, helper_updated) {
-        (
-            ClaudeSettingsRepairOutcome::Unchanged { path }
-            | ClaudeSettingsRepairOutcome::Missing { path },
-            true,
-        ) => Ok(ClaudeSettingsRepairOutcome::Updated {
-            path,
-            backup_path: None,
-            helper_path: Some(helper_path),
-        }),
-        (
-            ClaudeSettingsRepairOutcome::Updated {
-                path, backup_path, ..
-            },
-            true,
-        ) => Ok(ClaudeSettingsRepairOutcome::Updated {
-            path,
-            backup_path,
-            helper_path: Some(helper_path),
-        }),
-        (other, false) => Ok(other),
+    Ok(merge_helper_update_outcome(
+        outcome,
+        helper_updated,
+        helper_path,
+    ))
+}
+
+pub fn project_claude_settings_path(project_path: &Path) -> PathBuf {
+    project_path.join(".claude").join("settings.local.json")
+}
+
+pub fn repair_project_claude_settings(
+    project_path: &Path,
+) -> io::Result<ClaudeSettingsRepairOutcome> {
+    let path = project_claude_settings_path(project_path);
+    if !path.try_exists()? {
+        return Ok(ClaudeSettingsRepairOutcome::Missing { path });
     }
+
+    let base_dirs = BaseDirs::new().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "User home directory is unavailable",
+        )
+    })?;
+    let helper_path = mimo_key_helper_path_for_home(base_dirs.home_dir());
+    let helper_updated = ensure_mimo_key_helper(&helper_path)?;
+    let outcome = repair_project_claude_settings_with_helper(project_path, &helper_path)?;
+
+    Ok(merge_helper_update_outcome(
+        outcome,
+        helper_updated,
+        helper_path,
+    ))
 }
 
 pub fn repair_claude_settings_file(path: &Path) -> io::Result<ClaudeSettingsRepairOutcome> {
@@ -88,6 +100,46 @@ pub fn repair_claude_settings_file(path: &Path) -> io::Result<ClaudeSettingsRepa
         .map(|claude_dir| claude_dir.join("bin").join(MIMO_KEY_HELPER_FILE_NAME))
         .unwrap_or_else(|| PathBuf::from(MIMO_KEY_HELPER_FILE_NAME));
     repair_claude_settings_file_with_helper(path, &helper_path)
+}
+
+fn repair_project_claude_settings_with_helper(
+    project_path: &Path,
+    helper_path: &Path,
+) -> io::Result<ClaudeSettingsRepairOutcome> {
+    let path = project_claude_settings_path(project_path);
+    if !path.try_exists()? {
+        return Ok(ClaudeSettingsRepairOutcome::Missing { path });
+    }
+    repair_claude_settings_file_with_helper(&path, helper_path)
+}
+
+fn merge_helper_update_outcome(
+    outcome: ClaudeSettingsRepairOutcome,
+    helper_updated: bool,
+    helper_path: PathBuf,
+) -> ClaudeSettingsRepairOutcome {
+    match (outcome, helper_updated) {
+        (
+            ClaudeSettingsRepairOutcome::Unchanged { path }
+            | ClaudeSettingsRepairOutcome::Missing { path },
+            true,
+        ) => ClaudeSettingsRepairOutcome::Updated {
+            path,
+            backup_path: None,
+            helper_path: Some(helper_path),
+        },
+        (
+            ClaudeSettingsRepairOutcome::Updated {
+                path, backup_path, ..
+            },
+            true,
+        ) => ClaudeSettingsRepairOutcome::Updated {
+            path,
+            backup_path,
+            helper_path: Some(helper_path),
+        },
+        (other, false) => other,
+    }
 }
 
 fn repair_claude_settings_file_with_helper(
@@ -504,5 +556,109 @@ mod tests {
         );
         assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "mimo-v2.5-pro");
         assert_eq!(settings["env"]["CUSTOM_ENV"], "preserved");
+    }
+
+    fn unique_temp_project(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mergen-ade-claude-settings-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        path
+    }
+
+    #[test]
+    fn repair_project_settings_missing_does_not_create_file() {
+        let project_path = unique_temp_project("missing");
+        let settings_path = project_claude_settings_path(&project_path);
+
+        let outcome =
+            repair_project_claude_settings_with_helper(&project_path, &helper_path()).unwrap();
+
+        assert_eq!(
+            outcome,
+            ClaudeSettingsRepairOutcome::Missing {
+                path: settings_path.clone()
+            }
+        );
+        assert!(!settings_path.exists());
+        assert!(!project_path.join(".claude").exists());
+    }
+
+    #[test]
+    fn repair_project_settings_updates_local_kimi_override_to_mimo() {
+        let project_path = unique_temp_project("local-kimi");
+        let settings_path = project_claude_settings_path(&project_path);
+        fs::create_dir_all(settings_path.parent().expect("settings parent")).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "apiKeyHelper": "C:/Users/example/.claude/bin/fireworks-firepass-key-helper.cmd",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.fireworks.ai/inference",
+    "ANTHROPIC_MODEL": "accounts/fireworks/routers/kimi-k2p6-turbo",
+    "ANTHROPIC_SMALL_FAST_MODEL": "accounts/fireworks/routers/kimi-k2p6-turbo",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "accounts/fireworks/routers/kimi-k2p6-turbo",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "accounts/fireworks/routers/kimi-k2p6-turbo",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "accounts/fireworks/routers/kimi-k2p6-turbo",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "accounts/fireworks/routers/kimi-k2p6-turbo",
+    "DISABLE_AUTOUPDATER": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"src\" -Filter \"*.rs\")"
+    ]
+  },
+  "model": "accounts/fireworks/routers/kimi-k2p6-turbo",
+  "hooks": {
+    "Notification": [{
+      "hooks": [{
+        "type": "command",
+        "command": "cmd.exe /d /c \"echo EMDASH_HOOK_PORT >NUL\""
+      }]
+    }]
+  }
+}"#,
+        )
+        .unwrap();
+
+        let outcome =
+            repair_project_claude_settings_with_helper(&project_path, &helper_path()).unwrap();
+
+        let ClaudeSettingsRepairOutcome::Updated {
+            backup_path: Some(backup_path),
+            ..
+        } = outcome
+        else {
+            panic!("expected project-local settings to be updated");
+        };
+        assert!(backup_path.exists());
+
+        let repaired =
+            serde_json::from_str::<JsonValue>(&fs::read_to_string(&settings_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            repaired["apiKeyHelper"],
+            "C:/Users/example/.claude/bin/mimo-key-helper.cmd"
+        );
+        assert_eq!(repaired["model"], "mimo-v2.5-pro");
+        assert_eq!(
+            repaired["env"]["ANTHROPIC_BASE_URL"],
+            "https://token-plan-sgp.xiaomimimo.com/anthropic"
+        );
+        assert_eq!(repaired["env"]["ANTHROPIC_MODEL"], "mimo-v2.5-pro");
+        assert_eq!(repaired["env"]["DISABLE_UPDATES"], "1");
+        assert_eq!(
+            repaired["permissions"]["allow"][0],
+            "Bash(Get-ChildItem -Path \"src\" -Filter \"*.rs\")"
+        );
+        assert!(repaired["hooks"].get("Notification").is_none());
+
+        let _ = fs::remove_dir_all(&project_path);
     }
 }

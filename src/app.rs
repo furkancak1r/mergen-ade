@@ -7572,37 +7572,47 @@ impl AdeApp {
                     let _ = self.mark_opencode_launch_pending(terminal_id, baseline);
                 }
                 Some(BuiltinLauncherKind::Claude) => {
-                    match Self::repair_claude_settings_before_launch() {
-                        Ok(crate::claude_settings::ClaudeSettingsRepairOutcome::Updated {
-                            path,
-                            backup_path,
-                            helper_path,
-                        }) => {
-                            log::info!(
-                                "Repaired Claude settings before launch: {} (backup: {}, helper: {})",
-                                path.display(),
-                                backup_path
-                                    .as_ref()
-                                    .map(|path| path.display().to_string())
-                                    .unwrap_or_else(|| "none".to_owned()),
-                                helper_path
-                                    .as_ref()
-                                    .map(|path| path.display().to_string())
-                                    .unwrap_or_else(|| "unchanged".to_owned())
-                            );
-                            launcher_status_note = Some("Claude settings repaired".to_owned());
+                    match Self::repair_claude_settings_before_launch(&project.path) {
+                        Ok(outcomes) => {
+                            let mut repaired_any = false;
+                            for outcome in outcomes {
+                                match outcome {
+                                    crate::claude_settings::ClaudeSettingsRepairOutcome::Updated {
+                                        path,
+                                        backup_path,
+                                        helper_path,
+                                    } => {
+                                        log::info!(
+                                            "Repaired Claude settings before launch: {} (backup: {}, helper: {})",
+                                            path.display(),
+                                            backup_path
+                                                .as_ref()
+                                                .map(|path| path.display().to_string())
+                                                .unwrap_or_else(|| "none".to_owned()),
+                                            helper_path
+                                                .as_ref()
+                                                .map(|path| path.display().to_string())
+                                                .unwrap_or_else(|| "unchanged".to_owned())
+                                        );
+                                        repaired_any = true;
+                                    }
+                                    crate::claude_settings::ClaudeSettingsRepairOutcome::Missing {
+                                        path,
+                                    } => {
+                                        log::debug!(
+                                            "Claude settings file not found before launch: {}",
+                                            path.display()
+                                        );
+                                    }
+                                    crate::claude_settings::ClaudeSettingsRepairOutcome::Unchanged {
+                                        ..
+                                    } => {}
+                                }
+                            }
+                            if repaired_any {
+                                launcher_status_note = Some("Claude settings repaired".to_owned());
+                            }
                         }
-                        Ok(crate::claude_settings::ClaudeSettingsRepairOutcome::Missing {
-                            path,
-                        }) => {
-                            log::debug!(
-                                "Claude settings file not found before launch: {}",
-                                path.display()
-                            );
-                        }
-                        Ok(crate::claude_settings::ClaudeSettingsRepairOutcome::Unchanged {
-                            ..
-                        }) => {}
                         Err(err) => {
                             log::warn!("Claude settings repair failed before launch: {err}");
                             launcher_status_note = Some("Claude settings repair failed".to_owned());
@@ -7660,18 +7670,23 @@ impl AdeApp {
 
     #[cfg(not(test))]
     fn repair_claude_settings_before_launch(
-    ) -> std::io::Result<crate::claude_settings::ClaudeSettingsRepairOutcome> {
-        crate::claude_settings::repair_user_claude_settings()
+        project_path: &Path,
+    ) -> std::io::Result<Vec<crate::claude_settings::ClaudeSettingsRepairOutcome>> {
+        Ok(vec![
+            crate::claude_settings::repair_user_claude_settings()?,
+            crate::claude_settings::repair_project_claude_settings(project_path)?,
+        ])
     }
 
     #[cfg(test)]
     fn repair_claude_settings_before_launch(
-    ) -> std::io::Result<crate::claude_settings::ClaudeSettingsRepairOutcome> {
-        Ok(
+        _project_path: &Path,
+    ) -> std::io::Result<Vec<crate::claude_settings::ClaudeSettingsRepairOutcome>> {
+        Ok(vec![
             crate::claude_settings::ClaudeSettingsRepairOutcome::Unchanged {
                 path: PathBuf::from("test-claude-settings.json"),
             },
-        )
+        ])
     }
 
     fn codex_notify_inbox_path_for_dir(dir: &Path, terminal_id: u64, inbox_token: &str) -> PathBuf {
