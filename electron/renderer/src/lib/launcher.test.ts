@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BuiltinLauncherKind, defaultLaunchers, LauncherIconKey, ShellKind } from '../../../shared/types';
+import { BuiltinLauncherKind, BuiltinLauncherKindDefaultLaunchCommand, defaultLaunchers, LauncherIconKey, ShellKind } from '../../../shared/types';
 import {
   claudeCommandWithBypassPermissions,
   effectiveLauncherCommand,
@@ -8,6 +8,8 @@ import {
 } from './launcher';
 
 describe('launcher helpers', () => {
+  const defaultClaudeCommand = BuiltinLauncherKindDefaultLaunchCommand(BuiltinLauncherKind.Claude);
+
   it('marks the Claude builtin launcher as bypass-enabled by default', () => {
     const launchers = defaultLaunchers();
     expect(launchers.find((launcher) => launcher.builtin === BuiltinLauncherKind.Claude)?.bypassPermissions).toBe(true);
@@ -20,11 +22,11 @@ describe('launcher helpers', () => {
     expect(launcherBypassPermissionsEffective({ ...claude!, bypassPermissions: false })).toBe(true);
   });
 
-  it('clears Anthropic env and preserves configured aliases for PowerShell Claude launchers', () => {
+  it('clears Anthropic env and bypasses legacy aliases for PowerShell Claude launchers', () => {
     const cmd = sanitizedClaudeLaunchCommand(ShellKind.PowerShell, 'cc');
     expect(cmd).toContain('Remove-Item Env:ANTHROPIC_AUTH_TOKEN');
-    expect(cmd).toMatch(/; cc --permission-mode bypassPermissions$/);
-    expect(cmd).not.toContain('claude.cmd');
+    expect(cmd.endsWith(`; ${defaultClaudeCommand} --permission-mode bypassPermissions`)).toBe(true);
+    expect(cmd).not.toMatch(/;\s*cc\s/);
   });
 
   it('uses the PowerShell call operator for quoted Claude executable paths', () => {
@@ -32,34 +34,34 @@ describe('launcher helpers', () => {
     expect(cmd).toMatch(/; & "C:\\Program Files\\Claude\\claude\.cmd" --permission-mode bypassPermissions$/);
   });
 
-  it('clears Anthropic env and preserves configured aliases for CMD Claude launchers', () => {
+  it('clears Anthropic env and bypasses legacy aliases for CMD Claude launchers', () => {
     const cmd = sanitizedClaudeLaunchCommand(ShellKind.Cmd, 'cc');
     expect(cmd).toContain('set ANTHROPIC_AUTH_TOKEN=');
-    expect(cmd).toMatch(/& cc --permission-mode bypassPermissions$/);
-    expect(cmd).not.toContain('claude.cmd');
+    expect(cmd.endsWith(`& ${defaultClaudeCommand} --permission-mode bypassPermissions`)).toBe(true);
+    expect(cmd).not.toMatch(/&\s*cc\s/);
   });
 
   it('appends bypass permission mode for zsh Claude launchers', () => {
-    expect(sanitizedClaudeLaunchCommand(ShellKind.Zsh, 'cc')).toBe('cc --permission-mode bypassPermissions');
+    expect(sanitizedClaudeLaunchCommand(ShellKind.Zsh, 'cc')).toBe(`${defaultClaudeCommand} --permission-mode bypassPermissions`);
   });
 
   it('defaults to claude when the configured Claude command is empty', () => {
-    expect(sanitizedClaudeLaunchCommand(ShellKind.Zsh, '  ')).toBe('claude --permission-mode bypassPermissions');
+    expect(sanitizedClaudeLaunchCommand(ShellKind.Zsh, '  ')).toBe(`${defaultClaudeCommand} --permission-mode bypassPermissions`);
   });
 
   it('does not duplicate an existing bypass permission mode', () => {
     const cmd = claudeCommandWithBypassPermissions('cc --permission-mode bypassPermissions');
-    expect(cmd).toBe('cc --permission-mode bypassPermissions');
+    expect(cmd).toBe(`${defaultClaudeCommand} --permission-mode bypassPermissions`);
     expect(cmd.match(/--permission-mode/g)).toHaveLength(1);
   });
 
   it('replaces non-bypass permission mode values', () => {
-    expect(claudeCommandWithBypassPermissions('cc --permission-mode ask')).toBe('cc --permission-mode bypassPermissions');
-    expect(claudeCommandWithBypassPermissions('cc --permission-mode=default')).toBe('cc --permission-mode=bypassPermissions');
+    expect(claudeCommandWithBypassPermissions('cc --permission-mode ask')).toBe(`${defaultClaudeCommand} --permission-mode bypassPermissions`);
+    expect(claudeCommandWithBypassPermissions('cc --permission-mode=default')).toBe(`${defaultClaudeCommand} --permission-mode=bypassPermissions`);
   });
 
   it('preserves dangerous skip permissions because it already requests bypass behavior', () => {
-    expect(claudeCommandWithBypassPermissions('cc --dangerously-skip-permissions')).toBe('cc --dangerously-skip-permissions');
+    expect(claudeCommandWithBypassPermissions('cc --dangerously-skip-permissions')).toBe(`${defaultClaudeCommand} --dangerously-skip-permissions`);
   });
 
   it('only rewrites built-in Claude launchers when computing the effective command', () => {
@@ -73,6 +75,6 @@ describe('launcher helpers', () => {
     };
     const claude = { ...custom, builtin: BuiltinLauncherKind.Claude };
     expect(effectiveLauncherCommand(custom, ShellKind.Zsh)).toBe('cc');
-    expect(effectiveLauncherCommand(claude, ShellKind.Zsh)).toBe('cc --permission-mode bypassPermissions');
+    expect(effectiveLauncherCommand(claude, ShellKind.Zsh)).toBe(`${defaultClaudeCommand} --permission-mode bypassPermissions`);
   });
 });

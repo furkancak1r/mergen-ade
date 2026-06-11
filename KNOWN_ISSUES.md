@@ -5791,3 +5791,28 @@
   - Keep ACP row chrome tied to the shared Terminal Manager row chrome helper instead of introducing ACP-specific callout styling.
 - Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
 - References: Original Rust `terminal_manager_row_chrome()` and ACP row rendering around `terminal_manager_acp_row_select`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude/OpenCode varsayilanlari eski cc ve Kimi ayarlarini kullaniyordu {#electron-claude-opencode-mimo-config-parity}
+- Date: 2026-06-11
+- Context: Rust tarafinda Claude Code gercek npm `claude.cmd` komutuna, OpenCode build varsayilani da Mimo modeline tasindi. Electron worktree ayni davranisi henuz tasimiyordu.
+- Error signature:
+  1. Electron config normalizasyonu eski Claude `cc` launcher alias'ini koruyabiliyordu.
+  2. OpenCode build varsayilani ve eski Kimi K2.6 migrasyonu Mimo'ya gecmiyordu.
+  3. Electron OpenCode runtime/terminal config uretimi Mimo provider bilgilerini yazmiyor, model bos kalinca `sonnet` kullanabiliyordu.
+- Symptoms/Impact:
+  - Claude Code acilinca eski shell wrapper/env ayarlari devreye girebiliyor ve Mimo/key akisi bozulabiliyordu.
+  - OpenCode build modu Electron tarafinda Rust ile ayni Mimo varsayilanini ve provider env ayarini kullanmiyordu.
+- Root cause:
+  - Electron shared config ve renderer launcher helper'lari Rust'taki yeni Claude launcher sanitization/migration davranisindan ayrismisti.
+  - OpenCode config generator yalnizca temel agent/mode alanlarini yaziyor, provider injection yapmiyordu.
+- Resolution:
+  - Added shared Claude launch command normalization and migrated legacy `cc`, `cc.cmd`, bare `claude`, and `claude.ps1` to the platform default Claude CLI command while preserving explicit custom `claude.cmd` paths.
+  - Changed Electron OpenCode build default to `mimo/mimo-v2.5-pro` and migrated old Kimi K2.5/K2.6 slot A values to Mimo.
+  - Wrote Mimo provider metadata (`MIMO_API_KEY`, Mimo base URL, model id/name) into generated OpenCode terminal/runtime configs.
+  - Updated Electron Settings placeholder so new launchers do not suggest `cc`.
+- Prevent recurrence:
+  - Keep Electron launcher/model defaults and migrations aligned with Rust `models.rs`, `config.rs`, and `opencode_config.rs` whenever AI CLI defaults change.
+- Files/Commands touched: `electron/shared/types.ts`, `electron/main/config.ts`, `electron/main/opencode.ts`, `electron/renderer/src/lib/launcher.ts`, `electron/renderer/src/components/SettingsPopup.tsx`, `electron/main/config.test.ts`, `electron/main/opencode.test.ts`, `electron/renderer/src/lib/launcher.test.ts`, `.agents/claude-code.md`, `AGENTS.md`, `.gitignore`, `KNOWN_ISSUES.md`
+- References: Rust Mimo/Claude launcher parity update, Electron parity goal 2026-06-11

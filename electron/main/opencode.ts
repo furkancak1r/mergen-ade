@@ -1,9 +1,15 @@
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import { DEFAULT_OPENCODE_BUILD_MODEL } from '../shared/types';
 import { getHookServicePort, getHookInboxDir } from './hookService';
 
 // OpenCode process detection and plugin lifecycle
+const MIMO_PROVIDER_ID = 'mimo';
+const MIMO_MODEL_ID = 'mimo-v2.5-pro';
+const MIMO_MODEL_NAME = 'Mimo v2.5 Pro';
+const MIMO_BASE_URL = 'https://token-plan-sgp.xiaomimimo.com/v1';
+
 const OPENCODE_PLUGIN_DIR = () => {
   const appData = process.env.APPDATA || path.join(require('os').homedir(), 'AppData', 'Roaming');
   return path.join(appData, 'Mergen', 'MergenADE', 'runtime', 'opencode');
@@ -219,6 +225,35 @@ function getOpencodeGlobalConfigPath(): string {
   return path.join(dir, 'opencode.json');
 }
 
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+
+function addMimoProvider(config: Record<string, unknown>, model: string): void {
+  if (!model.trim().startsWith(`${MIMO_PROVIDER_ID}/`)) return;
+
+  const provider = asRecord(config.provider) ?? {};
+  config.provider = provider;
+
+  const mimoProvider = asRecord(provider[MIMO_PROVIDER_ID]) ?? {};
+  provider[MIMO_PROVIDER_ID] = mimoProvider;
+
+  const models = asRecord(mimoProvider.models) ?? {};
+  mimoProvider.models = models;
+  models[MIMO_MODEL_ID] = {
+    ...(asRecord(models[MIMO_MODEL_ID]) ?? {}),
+    id: MIMO_MODEL_ID,
+    name: MIMO_MODEL_NAME,
+  };
+
+  mimoProvider.options = {
+    ...(asRecord(mimoProvider.options) ?? {}),
+    apiKey: '{env:MIMO_API_KEY}',
+    baseURL: MIMO_BASE_URL,
+  };
+}
+
 export function generateOpencodeRuntimeConfig(cwd: string, opts: {
   model?: string;
   effort?: string;
@@ -252,20 +287,22 @@ export function generateOpencodeRuntimeConfig(cwd: string, opts: {
     : opts.kimiStrictPermissions === false
       ? { '*': 'allow', 'edit': 'allow', 'task/external_directory': 'allow', 'bash': 'allow' }
       : undefined;
+  const model = opts.model?.trim() || DEFAULT_OPENCODE_BUILD_MODEL;
 
   const config: Record<string, unknown> = {
     agent: {
       build: {
-        model: opts.model || 'sonnet',
+        model,
       },
     },
     mode: {
       build: {
-        model: opts.model || 'sonnet',
+        model,
       },
     },
     mcpServers,
   };
+  addMimoProvider(config, model);
 
   if (permission) {
     (config.agent as Record<string, unknown>).build = {
@@ -296,21 +333,23 @@ export function generateOpencodeTerminalConfig(cwd: string, opts: {
   const permission: Record<string, string> = opts.kimiStrictPermissions
     ? { '*': 'ask', 'edit': 'ask', 'task/external_directory': 'deny', 'bash': 'ask' }
     : { '*': 'allow', 'edit': 'allow', 'task/external_directory': 'allow', 'bash': 'allow' };
+  const model = opts.model?.trim() || DEFAULT_OPENCODE_BUILD_MODEL;
 
-  const config = {
+  const config: Record<string, unknown> = {
     agent: {
       build: {
-        model: opts.model || 'sonnet',
+        model,
         permission,
       },
     },
     mode: {
       build: {
-        model: opts.model || 'sonnet',
+        model,
         permission,
       },
     },
   };
+  addMimoProvider(config, model);
 
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
   return configPath;

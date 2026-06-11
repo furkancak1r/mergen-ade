@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { defaultAppConfig } from '../shared/types';
+import { BuiltinLauncherKind, BuiltinLauncherKindDefaultLaunchCommand, DEFAULT_OPENCODE_BUILD_MODEL, defaultAppConfig } from '../shared/types';
 import { configPath, loadConfig } from './config';
 
 const originalAppData = process.env.APPDATA;
@@ -51,5 +51,32 @@ describe('config normalization', () => {
     writeConfigJson(config);
 
     expect(loadConfig().claudeCodeCodexHookEnabled).toBe(false);
+  });
+
+  it('migrates the legacy Claude cc launcher to the real Claude CLI command', () => {
+    const config = defaultAppConfig();
+    const claude = config.launchers.find((entry) => entry.builtin === BuiltinLauncherKind.Claude);
+    expect(claude).toBeDefined();
+    claude!.launchCommand = 'cc';
+    writeConfigJson(config as unknown as Record<string, unknown>);
+
+    const loadedClaude = loadConfig().launchers.find((entry) => entry.builtin === BuiltinLauncherKind.Claude);
+    expect(loadedClaude?.launchCommand).toBe(BuiltinLauncherKindDefaultLaunchCommand(BuiltinLauncherKind.Claude));
+  });
+
+  it('migrates the old Kimi K2.5 OpenCode build default to Mimo', () => {
+    const config = defaultAppConfig();
+    config.opencode.buildModelSlotA = 'fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo';
+    writeConfigJson(config as unknown as Record<string, unknown>);
+
+    expect(loadConfig().opencode.buildModelSlotA).toBe(DEFAULT_OPENCODE_BUILD_MODEL);
+  });
+
+  it('migrates the old Kimi K2.6 OpenCode build default to Mimo', () => {
+    const config = defaultAppConfig();
+    config.opencode.buildModelSlotA = 'fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo';
+    writeConfigJson(config as unknown as Record<string, unknown>);
+
+    expect(loadConfig().opencode.buildModelSlotA).toBe(DEFAULT_OPENCODE_BUILD_MODEL);
   });
 });

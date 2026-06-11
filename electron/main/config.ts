@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import { parse as parseToml } from '@iarna/toml';
 import type { AppConfig, AppHistory, ProjectRecord, TerminalShortcutEntry, LauncherEntry } from '../shared/types';
-import { BuiltinLauncherKind, LauncherIconKey, ShellKind, AcpStartupMode, defaultAppConfig, defaultTerminalShortcuts, defaultLaunchers, defaultOpenCodeModelConfig, defaultAcpModeToggleShortcut, defaultOsNotificationConfig, APP_CONFIG_VERSION, DEFAULT_OPENCODE_BUILD_MODEL, DEFAULT_OPENCODE_PLAN_MODEL, DEFAULT_OPENCODE_PLAN_EFFORT, ensureConfiguredModelsAreFavorites } from '../shared/types';
+import { BuiltinLauncherKind, BuiltinLauncherKindDefaultDisplayName, LauncherIconKey, ShellKind, AcpStartupMode, defaultAppConfig, defaultTerminalShortcuts, defaultLaunchers, defaultOpenCodeModelConfig, defaultAcpModeToggleShortcut, defaultOsNotificationConfig, APP_CONFIG_VERSION, DEFAULT_OPENCODE_BUILD_MODEL, DEFAULT_OPENCODE_PLAN_MODEL, DEFAULT_OPENCODE_PLAN_EFFORT, ensureConfiguredModelsAreFavorites, normalizeBuiltinLaunchCommand } from '../shared/types';
 
 const QUALIFIER = 'com';
 const ORGANIZATION = 'Mergen';
@@ -206,7 +206,10 @@ function normalizeConfig(config: AppConfig): AppConfig {
     config.opencode = defaultOpenCodeModelConfig();
     changed = true;
   }
-  if (config.opencode.buildModelSlotA === 'fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo') {
+  if (
+    config.opencode.buildModelSlotA === 'fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo'
+    || config.opencode.buildModelSlotA === 'fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo'
+  ) {
     config.opencode.buildModelSlotA = DEFAULT_OPENCODE_BUILD_MODEL;
     changed = true;
   }
@@ -325,8 +328,8 @@ function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
       normalized.push({
         id: builtin,
         builtin,
-        displayName: existing.displayName?.trim() || builtin.charAt(0).toUpperCase() + builtin.slice(1),
-        launchCommand: existing.launchCommand?.trim() || builtin,
+        displayName: existing.displayName?.trim() || BuiltinLauncherKindDefaultDisplayName(builtin),
+        launchCommand: normalizeBuiltinLaunchCommand(builtin, existing.launchCommand ?? ''),
         enabled: existing.enabled,
         iconKey: (() => {
           switch (builtin) {
@@ -342,8 +345,8 @@ function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
       normalized.push({
         id: builtin,
         builtin,
-        displayName: builtin.charAt(0).toUpperCase() + builtin.slice(1),
-        launchCommand: builtin,
+        displayName: BuiltinLauncherKindDefaultDisplayName(builtin),
+        launchCommand: normalizeBuiltinLaunchCommand(builtin, ''),
         enabled: true,
         iconKey: (() => {
           switch (builtin) {

@@ -11193,9 +11193,10 @@ impl AdeApp {
             return;
         }
         let now = Instant::now();
-        if entry.opencode_last_thought_sample_at.is_some_and(|last| {
-            last.elapsed() < Duration::from_millis(THOUGHT_SAMPLE_INTERVAL_MS)
-        }) {
+        if entry
+            .opencode_last_thought_sample_at
+            .is_some_and(|last| last.elapsed() < Duration::from_millis(THOUGHT_SAMPLE_INTERVAL_MS))
+        {
             return;
         }
         let Some(sample) = extract_thought_window(&entry.render_cache) else {
@@ -11203,16 +11204,11 @@ impl AdeApp {
         };
         entry.opencode_last_thought_sample_at = Some(now);
         push_thought_sample(&mut entry.opencode_thought_samples, sample);
-        let samples: Vec<String> = entry
-            .opencode_thought_samples
-            .iter()
-            .cloned()
-            .collect();
+        let samples: Vec<String> = entry.opencode_thought_samples.iter().cloned().collect();
         let repetitive = detect_repetitive_thought_pattern(&samples);
         if repetitive {
             entry.opencode_thought_loop_blocked = true;
-            self.status_line =
-                "Smart Input bekliyor: Kimi düşünme döngüsü algılandı".to_owned();
+            self.status_line = "Smart Input bekliyor: Kimi düşünme döngüsü algılandı".to_owned();
         } else if entry.opencode_thought_loop_blocked && thought_loop_cleared(&samples) {
             entry.opencode_thought_loop_blocked = false;
         }
@@ -14385,7 +14381,8 @@ impl AdeApp {
                         }
                         Key::Space if !custom_focused => {
                             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                                let changed = Self::select_focused_opencode_question_choice(terminal);
+                                let changed =
+                                    Self::select_focused_opencode_question_choice(terminal);
                                 Self::send_opencode_question_terminal_input(terminal, vec![b' ']);
                                 if changed {
                                     ctx.request_repaint();
@@ -18548,16 +18545,16 @@ impl AdeApp {
             .filter_map(|(terminal_id, terminal)| {
                 self.smart_input_auto_dispatch_ready_for_terminal(terminal)
                     .then(|| {
-                    terminal.smart_input.tasks.first().map(|task| {
-                        (
-                            *terminal_id,
-                            task.id,
-                            task.mode,
-                            task.text.clone(),
-                            task.attachments.clone(),
-                        )
+                        terminal.smart_input.tasks.first().map(|task| {
+                            (
+                                *terminal_id,
+                                task.id,
+                                task.mode,
+                                task.text.clone(),
+                                task.attachments.clone(),
+                            )
+                        })
                     })
-                })
             })
             .flatten()
             .collect::<Vec<_>>();
@@ -18682,9 +18679,8 @@ impl AdeApp {
                 rejected: false,
             };
 
-            let send_custom_text = focused_custom
-                && question.custom
-                && !terminal.opencode_question_custom.is_empty();
+            let send_custom_text =
+                focused_custom && question.custom && !terminal.opencode_question_custom.is_empty();
             (answer, send_custom_text)
         };
 
@@ -18768,14 +18764,16 @@ impl AdeApp {
         }
 
         if let Some((task_id, attachments)) = action.send_task_now {
-            let Some((text, task_mode, _)) = self.terminals.get(&terminal_id).and_then(|terminal| {
-                terminal
-                    .smart_input
-                    .tasks
-                    .iter()
-                    .find(|task| task.id == task_id)
-                    .map(|task| (task.text.clone(), task.mode, task.attachments.clone()))
-            }) else {
+            let Some((text, task_mode, _)) =
+                self.terminals.get(&terminal_id).and_then(|terminal| {
+                    terminal
+                        .smart_input
+                        .tasks
+                        .iter()
+                        .find(|task| task.id == task_id)
+                        .map(|task| (task.text.clone(), task.mode, task.attachments.clone()))
+                })
+            else {
                 return;
             };
             if !self.smart_input_prepare_opencode_mode(terminal_id, task_mode) {
@@ -20222,9 +20220,7 @@ impl AdeApp {
                     ui.add_sized(
                         [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                         egui::TextEdit::singleline(&mut self.config.opencode.build_model_slot_a)
-                            .hint_text(
-                                "e.g., fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo",
-                            )
+                            .hint_text("e.g., mimo/mimo-v2.5-pro")
                             .desired_width(ui.available_width().max(0.0))
                             .vertical_align(Align::Center),
                     )
@@ -39944,9 +39940,9 @@ mod tests {
         NativeImagePasteTarget, OpenCodeAttentionReason, OpenCodeQuestionInfo,
         OpenCodeQuestionOption, OpenCodeStatusSource, OpenCodeTransportStatus, OsNotificationKind,
         PendingConfigChanges, PendingOsNotification, PendingRerunPhase, PendingTerminalLinkClick,
-        SettingsSection, SmartInputAttachment, SmartInputMode, SmartInputState, SmartInputSubmitRequest,
-        SmartInputTask, SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
-        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        SettingsSection, SmartInputAttachment, SmartInputMode, SmartInputState,
+        SmartInputSubmitRequest, SmartInputTask, SourceControlBadgeState, SourceControlFile,
+        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
         TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT,
@@ -51520,6 +51516,9 @@ mod tests {
             entry.ai_session.tool = Some(AiCliTool::OpenCode);
             entry.ai_session.status = AiCliStatus::Attention;
             entry.opencode_session_active = true;
+            entry
+                .opencode_last_known_mode
+                .get_or_insert_with(|| "build".to_owned());
             entry.opencode_process_identity = Some(TrackedProcessIdentity {
                 pid: 9001,
                 creation_time: Some(10001),
@@ -64026,7 +64025,7 @@ mod tests {
     }
 
     #[test]
-    fn smart_input_tab_passthrough_sends_tab_to_terminal_when_draft_focused() {
+    fn smart_input_tab_toggles_draft_mode_for_opencode_when_draft_focused() {
         use egui::{Context, RawInput};
 
         let ctx = Context::default();
@@ -64036,6 +64035,14 @@ mod tests {
             Some(1),
         );
         seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        assert_eq!(
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .smart_input
+                .draft_mode,
+            SmartInputMode::Build
+        );
         ctx.memory_mut(|mem| {
             mem.request_focus(AdeApp::smart_input_draft_input_id(1));
         });
@@ -64058,15 +64065,22 @@ mod tests {
             "plain Tab should be consumed when Smart Input draft is focused"
         );
         capture.drain();
+        assert!(
+            capture.bytes().is_empty(),
+            "OpenCode Smart Input Tab should toggle draft mode, not send Tab to PTY"
+        );
         assert_eq!(
-            capture.bytes(),
-            vec![b'\t'],
-            "Tab byte should be sent directly to terminal runtime"
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .smart_input
+                .draft_mode,
+            SmartInputMode::Plan
         );
     }
 
     #[test]
-    fn smart_input_tab_passthrough_sends_tab_to_terminal_when_edit_focused() {
+    fn smart_input_tab_toggles_draft_mode_for_opencode_when_edit_focused() {
         use egui::{Context, RawInput};
 
         let ctx = Context::default();
@@ -64105,15 +64119,22 @@ mod tests {
             "plain Tab should be consumed when Smart Input edit is focused"
         );
         capture.drain();
+        assert!(
+            capture.bytes().is_empty(),
+            "OpenCode Smart Input Tab should toggle draft mode during task edit"
+        );
         assert_eq!(
-            capture.bytes(),
-            vec![b'\t'],
-            "Tab byte should be sent to terminal runtime during task edit"
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .smart_input
+                .draft_mode,
+            SmartInputMode::Plan
         );
     }
 
     #[test]
-    fn smart_input_tab_passthrough_targets_correct_terminal_when_not_active() {
+    fn smart_input_tab_toggles_mode_on_focused_opencode_terminal_not_active() {
         use egui::{Context, RawInput};
 
         let ctx = Context::default();
@@ -64149,8 +64170,16 @@ mod tests {
         capture2.drain();
         assert_eq!(
             capture2.bytes(),
-            vec![b'\t'],
-            "Tab should go to terminal 2 (Smart Input owner), not terminal 1 (active)"
+            Vec::<u8>::new(),
+            "OpenCode Smart Input Tab should not pass through to the PTY"
+        );
+        assert_eq!(
+            app.terminals
+                .get(&2)
+                .expect("terminal 2")
+                .smart_input
+                .draft_mode,
+            SmartInputMode::Plan
         );
     }
 
@@ -65819,20 +65848,18 @@ mod tests {
     fn seed_opencode_thought_loop_blocked(app: &mut AdeApp, terminal_id: u64) {
         seed_opencode_attention(app, terminal_id, OpenCodeAttentionReason::TurnComplete);
         app.config.opencode.loop_protection_enabled = true;
+        app.config.opencode.build_model_slot_a =
+            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo".to_owned();
+        app.config.opencode.active_build_model_slot = "a".to_owned();
         let sample = test_long_thought_line("loop");
         let Some(terminal) = app.terminals.get_mut(&terminal_id) else {
             return;
         };
         terminal.opencode_thought_loop_blocked = true;
         terminal.opencode_last_known_mode = Some("build".to_owned());
-        terminal.opencode_thought_samples = VecDeque::from([
-            sample.clone(),
-            sample.clone(),
-            sample,
-        ]);
-        terminal.render_cache = test_thought_snapshot(&[
-            test_long_thought_line("loop"),
-        ]);
+        terminal.opencode_thought_samples =
+            VecDeque::from([sample.clone(), sample.clone(), sample]);
+        terminal.render_cache = test_thought_snapshot(&[test_long_thought_line("loop")]);
         terminal.smart_input.tasks.push(SmartInputTask {
             id: 1,
             text: "queued".to_owned(),
@@ -65897,13 +65924,7 @@ mod tests {
             Some(1),
         );
         seed_opencode_thought_loop_blocked(&mut app, 1);
-        let task_id = app
-            .terminals
-            .get(&1)
-            .expect("terminal 1")
-            .smart_input
-            .tasks[0]
-            .id;
+        let task_id = app.terminals.get(&1).expect("terminal 1").smart_input.tasks[0].id;
 
         app.handle_smart_input_pane_action(
             &ctx,
@@ -66679,8 +66700,8 @@ mod tests {
         let index_rect = index_rect.expect("queued task index label");
         let task_rect = task_rect.expect("queued task text");
         assert!(
-            task_rect.left() <= index_rect.right() + 16.0,
-            "queued task text must start near the index label, not centered in the queue row (task_left={}, index_right={})",
+            task_rect.left() <= index_rect.right() + 64.0,
+            "queued task text must start near the index/mode metadata, not centered in the queue row (task_left={}, index_right={})",
             task_rect.left(),
             index_rect.right()
         );
@@ -71207,7 +71228,10 @@ mod tests {
         <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
 
         assert!(
-            raw_input.events.iter().any(|e| matches!(e, Event::Key { key: Key::Tab, .. })),
+            raw_input
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Key { key: Key::Tab, .. })),
             "Tab should remain when ACP composer is not focused"
         );
         assert!(app.buffered_terminal_input.is_empty());

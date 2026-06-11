@@ -68,10 +68,58 @@ export const BuiltinLauncherKindDefaultDisplayName = (kind: BuiltinLauncherKind)
 export const BuiltinLauncherKindDefaultLaunchCommand = (kind: BuiltinLauncherKind): string => {
   switch (kind) {
     case BuiltinLauncherKind.Codex: return 'codex';
-    case BuiltinLauncherKind.Claude: return 'claude';
+    case BuiltinLauncherKind.Claude: return defaultClaudeLaunchCommand();
     case BuiltinLauncherKind.Droid: return 'droid';
     case BuiltinLauncherKind.OpenCode: return 'opencode';
   }
+};
+
+export const defaultClaudeLaunchCommand = (): string =>
+  process.platform === 'win32' ? 'claude.cmd' : 'claude';
+
+export const normalizeBuiltinLaunchCommand = (kind: BuiltinLauncherKind, command: string): string => {
+  const trimmed = command.trim();
+  if (trimmed.length === 0) return BuiltinLauncherKindDefaultLaunchCommand(kind);
+  if (kind === BuiltinLauncherKind.Claude) return normalizeClaudeLaunchCommand(trimmed);
+  return trimmed;
+};
+
+export const normalizeClaudeLaunchCommand = (command: string): string =>
+  migrateLegacyClaudeLaunchCommand(command) ?? command;
+
+const migrateLegacyClaudeLaunchCommand = (command: string): string | undefined => {
+  let trimmed = command.trim();
+  if (trimmed.length === 0) return undefined;
+
+  if (trimmed.startsWith('&') || trimmed.startsWith('.')) {
+    trimmed = trimmed.slice(1).trimStart();
+  }
+
+  const token = firstShellToken(trimmed);
+  if (!token) return undefined;
+
+  const executable = token.token.trim().replace(/^["']|["']$/g, '');
+  const normalized = executable.replace(/\\/g, '/').toLowerCase();
+  const fileName = normalized.split('/').pop() ?? normalized;
+  if (!['cc', 'cc.cmd', 'claude', 'claude.ps1'].includes(fileName)) {
+    return undefined;
+  }
+
+  return `${BuiltinLauncherKindDefaultLaunchCommand(BuiltinLauncherKind.Claude)}${token.tail}`;
+};
+
+const firstShellToken = (command: string): { token: string; tail: string } | undefined => {
+  if (command.length === 0) return undefined;
+  const quote = command[0];
+  if (quote === '"' || quote === "'") {
+    const end = command.indexOf(quote, 1);
+    if (end === -1) return undefined;
+    return { token: command.slice(0, end + 1), tail: command.slice(end + 1) };
+  }
+
+  const whitespaceIndex = command.search(/\s/);
+  if (whitespaceIndex === -1) return { token: command, tail: '' };
+  return { token: command.slice(0, whitespaceIndex), tail: command.slice(whitespaceIndex) };
 };
 
 export enum LauncherIconKey {
@@ -276,7 +324,7 @@ export interface OpenCodeAcpModelEntry {
 }
 
 export const APP_CONFIG_VERSION = 2;
-export const DEFAULT_OPENCODE_BUILD_MODEL = 'fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo';
+export const DEFAULT_OPENCODE_BUILD_MODEL = 'mimo/mimo-v2.5-pro';
 export const DEFAULT_OPENCODE_PLAN_MODEL = 'openai/gpt-5.5-fast';
 export const DEFAULT_OPENCODE_PLAN_EFFORT = 'xhigh';
 export const DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED = true;

@@ -105,4 +105,4 @@ All detailed implementation guidelines are split into topic files under `.agents
 - [.agents/checklist.md](.agents/checklist.md) — Check-list panel
 - [.agents/acp-ui.md](.agents/acp-ui.md) — OpenCode ACP UI (composer, capsule, attachments, model selector, mode toggle)
 - [.agents/ui-overlay.md](.agents/ui-overlay.md) — Window close, clipboard paste, resizable panels, OS notifications, popup/overlay
-- [.agents/claude-code.md](.agents/claude-code.md) — Claude Code configuration (Fireworks/Kimi, hooks, auth, Windows compat)
+- [.agents/claude-code.md](.agents/claude-code.md) — Claude Code configuration (Mimo, hooks, auth, Windows compat)

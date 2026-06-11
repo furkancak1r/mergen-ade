@@ -457,7 +457,7 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
                           <input
                             value={launcher.launchCommand}
                             onChange={(e) => updateLauncher(i, { launchCommand: e.target.value })}
-                            placeholder="Example: codex, cc, droid, opencode"
+                            placeholder="Example: codex, claude.cmd, droid, opencode"
                             style={{ width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', padding: '4px 8px', fontSize: 11, borderRadius: 4 }}
                           />
                         </div>

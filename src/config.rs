@@ -334,10 +334,12 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) -> bool {
     config.default_shell = config.default_shell.normalize_for_current_platform();
     normalize_launcher_entries(&mut config.launchers);
     normalize_terminal_shortcut_entries(&mut config.terminal_shortcuts);
-    // Migrate old OpenCode default model from k2.5 to k2.6
-    if config.opencode.build_model_slot_a
-        == "fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo"
-    {
+    // Migrate old OpenCode Kimi defaults to the current Mimo build default.
+    if matches!(
+        config.opencode.build_model_slot_a.as_str(),
+        "fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo"
+            | "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo"
+    ) {
         config.opencode.build_model_slot_a = DEFAULT_OPENCODE_BUILD_MODEL.to_owned();
         changed = true;
     }
@@ -415,7 +417,7 @@ mod tests {
     };
     use crate::models::{
         default_terminal_shortcuts, AppConfig, BuiltinLauncherKind, ShellKind, ShortcutModifiers,
-        TerminalManagerFilter, TerminalShortcutEntry,
+        TerminalManagerFilter, TerminalShortcutEntry, DEFAULT_OPENCODE_BUILD_MODEL,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -822,6 +824,34 @@ command = false
             .iter_mut()
             .find(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Claude))
             .expect("claude launcher")
+            .launch_command = r"C:/Tools/claude-custom.cmd --verbose".to_owned();
+
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        let claude = loaded
+            .launchers
+            .iter()
+            .find(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Claude))
+            .expect("claude launcher");
+
+        assert_eq!(
+            claude.launch_command,
+            r"C:/Tools/claude-custom.cmd --verbose"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_migrates_legacy_claude_cc_launcher_to_real_cli() {
+        let path = unique_temp_path("migrate-claude-cc-launcher");
+        let mut config = AppConfig::default();
+        config
+            .launchers
+            .iter_mut()
+            .find(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Claude))
+            .expect("claude launcher")
             .launch_command = "cc".to_owned();
 
         save_config(&path, &config).expect("should save config");
@@ -833,7 +863,10 @@ command = false
             .find(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Claude))
             .expect("claude launcher");
 
-        assert_eq!(claude.launch_command, "cc");
+        assert_eq!(
+            claude.launch_command,
+            BuiltinLauncherKind::Claude.default_launch_command()
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -1013,7 +1046,7 @@ command = false
     }
 
     #[test]
-    fn load_config_migrates_old_opencode_default_model_to_k2p6() {
+    fn load_config_migrates_old_opencode_default_model_to_mimo() {
         let path = unique_temp_path("opencode-model-migration");
         let mut config = AppConfig::default();
         config.opencode.build_model_slot_a =
@@ -1024,7 +1057,25 @@ command = false
         let loaded = load_config(&path).expect("should load config");
         assert_eq!(
             loaded.opencode.build_model_slot_a,
-            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo"
+            DEFAULT_OPENCODE_BUILD_MODEL
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_migrates_k2p6_opencode_default_model_to_mimo() {
+        let path = unique_temp_path("opencode-k2p6-model-migration");
+        let mut config = AppConfig::default();
+        config.opencode.build_model_slot_a =
+            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo".to_owned();
+
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        assert_eq!(
+            loaded.opencode.build_model_slot_a,
+            DEFAULT_OPENCODE_BUILD_MODEL
         );
 
         let _ = fs::remove_file(path);

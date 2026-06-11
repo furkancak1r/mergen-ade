@@ -1,5 +1,5 @@
 import type { LauncherEntry } from '../../../shared/types';
-import { ANTHROPIC_ENV_VARS_TO_REMOVE, BuiltinLauncherKind, ShellKind } from '../../../shared/types';
+import { ANTHROPIC_ENV_VARS_TO_REMOVE, BuiltinLauncherKind, BuiltinLauncherKindDefaultLaunchCommand, ShellKind, normalizeClaudeLaunchCommand } from '../../../shared/types';
 
 const PERMISSION_MODE_FLAG = '--permission-mode';
 const DANGEROUS_SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions';
@@ -30,7 +30,11 @@ export const sanitizedClaudeLaunchCommand = (shell: ShellKind, configuredCommand
 
 export const claudeCommandWithBypassPermissions = (configuredCommand: string): string => {
   const trimmed = configuredCommand.trim();
-  const command = trimmed.length === 0 ? 'claude' : trimmed;
+  const command = normalizeClaudeLaunchCommand(
+    trimmed.length === 0
+      ? BuiltinLauncherKindDefaultLaunchCommand(BuiltinLauncherKind.Claude)
+      : trimmed,
+  );
 
   if (findShellFlag(command, DANGEROUS_SKIP_PERMISSIONS_FLAG) !== undefined) {
     return command;
