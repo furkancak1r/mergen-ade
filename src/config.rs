@@ -7,10 +7,10 @@ use directories::ProjectDirs;
 use serde::Deserialize;
 
 use crate::models::{
-    default_claude_code_codex_hook_enabled, default_launchers, default_terminal_shortcuts,
-    normalize_launcher_entries, normalize_terminal_shortcut_entries, AcpStartupMode, AppConfig,
-    AppHistory, ProjectRecord, ShellKind, UiConfig, APP_CONFIG_VERSION,
-    DEFAULT_OPENCODE_BUILD_MODEL, DEFAULT_OPENCODE_PLAN_EFFORT, DEFAULT_OPENCODE_PLAN_MODEL,
+    default_launchers, default_terminal_shortcuts, normalize_launcher_entries,
+    normalize_terminal_shortcut_entries, AcpStartupMode, AppConfig, AppHistory, ProjectRecord,
+    ShellKind, UiConfig, APP_CONFIG_VERSION, DEFAULT_OPENCODE_BUILD_MODEL,
+    DEFAULT_OPENCODE_PLAN_EFFORT, DEFAULT_OPENCODE_PLAN_MODEL,
 };
 
 const QUALIFIER: &str = "com";
@@ -289,7 +289,6 @@ impl From<LegacyAppConfig> for AppConfig {
         AppConfig {
             version: value.version,
             default_shell: value.default_shell,
-            claude_code_codex_hook_enabled: default_claude_code_codex_hook_enabled(),
             ui: value.ui,
             launchers: default_launchers(),
             terminal_shortcuts: default_terminal_shortcuts(),
@@ -489,25 +488,6 @@ path = "C:/work/demo"
         let config = load_config(&path).expect("should load config");
 
         assert_eq!(config.default_shell, ShellKind::default());
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn missing_claude_code_codex_hook_setting_defaults_enabled() {
-        let path = unique_temp_path("missing-claude-code-codex-hook");
-        fs::write(
-            &path,
-            r#"
-version = 1
-default_shell = "powershell"
-"#,
-        )
-        .expect("should write config");
-
-        let config = load_config(&path).expect("should load config");
-
-        assert!(config.claude_code_codex_hook_enabled);
 
         let _ = fs::remove_file(path);
     }

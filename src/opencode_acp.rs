@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -16,6 +17,13 @@ use serde_json::{json, Value as JsonValue};
 
 pub const ACP_LOOP_WARNING_TOOL_CALLS: usize = 20;
 pub const ACP_LOOP_LIMIT_TOOL_CALLS: usize = 32;
+
+/// Which agent backend powers this ACP chat session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpBackend {
+    OpenCode,
+    ClaudeCode,
+}
 
 /// Events sent from the ACP agent thread to the UI thread.
 #[derive(Debug, Clone)]
@@ -229,11 +237,76 @@ pub struct AcpChatSession {
     reader_thread: Option<thread::JoinHandle<()>>,
     #[allow(dead_code)]
     stderr_thread: Option<thread::JoinHandle<()>>,
+    /// Which backend powers this session.
+    pub backend: AcpBackend,
+    /// Event sender for Claude Code per-turn process spawning.
+    pub event_tx: Option<crossbeam_channel::Sender<AcpChatEvent>>,
+    /// Shared handle to the current Claude Code child process (for kill support).
+    pub claude_child: Option<Arc<Mutex<Option<Child>>>>,
 }
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 impl AcpChatSession {
+    /// Create a terminal-less Claude Code chat session. Claude Code does not
+    /// use the JSON-RPC writer loop; prompts spawn one `claude --print` turn.
+    pub fn new_claude_code(
+        id: u64,
+        project_id: u64,
+        project_path: PathBuf,
+        event_tx: crossbeam_channel::Sender<AcpChatEvent>,
+    ) -> Self {
+        let (command_tx, _command_rx) = crossbeam_channel::unbounded::<String>();
+        let now = Instant::now();
+        Self {
+            id,
+            project_id,
+            project_path,
+            title: "Claude Code".to_owned(),
+            created_at: now,
+            updated_at: now,
+            status: AcpChatStatus::Idle,
+            session_id: None,
+            config_options: BTreeMap::new(),
+            config_options_struct: Vec::new(),
+            modes: Vec::new(),
+            available_commands: Vec::new(),
+            messages: Vec::new(),
+            pending_permission: None,
+            prompt_input: String::new(),
+            attachments: Vec::new(),
+            is_running: false,
+            show_thread_selector: false,
+            selected_mode_id: None,
+            queue: Vec::new(),
+            next_queued_prompt_id: 1,
+            queue_expanded: true,
+            queue_draft_return: None,
+            queue_scroll_to_end: false,
+            model_search_query: String::new(),
+            recent_inputs: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            tool_calls_this_turn: 0,
+            loop_warning_emitted: false,
+            loop_limit_emitted: false,
+            cancel_error_suppression_until: None,
+            cancel_unsupported: false,
+            command_tx,
+            process: None,
+            writer_thread: None,
+            reader_thread: None,
+            stderr_thread: None,
+            backend: AcpBackend::ClaudeCode,
+            event_tx: Some(event_tx),
+            claude_child: None,
+        }
+    }
+
+    pub fn is_claude_code(&self) -> bool {
+        self.backend == AcpBackend::ClaudeCode
+    }
+
     /// Send a JSON-RPC request.
     pub fn send_request(&self, id: u64, method: &str, params: JsonValue) {
         let msg = json!({
@@ -414,6 +487,9 @@ pub(crate) fn test_session_for_app(
             writer_thread: None,
             reader_thread: None,
             stderr_thread: None,
+            backend: AcpBackend::OpenCode,
+            event_tx: None,
+            claude_child: None,
         },
         rx,
     )
@@ -662,6 +738,9 @@ pub fn spawn_opencode_acp(
         writer_thread: Some(writer_thread),
         reader_thread: Some(reader_thread),
         stderr_thread: Some(stderr_thread),
+        backend: AcpBackend::OpenCode,
+        event_tx: None,
+        claude_child: None,
     })
 }
 
@@ -1094,6 +1173,9 @@ mod tests {
             writer_thread: None,
             reader_thread: None,
             stderr_thread: None,
+            backend: AcpBackend::OpenCode,
+            event_tx: None,
+            claude_child: None,
         }
     }
 
@@ -1138,6 +1220,9 @@ mod tests {
             writer_thread: None,
             reader_thread: None,
             stderr_thread: None,
+            backend: AcpBackend::OpenCode,
+            event_tx: None,
+            claude_child: None,
         };
         (session, rx)
     }

@@ -1,89 +1,27 @@
-#### Project-local Claude settings override forced Fireworks/Kimi despite Mimo env {#claude-project-local-settings-override}
-- Date: 2026-06-11
-- Context: User reported that launching Claude Code from the foreground launcher still opened as Kimi even though the launch command exported Mimo Anthropic env vars.
-- Error signature:
-  1. Global `~/.claude/settings.json` pointed to Mimo and `mimo-key-helper.cmd`.
-  2. The selected project had `.claude/settings.local.json` with `apiKeyHelper` pointing to `fireworks-firepass-key-helper.cmd`, Fireworks base URL, and Kimi model overrides.
-  3. Claude Code loaded the project-local settings after the global settings, so the local Fireworks/Kimi values won.
-- Symptoms/Impact:
-  - Claude Code startup failed with a missing Fireworks helper error.
-  - Foreground Claude sessions in that project used Kimi/Fireworks config instead of Mimo.
-- Root cause:
-  - Mergen repaired only global Claude settings before launching Claude Code and ignored existing project-local `.claude/settings.local.json` overrides.
-- Resolution:
-  - Added project-local Claude settings repair for existing `project/.claude/settings.local.json` files.
-  - Updated the foreground Claude launcher path to repair both global and selected-project local settings before submitting the launch command.
-  - Repaired the current ignored `.claude/settings.local.json` to Mimo and removed stale Emdash hooks.
-- Prevent recurrence:
-  - Added regression tests for missing local settings, local Fireworks/Kimi override repair, permission preservation, and stale hook cleanup.
-- Files/Commands touched: `src/claude_settings.rs`, `src/app.rs`, `.claude/settings.local.json`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
-- References: User request 2026-06-11
-
 ---
 
-#### Smart Input queue stuck on ACP stderr error and Claude fresh session not dispatching {#smart-input-queue-acp-claude-dispatch}
+#### Electron OpenCode ACP question cevabi unknown request hatasina dusuyordu {#electron-acp-question-unknown-request}
 - Date: 2026-06-10
-- Context: User reported that Smart Input queued prompts were never sent when OpenCode ACP emitted a `SessionStart:startup hook error` on stderr, and that Claude Code Smart Input auto-dispatch never worked for fresh sessions.
+- Context: User reported that answering an ACP question/permission card after a `bash (execute)` tool call showed raw `ACP stderr: Got response to unknown request 0` in the chat UI.
 - Error signature:
-  1. `stderr_thread` in `src/opencode_acp.rs` sends ALL stderr lines as `AcpChatEvent::Error`.
-  2. `handle_acp_error_event` unconditionally set `session.status = AcpChatStatus::Error` for any `Error` event, killing the session before `SessionCreated` could arrive and flush the queue.
-  3. `apply_claude_status` only set `claude_attention_pending = true` on `Working -> Idle` transition (`previous_normalized_status == Some(Working)`). For fresh Claude sessions, `previous_normalized_status` is `None` on the first `Idle` detection, so `claude_attention_pending` was never set.
-  4. `smart_input_auto_dispatch_ready` for Claude requires `claude_attention_pending == true`, so fresh sessions could never auto-dispatch.
-  5. `clear_claude_state` and `mark_claude_launch_pending` did NOT reset `claude_attention_pending`, leaving stale state across session restarts.
+  1. Electron ACP converted JSON-RPC response ids to strings before writing permission responses.
+  2. The renderer sent the displayed `requestId` back directly, with no main-process pending-request guard.
+  3. Stderr ANSI color codes were stored and broadcast as fatal ACP `error` events.
 - Symptoms/Impact:
-  1. After submitting a Smart Input `After Done` task, if OpenCode ACP printed any stderr line, the queue got stuck forever because the session status became `Error`.
-  2. Claude Code Smart Input `After Done` tasks never auto-dispatched for new terminals; the queue grew indefinitely.
+  - OpenCode rejected the response as an unknown request and the turn could remain stuck.
+  - The chat displayed raw ANSI escape sequences instead of readable text.
+  - Non-fatal protocol stderr could incorrectly clear ACP running state.
 - Root cause:
-  - `handle_acp_error_event` treated all stderr as fatal.
-  - `apply_claude_status` had an asymmetric `claude_attention_pending` transition that only covered `Working -> Idle`, not `None -> Idle` or `Permission -> Idle`.
+  - ACP permission/question responses must use the exact JSON-RPC request id for the inbound request, while UI state should only carry an opaque local token.
 - Resolution:
-  - Changed `handle_acp_error_event` to treat non-fatal stderr as transient warnings when the session has `session_id` or is `Starting` (only "ACP JSON parse error" remains fatal). The session stays alive so `SessionCreated` or `PromptResponse` can still flush the queue.
-  - Changed `apply_claude_status` to trigger `claude_attention_pending` on any transition to `Idle`/`Permission` except `Idle -> Idle`, covering `None -> Idle`, `Working -> Idle`, and `Permission -> Idle`.
-  - Added `claude_attention_pending = false` to `clear_claude_state` and `mark_claude_launch_pending` to prevent stale state.
-  - Added `claude_prompt_submit_since = None` to `mark_claude_launch_pending`.
-  - Added 7 regression tests:
-    - `acp_error_event_treats_stderr_as_warning_when_session_exists`
-    - `acp_error_event_treats_warning_when_starting_without_session_id`
-    - `apply_claude_status_sets_attention_pending_on_none_to_idle`
-    - `apply_claude_status_sets_attention_pending_on_permission_to_idle`
-    - `apply_claude_status_skips_attention_pending_on_idle_to_idle`
-    - `clear_claude_state_clears_attention_pending`
-    - `mark_claude_launch_pending_clears_attention_pending_and_prompt_submit_since`
+  - Preserve JSON-RPC id type in ACP response builders.
+  - Track pending permission/question interactions in the Electron main process and reject stale UI tokens without writing to OpenCode.
+  - Add OpenCode `opencode/question` capability support and route question answers through the correct response shape.
+  - Strip ANSI from ACP stderr and downgrade non-fatal stderr to warning/stderr UI events.
 - Prevent recurrence:
-  - Updated AGENTS.md with the "ACP `session/new` must include `cwd` and `mcpServers`" and related ACP standby guidelines.
-  - Recorded this entry in KNOWN_ISSUES.md.
-- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
-- References: `/implement-plan` request 2026-06-10
-
----
-
-#### Clipboard image paste cross-app leakage and accidental Smart Input attachment {#clipboard-image-paste-leakage}
-- Date: 2026-06-09
-- Context: User reported that pressing Ctrl+V in another application while Mergen was running in the background caused image paste to leak into the active terminal, and that auto-focused Smart Input was creating accidental image attachments.
-- Error signature:
-  1. `native_primary_paste_shortcut_down()` uses Windows `GetAsyncKeyState` which is global and fires even when Mergen is unfocused.
-  2. `raw_input_hook` processed `native_primary_paste_requested` without checking `raw_input.focused`, so clipboard image paste from another app leaked into Mergen.
-  3. `native_image_paste_target()` used `capture_keyboard` fallback and `active_smart_input_draft_request()` which returned auto-focused Smart Input, causing image paste to create attachments even when the user never explicitly clicked the Smart Input field.
-  4. `ensure_smart_input_focus()` auto-focuses Smart Input when no other UI input is focused, which is why explicit-click tracking is necessary to distinguish intentional clicks.
-- Symptoms/Impact:
-  1. Copying an image in another app while Mergen was in background would unexpectedly paste it into the active terminal.
-  2. Auto-focused Smart Input (without explicit click) received image paste and created unwanted attachment chips.
-  3. Image paste could leak to the wrong terminal after switching terminals because stale focus state persisted.
-- Root cause:
-  - No focus gate on native (global key poll) image paste.
-  - No explicit-click tracking for Smart Input; auto-focus was treated the same as user click.
-- Resolution:
-  - Added `raw_input.focused` gate before processing `native_primary_paste_requested` image paste.
-  - Added `smart_input_explicit_focus: Option<u64>` field to `AdeApp` to track explicit clicks vs auto-focus.
-  - Added `smart_input_explicitly_clicked: bool` to `SmartInputPaneAction`; set when draft/edit `TextEdit` is clicked.
-  - Modified `raw_input_hook` to only use explicit targets for native paste: `terminal_output_paste_target` and `smart_input_explicit_request`.
-  - Cleared `smart_input_explicit_focus` on terminal output click, terminal switch, terminal close, popup/modal open, ACP chat visible, and terminal output override active.
-  - Added 8 regression tests covering unfocused blocking, explicit terminal output click, explicit Smart Input click, auto-focus blocking, and focus clearing on terminal switch/ACP visible.
-- Prevent recurrence:
-  - Updated AGENTS.md Clipboard Paste Guidelines with `raw_input.focused` gate, explicit-click routing, and `smart_input_explicit_focus` clearing rules.
-  - Recorded this entry in KNOWN_ISSUES.md.
-- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
-- References: User request 2026-06-09
+  - Add regression tests for numeric id preservation, question response shape, strict id handling, ANSI stripping, and non-fatal stderr activity state.
+- Files/Commands touched: `electron/shared/acpProtocol.ts`, `electron/main/acpService.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, ACP protocol/UI tests
+- References: User report 2026-06-10
 
 ---
 
@@ -3609,6 +3547,313 @@
 
 ---
 
+#### Electron port Settings Diagnostics bolumu eksikti {#electron-settings-diagnostics-missing}
+- Date: 2026-06-10
+- Context: Electron port is being brought closer to the original Rust Mergen ADE feature set and visual structure.
+- Error signature:
+  1. Original Settings had a `Diagnostics` section with runtime overview and technical detail rows.
+  2. Electron Settings stopped at General/Launchers/OpenCode/Saved Messages/Shortcuts/Notifications.
+- Symptoms/Impact:
+  - Electron users could not inspect hook bridge, Codex, config path, Browser MCP, and active terminal state from Settings.
+  - Troubleshooting AI CLI integration required source inspection or logs instead of the app UI.
+- Root cause:
+  - The Electron Settings port had not implemented the original Diagnostics navigation section or a diagnostics IPC payload.
+- Resolution:
+  - Added a read-only `diagnostics:get` IPC and `Settings > Diagnostics` UI with runtime overview, session state, and expandable technical details.
+  - Added regression coverage for the diagnostics runtime overview decision logic.
+- Prevent recurrence:
+  - Keep Settings section parity checked whenever original `SettingsSection::ALL` changes.
+- Files/Commands touched: `electron/shared/types.ts`, `electron/main/diagnostics.ts`, `electron/main/ipcHandlers.ts`, `electron/renderer/src/App.tsx`, `electron/renderer/src/components/SettingsPopup.tsx`, `electron/renderer/src/lib/diagnostics.ts`
+- References: Electron parity goal, 2026-06-10
+
+---
+
+#### Electron Terminal Manager git diff satir ozeti eksikti {#electron-terminal-manager-diff-summary}
+- Date: 2026-06-10
+- Context: Original Rust Terminal Manager shows source-control line totals next to project/worktree headers.
+- Error signature:
+  1. Rust `TerminalManagerDiffSummaryModel` renders `+N -M`, `...`, `--`, or blank clean state from git numstat totals.
+  2. Electron Terminal Manager project headers showed only the project name, worktree marker, and terminal count.
+- Symptoms/Impact:
+  - Users could not scan changed-line volume from Terminal Manager without switching to Source Control.
+  - Electron visual hierarchy drifted from the original Terminal Manager header composition.
+- Root cause:
+  - The Electron port lacked a read-only `git diff --numstat` summary IPC and header badge renderer.
+- Resolution:
+  - Added `git:diffSummary` IPC, shared numstat parser/label helper, and Terminal Manager project/worktree header badges.
+  - Added regression coverage for binary numstat rows, malformed rows, and loading/error/clean/changed labels.
+- Prevent recurrence:
+  - Keep Terminal Manager header parity checked when original source-control summary behavior changes.
+- Files/Commands touched: `electron/shared/gitDiffSummary.ts`, `electron/shared/types.ts`, `electron/main/worktree.ts`, `electron/main/ipcHandlers.ts`, `electron/renderer/src/components/TerminalManager.tsx`
+- References: Electron parity goal, 2026-06-10
+
+---
+
+#### Electron Input History filtresi config'e bagli degildi {#electron-input-history-filter-parity}
+- Date: 2026-06-10
+- Context: Original Rust Input History has a project selector, persisted All/Foreground/Background filter tabs, and a search field.
+- Error signature:
+  1. Electron Input History kept its filter in local component state instead of `config.ui.inputHistoryFilter`.
+  2. The visible `All` button set the filter back to Foreground, so All could not actually be selected.
+  3. Electron lacked the original project selector and search input in the Input History panel.
+- Symptoms/Impact:
+  - Input History opened with a different default than the original app.
+  - Users could not persist the filter choice or reliably view all foreground/background history together.
+  - Finding a prior command required manual scanning.
+- Root cause:
+  - The Electron component used a separate local `TerminalInputHistoryFilter` path instead of the persisted `InputHistoryFilter` config field.
+- Resolution:
+  - Reworked Electron Input History to use `config.ui.inputHistoryFilter`, added project selection and search, and fixed All/FG/BG filtering.
+  - Added helper tests for selected-project filtering, All behavior, foreground limiting, and search matching.
+- Prevent recurrence:
+  - Keep Input History UI state tied to persisted UI config when porting original panel behavior.
+- Files/Commands touched: `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/inputHistory.ts`
+- References: Electron parity goal, 2026-06-10
+
+---
+
+#### Electron Terminal Manager filtre durumu config'e yazilmiyordu {#electron-terminal-manager-filter-config}
+- Date: 2026-06-10
+- Context: Original Rust Terminal Manager stores the Foreground/Background filter and hide-inactive-projects toggle in UI config.
+- Error signature:
+  1. Electron Terminal Manager initialized its filter from `config.ui.terminalManagerFilter` but then kept changes only in local React state.
+  2. `terminalManagerHideInactiveProjects` existed in config and filtering logic, but there was no visible toggle in the Terminal Manager UI.
+- Symptoms/Impact:
+  - Terminal Manager filter changes were lost across rerenders/restarts instead of following the persisted UI config path.
+  - Users could not toggle inactive project hiding from the Terminal Manager panel as in the original app.
+- Root cause:
+  - The Electron component owned filter state locally and did not expose config update callbacks for filter/hide state.
+- Resolution:
+  - Bound Terminal Manager filter directly to `config.ui.terminalManagerFilter` and added App-level update callbacks.
+  - Added a compact hide-inactive toggle to the filter row and config helper tests for both state updates.
+  - Matched original reset behavior: opening Terminal Manager from the rail selects Foreground, and startup clears inactive-project hiding while normalizing Terminal Manager's saved active filter.
+- Prevent recurrence:
+  - Avoid duplicating persisted UI state as local component state unless there is a deliberate draft/edit lifecycle.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/terminalManagerState.ts`
+- References: Electron parity goal, 2026-06-10
+
+---
+
+#### Electron Input History kalici gecmisi kullanmiyordu {#electron-input-history-persistent-history}
+- Date: 2026-06-10
+- Context: Original Rust app records foreground terminal input into project-scoped persistent `AppHistory` and the Input History panel reads from that store.
+- Error signature:
+  1. Electron exposed `history:load` / `history:save` IPC but the renderer never loaded or saved `AppHistory`.
+  2. Input History rendered only live terminal `recentInputs`, so entries disappeared when terminals were gone or the app restarted.
+  3. Row click behavior resent the command to a terminal, while the original row click copies the command to the clipboard.
+- Symptoms/Impact:
+  - Input History was runtime-only instead of project history.
+  - The panel could not inspect older commands after terminal cleanup or restart.
+  - Clicking a history row could unexpectedly execute a command instead of copying it.
+- Root cause:
+  - The Electron port reused terminal runtime recent-input state and left the persistent history API unintegrated.
+- Resolution:
+  - Added renderer `AppHistory` load/save, foreground-only recording from terminal recent input changes, and project-scoped display from persistent history.
+  - Changed Input History row click to copy text to clipboard and added relative timestamp display.
+  - Added tests for persistent recording, background/slash/empty skips, zero-limit migration, project/filter/search display, and relative time labels.
+- Prevent recurrence:
+  - Treat terminal `recentInputs` as runtime convenience only; project history panels should read `AppHistory`.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/lib/inputHistory.ts`
+- References: Electron parity goal, 2026-06-10
+
+---
+
+#### Electron Claude launcher bypass permission modu eksikti {#electron-claude-launcher-bypass-permissions}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app had Claude launcher handling that preserved configured aliases while forcing bypass permission mode, but the Electron port sent the raw launcher command.
+- Error signature:
+  1. `LauncherEntry` in Electron config had no `bypassPermissions` field.
+  2. Terminal Manager used `launchCommand` directly for the built-in Claude launcher.
+  3. Existing `--permission-mode` values were not normalized to `bypassPermissions`.
+- Symptoms/Impact:
+  - Launching Claude from Electron could start in the default permission mode instead of the original app's bypass mode.
+  - Users with a working alias such as `cc` needed manual flags each time.
+  - Quoted PowerShell executable paths were not guarded with the call operator when flags were appended.
+- Root cause:
+  - The Electron launcher model and command path lagged behind the original Rust `sanitized_claude_launch_command` behavior.
+- Resolution:
+  - Add `LauncherEntry.bypassPermissions` and default it to true for the Claude built-in launcher.
+  - Preserve the field during config launcher normalization.
+  - Route built-in Claude launch commands through a testable sanitizer that clears stale Anthropic env vars, preserves aliases, and appends or replaces `--permission-mode bypassPermissions`.
+- Prevent recurrence:
+  - Add renderer regression tests for default launcher flags, PowerShell/CMD/zsh command generation, existing permission-mode replacement, and custom launcher non-rewrite behavior.
+- Files/Commands touched: `electron/shared/types.ts`, `electron/main/config.ts`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/launcher.ts`, launcher tests
+- References: Original commit `d618cec`, parity audit 2026-06-10
+
+---
+
+#### Electron Settings icinde Launchers sekmesi eksikti {#electron-settings-launchers-tab-missing}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app exposed Settings > Launchers for foreground launcher catalog management, while the Electron port only exposed General, OpenCode, Shortcuts, and Notifications tabs.
+- Error signature:
+  1. `SettingsPopup` did not render or edit `config.launchers`.
+  2. Built-in launcher labels/commands could only be changed by editing config outside the UI.
+  3. Custom foreground launchers could not be created or removed from Electron Settings.
+- Symptoms/Impact:
+  - Electron users could launch configured entries, but could not manage the launcher catalog from the app.
+  - The Settings surface looked less complete than the original app.
+- Root cause:
+  - The Electron port had implemented launcher use in Terminal Manager before porting the original Settings > Launchers editor.
+- Resolution:
+  - Add a Launchers tab to Electron Settings.
+  - Support editing built-in launcher labels/commands/enabled state, resetting built-ins, showing Claude bypass behavior, adding/removing custom launchers, and selecting custom launcher icon presets.
+- Prevent recurrence:
+  - Keep launcher config fields wired through both Settings and Terminal Manager whenever the catalog model changes.
+- Files/Commands touched: `electron/renderer/src/components/SettingsPopup.tsx`, `KNOWN_ISSUES.md`
+- References: Original `draw_settings_launchers_section`, parity audit 2026-06-10
+
+---
+
+#### Electron Smart Input Build/Plan secici eksikti {#electron-smart-input-build-plan-selector}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app had a compact Build/Plan selector directly beside the Smart Input draft field for OpenCode terminal sessions. The Electron port only exposed Steer Now/After Done delivery controls and always wrote queued Smart Input tasks with `modeId: build`.
+- Error signature:
+  1. `SmartInputFooter` had no Build/Plan draft mode state.
+  2. Plain Tab in the Smart Input draft sent `\t` to the PTY instead of toggling the draft mode.
+  3. `usePty` ignored queued task `modeId` during OpenCode Smart Input dispatch.
+- Symptoms/Impact:
+  - Users could not queue or immediately send a Plan-mode Smart Input prompt from the Electron terminal UI.
+  - The Smart Input footer layout looked different from the original app.
+- Root cause:
+  - The Electron Smart Input implementation kept only delivery timing (`Steer Now` vs `After Done`) and did not port the OpenCode Build/Plan mode selector/dispatch path.
+- Resolution:
+  - Add a compact Build/Plan segmented control to the left of the Smart Input draft field.
+  - Make Tab toggle Build/Plan while Smart Input owns focus.
+  - Store the selected mode on new queued tasks and pass it through immediate sends.
+  - Add mode-aware OpenCode terminal dispatch that sends a TUI Tab before Plan-mode payloads when the tracked mode differs.
+- Prevent recurrence:
+  - Add mode helper tests for normalization, toggling, Plan-only queue labels, and OpenCode mode-toggle decisions.
+- Files/Commands touched: `electron/renderer/src/components/SmartInputFooter.tsx`, `electron/renderer/src/components/MainArea.tsx`, `electron/renderer/src/App.tsx`, `electron/renderer/src/hooks/usePty.ts`, `electron/renderer/src/lib/smartInputMode.ts`, Smart Input mode tests
+- References: Original commit `8e1105c`, parity audit 2026-06-10
+
+---
+
+#### Electron Smart Input text paste eski clipboard gorselini attachment yapabiliyordu {#electron-smart-input-paste-stale-image}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app had a clipboard image paste safety fix that only converts image paste into Smart Input attachments for explicit image/file paste triggers. The Electron Smart Input paste handlers still read native file paths and bitmap images before checking whether the actual paste event carried image/file data.
+- Error signature:
+  1. `SmartInputFooter` called `clipboard:readFilePaths` and `clipboard:readImage` for every paste event.
+  2. Normal text paste could still inspect native clipboard image state.
+  3. Draft and queued-task edit paste handlers duplicated the same unsafe ordering.
+- Symptoms/Impact:
+  - Pasting ordinary text into Smart Input could create an unexpected image/file attachment if the native clipboard still exposed image or file formats.
+  - The Electron behavior differed from the original app's guarded image paste flow.
+- Root cause:
+  - The Electron renderer did not classify `ClipboardEvent.clipboardData` before calling native clipboard readers.
+- Resolution:
+  - Add a testable paste snapshot/classification helper.
+  - Read native file paths only when the paste event carries files or path-like text.
+  - Read native bitmap images only when the paste event carries an image item/type.
+  - Keep normal text paste as a text-only operation.
+- Prevent recurrence:
+  - Add regression tests covering normal text paste, image item paste, text path lists, and absolute path detection.
+- Files/Commands touched: `electron/renderer/src/components/SmartInputFooter.tsx`, `electron/renderer/src/lib/clipboardPaste.ts`, clipboard paste tests
+- References: Original commit `03eeb0d`, parity audit 2026-06-10
+
+---
+
+#### Electron terminal wheel overlay acikken yakalanabiliyordu {#electron-terminal-wheel-overlay-popups}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app disables terminal output wheel handling while UI overlays such as Terminal Manager history and foreground-message popups are open. The Electron port only disabled terminal wheel forwarding for Settings and checklist overlays.
+- Error signature:
+  1. `MainArea` passed `wheelEnabled={!settingsOpen && !checklistVisible}`.
+  2. `TerminalManager` popup state stayed local and was not visible to `App`.
+  3. OpenCode terminal wheel forwarding could still prevent popup scrolling while a Terminal Manager popup was open.
+- Symptoms/Impact:
+  - Mouse wheel over an open Terminal Manager popup could be intercepted by the terminal pane instead of scrolling the popup naturally.
+  - Electron behavior differed from the original app's overlay-aware terminal wheel gate.
+- Root cause:
+  - Terminal Manager overlay state was not included in the terminal wheel enabled calculation.
+- Resolution:
+  - Add a small `terminalWheelEnabled` helper.
+  - Report Terminal Manager launcher/history/saved/foreground popup visibility to `App`.
+  - Disable terminal wheel handling while any Terminal Manager popup is open.
+- Prevent recurrence:
+  - Add regression tests for Settings, checklist, and Terminal Manager overlay wheel gating.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/terminalWheel.ts`, terminal wheel tests
+- References: Original terminal wheel overlay guideline, parity audit 2026-06-10
+
+---
+
+#### Electron Settings icinde Saved Messages sekmesi eksikti {#electron-settings-saved-messages-tab-missing}
+- Date: 2026-06-10
+- Context: During original-vs-Electron parity work, the Rust app exposed Settings > Saved Messages for project-scoped saved message catalog management. The Electron port could send saved messages from Terminal Manager, but Settings did not expose the catalog.
+- Error signature:
+  1. `SettingsPopup` tabs omitted Saved Messages.
+  2. Project `savedMessages` could not be edited centrally from Electron Settings.
+  3. Worktree rows did not show that saved messages are owned by the root project family.
+- Symptoms/Impact:
+  - Users had to manage saved snippets outside Settings or through narrower Terminal Manager flows.
+  - Electron Settings looked less complete than the original app.
+- Root cause:
+  - Saved message catalog editing was not ported when the initial Electron Settings tabs were implemented.
+- Resolution:
+  - Add a Saved Messages tab to Electron Settings.
+  - Support adding, editing, and removing project saved messages.
+  - Keep worktree saved-message edits tied to the root project owner, matching the Terminal Manager inheritance model.
+- Prevent recurrence:
+  - Add helper tests for saved-message add/update/remove and root/worktree ownership replacement.
+- Files/Commands touched: `electron/renderer/src/components/SettingsPopup.tsx`, `electron/renderer/src/lib/savedMessages.ts`, saved message tests
+- References: Original `SettingsSection::SavedMessages`, parity audit 2026-06-10
+
+---
+
+#### Electron ACP protocol/status drift ve bildirim IPC uyumsuzlugu {#electron-acp-protocol-status-notify-drift}
+- Date: 2026-06-10
+- Context: User requested investigation and fixes for five critical bugs in the Electron worktree.
+- Error signature:
+  1. `npx tsc --noEmit` failed in `AcpChatPanel.tsx` because `effortOptions` was narrowed unsafely inside JSX callbacks.
+  2. ACP activity tracking in `App.tsx` reset `acpRunning` to false for events such as `promptSent` and `queued` because those events did not carry a `status` field.
+  3. Renderer called `api.invoke('notify:show')`, but the main process registered `notify:show` with `ipcMain.on`, so OS notifications had no invoke handler.
+  4. Electron ACP sessions ignored the configured ACP startup mode and could not persist a mode toggle before `sessionId` was available.
+  5. ACP permission handling used `params.requestId` and a synthetic `session/permission_response` method instead of replying to the JSON-RPC request id with a JSON-RPC result; the auto-approve setting was also unused.
+- Symptoms/Impact:
+  - Electron TypeScript builds failed.
+  - Closing the app could omit warnings for active ACP turns or queued prompts.
+  - Permission/turn-complete OS notifications failed at runtime.
+  - New ACP chats could start in the wrong mode and queued startup prompts could be dispatched with the wrong mode/model binding.
+  - ACP permission prompts could fail to unblock OpenCode, and auto-approve did not work even when enabled.
+- Root cause:
+  - ACP protocol/status behavior was duplicated in UI and main-process code without small tested helpers.
+  - IPC channel registration drifted from the renderer call shape.
+  - The Electron ACP implementation diverged from the Rust ACP permission response behavior.
+- Resolution:
+  - Added shared ACP protocol helpers for startup mode mapping, permission request id normalization, auto-approve option selection, and JSON-RPC permission responses.
+  - Added renderer ACP UI helpers for activity state, welcome gating, selector option gating, and action-control readiness.
+  - Updated `acpService.ts` to apply startup/pending mode on session creation, keep mode toggles while starting, auto-approve permission requests when configured, and keep sessions running after permission responses until the real prompt response arrives.
+  - Updated notification registration to `ipcMain.handle('notify:show')` and moved `notify:show` to invoke-channel typing.
+  - Rebuilt Electron dist assets from the updated source.
+- Prevent recurrence:
+  - Added regression tests in `electron/renderer/src/lib/acpProtocol.test.ts` and `electron/renderer/src/lib/acpUi.test.ts`.
+  - Verified with `npx tsc --noEmit`, `npx vitest run --reporter=dot`, and `npx vite build`.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/main/index.ts`, `electron/renderer/src/App.tsx`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/shared/acpProtocol.ts`, `electron/shared/types.ts`, `electron/renderer/dist/*`, `KNOWN_ISSUES.md`
+- References: User request 2026-06-10
+
+---
+
+#### Electron ACP slash komutu yazinca siyah ekran {#electron-acp-slash-command-black-screen}
+- Date: 2026-06-10
+- Context: User reported that typing `/` into the OpenCode ACP input made the screen go black.
+- Error signature:
+  1. `AcpChatPanel` assumed every available command had string `id` and `name` fields.
+  2. The slash-filter effect called `c.id.toLowerCase()` and `c.name.toLowerCase()` directly.
+  3. ACP command fixtures and real ACP payloads may provide only `name`, malformed entries, or non-array command data.
+- Symptoms/Impact:
+  - Typing `/` could throw a renderer exception and blank the Electron UI.
+  - Slash suggestions could render `/undefined` when command events lacked `id`.
+- Root cause:
+  - Slash command hint generation was not normalized or defensive at the UI boundary.
+- Resolution:
+  - Added `slashCommandHint()` and `slashCommandHints()` helpers that accept unknown command payloads, use `id` or `name`, strip leading `/`, reject malformed entries, deduplicate hints, and filter by query without throwing.
+  - Routed both `commands` events and `session.availableCommands` filtering through the shared helper.
+- Prevent recurrence:
+  - Added regression tests for id-only, name-only, malformed, non-array, deduplicated, and query-filtered slash command payloads.
+  - Verified with `npx tsc --noEmit`, `npx vitest run --reporter=dot`, and `npx vite build`.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/dist/*`, `KNOWN_ISSUES.md`
+- References: User request 2026-06-10
+
+---
+
 #### OpenCode ACP queued mesajı küçük ve ESC stop kısayolu eksikti {#acp-queued-row-escape-stop}
 - Date: 2026-06-04
 - Context: User reported that locally queued ACP messages looked absurdly tiny in the chat area, and requested that pressing `Esc` stop the AI response.
@@ -3697,6 +3942,1963 @@
 
 ---
 
+#### Electron Terminal Manager untracked satir ozeti eksikti {#electron-terminal-manager-untracked-line-summary}
+- Date: 2026-06-10
+- Context: Electron parity work found that the Terminal Manager diff summary counted tracked `git diff --numstat` lines but missed untracked text files that the Rust app includes in added-line totals.
+- Error signature:
+  1. `electron/main/worktree.ts` used only `git diff <base> --numstat`.
+  2. It did not run `git ls-files --others --exclude-standard -z`.
+  3. Untracked nested text files therefore showed as clean or under-counted in the Terminal Manager header badge.
+- Symptoms/Impact:
+  - New untracked source files were invisible to the Electron Terminal Manager `+N -M` summary.
+  - Electron did not match the original Rust `collect_source_control_line_totals()` behavior for collapsed untracked directories.
+- Root cause:
+  - The first Electron diff-summary implementation ported tracked numstat totals but omitted Rust's untracked text-file line counting and UTF-16/binary detection helpers.
+- Resolution:
+  - Added shared helpers for nul-delimited git path lists and UTF-8/UTF-16 text line counting.
+  - Updated `getGitDiffSummary()` to add untracked text-file line totals from `git ls-files --others --exclude-standard -z`.
+- Prevent recurrence:
+  - Added regression tests for nul-delimited path parsing, UTF-8/UTF-16 line counting, binary skip behavior, and existing numstat label formatting.
+- Files/Commands touched: `electron/main/worktree.ts`, `electron/shared/gitDiffSummary.ts`, `electron/renderer/src/lib/gitDiffSummary.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Input History zaman etiketleri Rust formatindan kisaydi {#electron-input-history-relative-time-format}
+- Date: 2026-06-10
+- Context: Electron parity work found that Input History timestamps used compact labels while the original Rust panel uses relative labels with `ago` wording plus week/month buckets.
+- Error signature:
+  1. `formatHistoryRelativeTime()` returned `now`, `2m`, `2h`, and `2d`.
+  2. Week and month ranges were not represented.
+  3. The visible Input History row therefore did not match Rust's `just now`, `2m ago`, `2w ago`, and `2mo ago` style.
+- Symptoms/Impact:
+  - Electron Input History looked less like the original sidebar and lost useful long-range context.
+- Root cause:
+  - The first Electron helper used a shorter display convention instead of porting Rust's `format_relative_time()` thresholds and labels.
+- Resolution:
+  - Updated the Electron relative-time helper to match Rust's second/minute/hour/day/week/month thresholds and wording.
+- Prevent recurrence:
+  - Expanded `inputHistory.test.ts` coverage for `just now`, minute, hour, day, week, and month labels.
+- Files/Commands touched: `electron/renderer/src/lib/inputHistory.ts`, `electron/renderer/src/lib/inputHistory.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Input History filtreleri kisaltilmis buton gibi gorunuyordu {#electron-input-history-filter-tab-visual-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that the Input History filter row still used compact `FG`/`BG` button labels while the original panel presents full `All`, `Foreground`, and `Background` tabs.
+- Error signature:
+  1. Filter labels used `FG` and `BG` abbreviations instead of the shared user-facing labels.
+  2. The row used heavier bordered button chrome, making the panel less consistent with the original sidebar style.
+  3. Input history rows used smaller 11px command text, reducing visual density compared with the Rust 13px row text.
+- Symptoms/Impact:
+  - The Electron Input History panel looked noticeably different from the Rust panel despite matching the underlying filtering behavior.
+- Root cause:
+  - The first Electron filter row favored compact web button styling instead of porting the original full-label tab appearance.
+- Resolution:
+  - Switched the filter row to full `InputHistoryFilterLabel` text.
+  - Moved tab and row hover/selected styling into global CSS with lighter, Rust-like row chrome.
+  - Increased entry text/timestamp sizing to better match the original sidebar density.
+- Prevent recurrence:
+  - Keep Input History filter labels sourced from the shared filter label table rather than local abbreviations.
+- Files/Commands touched: `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Input History kopyalama geri bildirimi yoktu {#electron-input-history-copy-feedback}
+- Date: 2026-06-10
+- Context: Electron parity work found that clicking an Input History row copied text silently, while the Rust panel shows a short `Copied to clipboard` status feedback and provides a right-click Copy menu.
+- Error signature:
+  1. `InputHistory.tsx` called `clipboard:writeText` directly on row click without any visible confirmation.
+  2. History rows did not handle `contextmenu`, so users had no explicit Copy action path.
+- Symptoms/Impact:
+  - Users could not tell whether a history row copy succeeded.
+  - Electron lacked the Rust panel's secondary copy affordance.
+- Root cause:
+  - The initial Electron panel port copied the underlying data behavior but omitted the UI feedback and context menu details.
+- Resolution:
+  - Added a short local `Copied to clipboard` toast after row-click or context-menu copy.
+  - Added a lightweight right-click context menu with a single Copy action for history rows.
+- Prevent recurrence:
+  - Keep row copy actions routed through one helper so click and context-menu copy share the same feedback path.
+- Files/Commands touched: `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron worktree kaldirma Input History kaydini temizlemiyordu {#electron-worktree-removal-input-history-cleanup}
+- Date: 2026-06-10
+- Context: Electron parity work found that the Rust app removes a deleted/removed project's input history and resets the selected history project if needed, but Electron worktree removal paths only updated config/browser state.
+- Error signature:
+  1. Orphan worktree cleanup removed projects from config without deleting `history.projects[path]`.
+  2. Git worktree deletion removed the registered project without deleting its persisted input history.
+  3. Source Control's `Remove from Mergen` button had an optional callback but App did not provide it.
+- Symptoms/Impact:
+  - Removed worktrees could leave stale Input History records in persistent history.
+  - The Source Control removal affordance appeared clickable but did not remove registered worktrees from Electron state.
+- Root cause:
+  - Project removal cleanup was duplicated inline and did not share Rust's input-history cleanup step.
+- Resolution:
+  - Added input-history removal helpers for one or many project paths.
+  - Centralized Electron project removal-by-path cleanup in App for config, history, browser scope, browser open state, active browser scope, and selected-project reset.
+  - Wired Source Control's `Remove from Mergen`, orphan cleanup, and delete-worktree paths through the shared cleanup callback.
+- Prevent recurrence:
+  - Added regression coverage for single and batch input-history removal helpers.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/inputHistory.ts`, `electron/renderer/src/lib/inputHistory.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Terminal Manager diff ozeti stale kalabiliyordu {#electron-terminal-manager-diff-summary-auto-refresh}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust Terminal Manager diff badges are fed by Source Control's recurring refresh state, while Electron fetched each project's diff summary only when the project list/path key changed.
+- Error signature:
+  1. `TerminalManager.tsx` loaded `git:diffSummary` inside a project-key effect.
+  2. After files changed, the `+N -M` badge could remain stale until the panel remounted or project paths changed.
+  3. This diverged from Rust's auto-refreshing Source Control snapshot model.
+- Symptoms/Impact:
+  - Terminal Manager could show outdated clean/changed badges for active projects.
+- Root cause:
+  - The first Electron diff badge port implemented initial fetch but omitted a background refresh loop.
+- Resolution:
+  - Added a 30-second background refresh for Terminal Manager diff summaries.
+  - Kept loading indicators only for the initial/project-list refresh so periodic updates do not flash `...` over existing badges.
+- Prevent recurrence:
+  - Keep future Terminal Manager diff-summary changes aligned with Source Control refresh behavior instead of treating the badge as a one-shot fetch.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control ahead/behind bilgisini gostermiyordu {#electron-source-control-ahead-behind}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust parses `git status --branch` headers into branch, ahead, and behind counts and displays them in Source Control, while Electron kept only the branch name.
+- Error signature:
+  1. `getGitStatus()` stripped the branch header with `split('...')[0]`.
+  2. `ahead` and `behind` counts from headers such as `## main...origin/main [ahead 2, behind 1]` were discarded.
+  3. The Source Control header could not show divergence from upstream.
+- Symptoms/Impact:
+  - Electron Source Control lost useful upstream divergence context visible in the Rust app.
+- Root cause:
+  - The first Electron status parser only needed a branch label and did not port Rust's `parse_branch_header()` behavior.
+- Resolution:
+  - Added shared branch-header parsing and branch-line formatting helpers.
+  - Extended `SourceControlStatus`/`SourceControlSnapshot` with `ahead` and `behind`.
+  - Updated `getGitStatus()` and Source Control header rendering to carry and display `branch  ahead:N behind:M`.
+- Prevent recurrence:
+  - Added regression tests for branch header parsing and Rust-style branch line formatting.
+- Files/Commands touched: `electron/shared/sourceControl.ts`, `electron/shared/types.ts`, `electron/main/worktree.ts`, `electron/renderer/src/components/SourceControl.tsx`, `electron/renderer/src/lib/sourceControl.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control status satirlari raw git kodu gosteriyordu {#electron-source-control-status-line-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust converts `git status --porcelain` file rows into semantic status labels and normalizes rename paths, while Electron carried raw status codes into the UI.
+- Error signature:
+  1. `getGitStatus()` pushed `statusCode.trim()` directly into `SourceControlFile.status`.
+  2. Rename rows such as `R  old.ts -> src/new.ts` kept the full `old -> new` path instead of the new path.
+  3. `U` was labeled `Updated` in the renderer while Rust labels it `Conflicted`.
+- Symptoms/Impact:
+  - Source Control rows did not match Rust's `Modified src/app.rs` / `Renamed src/new.ts` style.
+  - Search/status matching could miss Rust-style semantic terms such as `Conflicted`.
+- Root cause:
+  - The Electron status parser implemented a minimal raw-code view instead of porting Rust's `apply_source_control_status_line()` behavior.
+- Resolution:
+  - Added shared source-control status-line parsing with semantic labels, staged detection, conflict/ignored mappings, and rename path normalization.
+  - Updated main-process `getGitStatus()` to return semantic `SourceControlFile` rows.
+  - Updated Source Control file rows to render a staged/unstaged marker plus monospace `Status path` text.
+- Prevent recurrence:
+  - Added regression tests for renamed, unstaged, untracked, conflicted, ignored, and unknown status handling.
+- Files/Commands touched: `electron/shared/sourceControl.ts`, `electron/main/worktree.ts`, `electron/renderer/src/components/SourceControl.tsx`, `electron/renderer/src/lib/sourceControl.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control dosya satiri context menusu eksikti {#electron-source-control-file-context-menu}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust Source Control file rows provide a right-click menu for opening the containing folder and copying the relative path, while Electron file rows were passive.
+- Error signature:
+  1. Changed file rows in `SourceControl.tsx` rendered text only.
+  2. There was no `Open in Folder` action equivalent to Rust's file explorer integration.
+  3. There was no `Copy Relative Path` action or feedback.
+- Symptoms/Impact:
+  - Users could inspect changed files but could not quickly jump to the containing folder or copy paths from Source Control.
+- Root cause:
+  - The first Electron Source Control panel ported the status list display without porting row context actions.
+- Resolution:
+  - Added `shell:showItemInFolder` IPC backed by Electron `shell.showItemInFolder`.
+  - Added Source Control file-row context menu with `Open in Folder` and `Copy Relative Path`.
+  - Added short feedback toast for successful open/copy and open failures.
+- Prevent recurrence:
+  - Added a shared path-join helper for project-root plus git-relative file path, with regression coverage for Windows and POSIX-shaped paths.
+- Files/Commands touched: `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/shared/sourceControl.ts`, `electron/renderer/src/components/SourceControl.tsx`, `electron/renderer/src/lib/sourceControl.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron worktree slug temizleme Rust'tan daha agresifti {#electron-worktree-slug-sanitization}
+- Date: 2026-06-10
+- Context: Electron parity work found that Create Worktree slug generation removed valid branch-name characters that Rust preserves.
+- Error signature:
+  1. Electron used `/[^a-z0-9_-]+/g`, replacing dots and all non-ASCII characters.
+  2. Rust only replaces path-invalid characters (`/`, `\`, spaces, `:`, `*`, `?`, `"`, `<`, `>`, `|`), collapses `..`, trims `-`, and lowercases.
+- Symptoms/Impact:
+  - Branches like `release.v1` or `özellik/çağrı` generated different worktree paths in Electron than in Rust.
+- Root cause:
+  - The Electron slug helper used a broad ASCII-only URL-style sanitizer instead of porting Rust's path-oriented sanitizer.
+- Resolution:
+  - Updated `sanitizeWorktreeSlug()` to match Rust's invalid-character set, `..` handling, trimming, and lowercase behavior.
+- Prevent recurrence:
+  - Added regression tests for slash/space, dot preservation, `..` replacement, and Unicode preservation.
+- Files/Commands touched: `electron/renderer/src/lib/worktree.ts`, `electron/renderer/src/lib/worktree.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Create Worktree yolu ve base branch Rust davranisindan sapmisti {#electron-create-worktree-path-base-branch-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Create Worktree popup auto-fills the base branch from the current Source Control branch and shows the absolute auto-generated worktree path, while Electron displayed only a relative preview and left the base branch blank.
+- Error signature:
+  1. Electron rendered `../worktrees/<slug>` in the modal but submitted a separately calculated absolute path.
+  2. The create modal did not initialize `Base branch (optional)` from the current branch.
+  3. Create-in-progress state still allowed modal close and existing-worktree add actions.
+- Symptoms/Impact:
+  - Users could not verify the exact destination path before creating a worktree.
+  - Creating a branch from the active branch required retyping the base branch even though Rust prefilled it.
+  - Modal actions could drift while a git worktree create request was in flight.
+- Root cause:
+  - Electron duplicated a partial path calculation inside the component instead of sharing a Rust-parity default path helper and modal-open initialization flow.
+- Resolution:
+  - Added `defaultWorktreePathForBranch()` matching Rust's `parent/worktrees/slug` behavior for Windows and POSIX-shaped paths.
+  - Updated Source Control's Create Worktree modal to use the same computed path for display and submit.
+  - Prefilled base branch from the current snapshot branch on modal open, moved existing worktrees above the form, and disabled close/add/edit actions while creating.
+- Prevent recurrence:
+  - Added regression coverage for POSIX, Windows, drive-root, and relative default worktree paths.
+- Files/Commands touched: `electron/renderer/src/lib/worktree.ts`, `electron/renderer/src/lib/worktree.test.ts`, `electron/renderer/src/components/SourceControl.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Create Worktree hata durumu modal icinde tutulmuyordu {#electron-create-worktree-inline-error}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust keeps Create Worktree failures inside the popup as `create_worktree_error`, while Electron used a browser alert and did not recover cleanly from rejected IPC calls.
+- Error signature:
+  1. `git:createWorktree` returning `false` opened an alert instead of preserving context in the modal.
+  2. A rejected IPC call could skip `setCreateLoading(false)`.
+  3. Editing/reopening the form did not explicitly clear the previous error state because there was no local error state.
+- Symptoms/Impact:
+  - Create failures interrupted the modal workflow and could leave the button in a stale loading state.
+- Root cause:
+  - The Electron modal handled only boolean failure through `alert()` and did not mirror Rust's inline popup error lifecycle.
+- Resolution:
+  - Added local `createError` state, inline error/status text, try/catch/finally around create submit, and error clearing on reopen/edit/cancel/success.
+- Prevent recurrence:
+  - Keep create-worktree async state transitions localized to the modal instead of using browser alerts for recoverable git failures.
+- Files/Commands touched: `electron/renderer/src/components/SourceControl.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Terminal Manager Create Worktree dugmesi bagli degildi {#electron-terminal-manager-create-worktree-entry}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust opens the Create Worktree popup from Terminal Manager root project rows, while Electron rendered the matching `Create Worktree` icon button with a TODO handler.
+- Error signature:
+  1. `TerminalManager.tsx` showed the `📁+` button only as hover chrome.
+  2. Clicking it stopped propagation but did not open any create-worktree UI.
+  3. Source Control owned the only Electron create modal, so Terminal Manager had no route into the workflow.
+- Symptoms/Impact:
+  - Users could create worktrees from Source Control but not from Terminal Manager, unlike the Rust app.
+- Root cause:
+  - The initial Electron Terminal Manager port left the create-worktree action unwired instead of routing it to the existing Source Control modal.
+- Resolution:
+  - Added a Terminal Manager `onCreateWorktree` callback.
+  - Routed the App-level request to select the project, switch to Source Control, and pass an auto-open request id.
+  - Updated Source Control to open its create modal after the selected project's status snapshot is ready so the base branch can be prefilled.
+- Prevent recurrence:
+  - Keep Terminal Manager root-row action buttons wired through typed props instead of leaving local TODO handlers.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/components/SourceControl.tsx`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Terminal Manager satir path menusu eksikti {#electron-terminal-manager-path-context-menu}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust Terminal Manager project and worktree rows expose a context menu with `Copy Path` and `Open in Folder`, while Electron rows only toggled expansion.
+- Error signature:
+  1. Right-clicking Terminal Manager project/worktree headers opened no row actions.
+  2. Users had to switch panels or manually locate paths to copy/open project folders.
+- Symptoms/Impact:
+  - Terminal Manager lost Rust's quick path inspection workflow, especially for nested worktrees.
+- Root cause:
+  - The Electron Terminal Manager port implemented header hover buttons but omitted Rust's row context menu.
+- Resolution:
+  - Added a shared Terminal Manager path context menu for root project and worktree headers.
+  - Wired `Copy Path` through clipboard IPC and `Open in Folder` through shell IPC with a Rust-style feedback toast.
+  - Counted the context menu as a Terminal Manager overlay so surrounding wheel/input handling treats it like other foreground popups.
+- Prevent recurrence:
+  - Keep Terminal Manager row actions aligned with Rust header/context-menu actions whenever root/worktree rows change.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Directory ust path aksiyonlari eksikti {#electron-directory-project-path-actions}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Directory panel exposes selected-project `Copy Path`, `Open in Folder`, and `Refresh Directory Index` controls next to the project selector, while Electron's Project Explorer only showed the project name and search field.
+- Error signature:
+  1. Project Explorer had no way to copy the selected project path from the Directory panel.
+  2. Project Explorer had no direct open-folder action.
+  3. Directory refresh required switching projects or reloading instead of a panel-local refresh action.
+- Symptoms/Impact:
+  - Directory panel workflows were slower than Rust for common project path operations.
+- Root cause:
+  - The Electron Project Explorer port focused on lazy tree rendering and search but omitted Rust's selected-project toolbar actions.
+- Resolution:
+  - Added compact icon controls for `Copy Path`, `Open in Folder`, and `Refresh Directory Index`.
+  - Reused the shallow root directory scan for refresh so initial indexing remains lightweight.
+  - Added a small feedback toast matching the existing panel feedback style.
+- Prevent recurrence:
+  - Keep Directory panel header actions aligned with Rust when project selection or directory indexing controls change.
+- Files/Commands touched: `electron/renderer/src/components/ProjectExplorer.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control worktree branch kopyalama eksikti {#electron-source-control-worktree-copy-branch}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust Source Control worktree rows expose a right-click `Copy Branch Name` action, while Electron worktree rows only showed add/remove/delete buttons.
+- Error signature:
+  1. Worktree rows had no context menu.
+  2. Detached worktrees used a generic `(detached)` label instead of Rust's `detached@<short-head>` display fallback.
+  3. Worktree search matched raw branch/path only, not the Rust-style display label.
+- Symptoms/Impact:
+  - Users could not quickly copy a worktree branch name from Source Control.
+  - Detached worktree rows carried less identifying context than the Rust panel.
+- Root cause:
+  - The Electron Source Control worktree list ported row buttons but omitted Rust's worktree label helper and context-menu action.
+- Resolution:
+  - Added shared `sourceControlWorktreeLabel()` with branch-ref stripping, detached short-head fallback, and path basename fallback.
+  - Updated Source Control worktree rows and search to use the shared label.
+  - Added a worktree-row context menu with `Copy Branch Name` and feedback.
+- Prevent recurrence:
+  - Keep worktree row labels and context actions covered in shared source-control helper tests.
+- Files/Commands touched: `electron/shared/sourceControl.ts`, `electron/renderer/src/lib/sourceControl.test.ts`, `electron/renderer/src/components/SourceControl.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Directory expand collapse all kontrolu eksikti {#electron-directory-expand-collapse-all}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Directory panel can expand or collapse all loaded folders from the toolbar, while Electron required toggling folders one by one.
+- Error signature:
+  1. Project Explorer had no expand-all/collapse-all control.
+  2. Loaded lazy subtrees could not be opened or collapsed as a group.
+  3. The action was not disabled during search even though Rust avoids tree-wide open-state changes while search is active.
+- Symptoms/Impact:
+  - Directory navigation remained slower than Rust for moderately nested projects.
+- Root cause:
+  - The Electron tree port implemented lazy row expansion but did not port the toolbar-level open-state action.
+- Resolution:
+  - Added shared directory-tree helpers for loaded directory path collection and collapsed-folder detection.
+  - Added an Expand All / Collapse All toolbar button that keeps the root visible and changes only loaded folder state.
+  - Disabled the action while search text is active.
+- Prevent recurrence:
+  - Added regression tests for loaded directory collection, symlink skip behavior, and collapsed-folder detection.
+- Files/Commands touched: `electron/renderer/src/lib/directoryTree.ts`, `electron/renderer/src/lib/directoryTree.test.ts`, `electron/renderer/src/components/ProjectExplorer.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Directory panelinde proje secici ve kaldirma yoktu {#electron-directory-project-selector-actions}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Directory panel includes a project selector plus Add Project and Remove Project controls, while Electron required using the currently selected project from outside the panel and only showed Add Project when the list was empty.
+- Error signature:
+  1. Directory panel header displayed only the selected project name.
+  2. Users could not switch projects directly from Directory.
+  3. Add Project and Remove Project were not available from the active Directory panel.
+  4. Directory search placeholder said `Search files...` instead of Rust's `Search files and folders`.
+- Symptoms/Impact:
+  - Directory navigation and project management were less efficient than the Rust UI.
+- Root cause:
+  - The Electron Project Explorer component was scoped to a single project and did not receive the project list or App-level project management callbacks.
+- Resolution:
+  - Passed project list, selection, add, and remove callbacks from App into Project Explorer.
+  - Replaced the static project header with a compact project selector and Add/Remove controls.
+  - Updated the search placeholder to match Rust wording.
+- Prevent recurrence:
+  - Keep Directory panel project-management actions wired through App-level callbacks so config cleanup remains centralized.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/ProjectExplorer.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control fetch ve klasor acma kontrolleri eksikti {#electron-source-control-fetch-open-folder}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Source Control toolbar has `Refresh Status`, `Fetch and Refresh`, `Open Project Folder`, and `Create Worktree`, while Electron only had refresh and create worktree.
+- Error signature:
+  1. `git:status` could not request `git fetch --all --prune`.
+  2. Source Control fetch/status failures were collapsed into an empty clean-looking result.
+  3. Source Control had no project-folder open button.
+- Symptoms/Impact:
+  - Ahead/behind data could stay stale until the user fetched externally.
+  - Git failures were easy to misread as a clean working tree.
+  - Users had to leave Source Control to open the project folder.
+- Root cause:
+  - The Electron git status IPC was status-only and did not carry Rust's optional fetch step or error surface.
+- Resolution:
+  - Added optional `runFetch` support to `git:status`, using `git fetch --all --prune` before status when requested.
+  - Returned status/fetch errors through `SourceControlStatus.error` and rendered them in the panel.
+  - Added Source Control toolbar buttons for `Open Project Folder` and `Fetch and Refresh`.
+- Prevent recurrence:
+  - Keep Source Control toolbar actions and IPC options aligned with Rust's `request_source_control_refresh(run_fetch, manual)` behavior.
+- Files/Commands touched: `electron/main/worktree.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/components/SourceControl.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Directory satir context menusu eksikti {#electron-directory-node-context-menu}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Directory tree rows expose right-click actions for folders and files, while Electron rows only supported left-click navigation/opening.
+- Error signature:
+  1. Folder rows had no `Copy Path` context action.
+  2. File rows had no `Open in Editor`, `Open with Default App`, `Reveal in Folder`, or `Copy Path` context actions.
+  3. The renderer lacked an IPC channel for opening a local file with the OS default app.
+- Symptoms/Impact:
+  - Common file-tree actions required leaving the Directory panel or using external tools.
+  - Electron's Directory panel felt less complete than the Rust implementation for repeated file navigation.
+- Root cause:
+  - The Electron Project Explorer port implemented lazy tree rendering but skipped the row-level context menu behavior from Rust's `draw_folder_tree()`.
+- Resolution:
+  - Added tested directory-tree context action helpers matching Rust's folder/file action sets.
+  - Added a Project Explorer row context menu with file editor open, default app open, reveal-in-folder, and path copy actions.
+  - Added `shell:openPath` IPC support for OS default-app file opening.
+- Prevent recurrence:
+  - Keep Directory row action sets covered in `directoryTree.test.ts` when adding or changing tree context menu behavior.
+- Files/Commands touched: `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/lib/directoryTree.ts`, `electron/renderer/src/lib/directoryTree.test.ts`, `electron/renderer/src/components/ProjectExplorer.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron File Editor context menusu Rust davranisindan sapti {#electron-file-editor-context-menu-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's File Editor uses a lightweight context menu with a selection-aware `Copy` action, while Electron created an ad hoc DOM menu with different styling and an extra paste action.
+- Error signature:
+  1. File Editor context menu was created imperatively with `document.createElement`.
+  2. The menu styling did not match the other Electron/Rust-like context menus.
+  3. Copy did not preserve a right-click pre-selection as explicitly as Rust's stored selection path.
+- Symptoms/Impact:
+  - File Editor right-click behavior looked and felt different from Rust and from the rest of Electron's panels.
+  - Right-clicking selected text could risk copying the post-click caret state instead of the original selection.
+- Root cause:
+  - The Electron File Editor implemented a quick browser-style menu before the Rust selection-preservation behavior was ported.
+- Resolution:
+  - Replaced the imperative DOM menu with React-managed context menu state.
+  - Captured the secondary-click selection before the context menu opens and restored it while the menu is visible.
+  - Added a shared helper and regression tests for selection range text extraction.
+- Prevent recurrence:
+  - Keep editor context menu behavior state-driven and covered by helper tests for selection range edge cases.
+- Files/Commands touched: `electron/renderer/src/components/FileEditor.tsx`, `electron/renderer/src/lib/fileEditor.ts`, `electron/renderer/src/lib/fileEditor.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control proje secici ve bos durum metni Rust ile uyumsuzdu {#electron-source-control-project-selector-status-text}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Source Control panel includes a project selector in the header and distinguishes `Status pending` from `Working tree is clean`, while Electron showed only the active project name and used different clean-state wording.
+- Error signature:
+  1. Source Control header could not switch projects directly from inside the panel.
+  2. Clean state displayed `Working tree clean.` instead of Rust's `Working tree is clean`.
+  3. The panel had no Rust-equivalent display-data helper for deciding when to show `Status pending`.
+- Symptoms/Impact:
+  - Source Control navigation was less efficient than Rust for multi-project workspaces.
+  - Empty-state copy and status lifecycle were inconsistent across ports.
+- Root cause:
+  - The Electron Source Control component was scoped to a single selected project and did not carry Rust's source-control snapshot display-data rule.
+- Resolution:
+  - Added Source Control project selector props and wired them from App.
+  - Added shared `sourceControlSnapshotHasDisplayData()` with regression coverage.
+  - Updated empty-state messaging to show `Status pending` or `Working tree is clean` using the Rust display-data rule.
+- Prevent recurrence:
+  - Keep Source Control panel header controls and empty-state labels covered when porting Rust Source Control behavior.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/SourceControl.tsx`, `electron/shared/sourceControl.ts`, `electron/renderer/src/lib/sourceControl.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser toolbar refresh ve URL temizleme kontrolleri eksikti {#electron-browser-toolbar-refresh-clear-url}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Browser panel has compact toolbar controls for refreshing the active page and clearing the URL/tab state, while Electron exposed URL navigation, inspect, and screenshots but not these two direct actions.
+- Error signature:
+  1. Browser UI had no visible `Refresh` action despite an existing `browser:reload` IPC channel.
+  2. Browser UI had no `Clear URL` action to reset the draft, active tab metadata, and persisted project URL.
+  3. Project-scoped `browserLastUrl` could only be replaced by navigating elsewhere, not cleared from the browser toolbar.
+- Symptoms/Impact:
+  - Users had to use external browser gestures or MCP commands for a simple refresh.
+  - Reopening the Browser panel could restore an unwanted last URL after the user intended to clear it.
+- Root cause:
+  - The Electron BrowserPanel toolbar port skipped Rust's refresh/clear toolbar actions and only wired the lower-level IPC/state pieces.
+- Resolution:
+  - Added compact Refresh and Clear URL toolbar buttons.
+  - Wired Refresh to `browser:reload`.
+  - Added tested helpers for clearable URL detection and active-tab URL reset.
+  - Added App-level clearing of project-family `browserLastUrl` for project-scoped browser panels.
+- Prevent recurrence:
+  - Keep Browser toolbar controls aligned with Rust's compact URL-row actions when adding or reshuffling browser UI.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/BrowserPanel.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Input History bos durum metinleri Rust ile birebir degildi {#electron-input-history-label-copy-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's Input History panel uses exact no-period empty messages and always formats the result count as `N entries`, while Electron used sentence punctuation and singularized `1 entry`.
+- Error signature:
+  1. Empty project state showed `Select a project to view history.` instead of `Select a project to view history`.
+  2. Empty history/search states showed trailing periods.
+  3. Count label singularized one result as `1 entry`, unlike Rust's `1 entries`.
+- Symptoms/Impact:
+  - The Input History panel copy did not visually match the Rust reference.
+- Root cause:
+  - Electron implemented natural English UI copy independently instead of using the Rust panel's exact labels.
+- Resolution:
+  - Added tested Input History label helpers for empty messages and result count formatting.
+  - Updated the Input History component to use Rust-equivalent labels.
+- Prevent recurrence:
+  - Keep Input History visible copy in helper tests when changing panel labels.
+- Files/Commands touched: `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/lib/inputHistory.ts`, `electron/renderer/src/lib/inputHistory.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron File Editor kaydet dugmesi Rust toolbar gorunumunden farkliydi {#electron-file-editor-save-button-visual-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's File Editor header uses compact icon-only Save and Close buttons, while Electron still used a wider text `Save` button.
+- Error signature:
+  1. Save action rendered as a text button instead of a 28px icon-only toolbar button.
+  2. Save tooltip said `Save (Ctrl+S)` instead of Rust's `Save File (Ctrl+S)` / `No unsaved changes` split.
+  3. Close tooltip said `Close` instead of `Close Editor`.
+- Symptoms/Impact:
+  - File Editor header looked heavier and less like the Rust reference.
+- Root cause:
+  - The Electron File Editor header was implemented before the Rust compact toolbar treatment was ported.
+- Resolution:
+  - Replaced the text Save button with a compact icon-only toolbar button.
+  - Added shared File Editor toolbar button styling for enabled, hover, and muted disabled states.
+  - Aligned Save and Close tooltips with Rust labels.
+- Prevent recurrence:
+  - Keep File Editor header actions icon-only unless the Rust reference changes.
+- Files/Commands touched: `electron/renderer/src/components/FileEditor.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron activity rail metinliydi ve Rust ikon-only gorunumunden farkliydi {#electron-activity-rail-icon-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's activity rail uses compact icon-only buttons with tooltip labels, while Electron rendered text such as `Explorer`, `Terminals`, `History`, and `Check` inside 40px buttons.
+- Error signature:
+  1. Rail buttons used visible text labels instead of icons.
+  2. Long labels were cramped in the fixed 48px rail.
+  3. Tooltip copy did not fully match Rust labels such as `Open Directory` and `Toggle Browser Panel`.
+- Symptoms/Impact:
+  - The Electron shell looked less like the Rust reference and the rail was harder to scan.
+- Root cause:
+  - The initial Electron shell used descriptive text labels before the Rust icon rail treatment was ported.
+- Resolution:
+  - Added tested activity rail item metadata for Rust-equivalent order, icons, and tooltip labels.
+  - Updated App rail buttons to render icon-only content with accessible labels.
+  - Added rail icon styling, including monospace treatment for the terminal glyph.
+- Prevent recurrence:
+  - Keep rail order and tooltip copy covered by `activityRail.test.ts` when changing shell navigation.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/activityRail.ts`, `electron/renderer/src/lib/activityRail.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron activity rail ayni sekmeye tiklayinca sol paneli kapatmiyordu {#electron-activity-rail-toggle-collapse}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's activity rail toggles the left sidebar: clicking the active Directory/Source Control/Terminal Manager/Input History icon collapses the panel, while clicking an inactive icon opens the panel and switches tabs.
+- Error signature:
+  1. Electron ignored `ui.projectExplorerExpanded` during render.
+  2. Left sidebar and resize handle were always visible.
+  3. Active rail state was based only on `activeTab`, so a collapsed tab could still look active.
+- Symptoms/Impact:
+  - Users could not reclaim horizontal space from the left sidebar using the rail.
+  - Electron shell behavior diverged from the Rust reference even though the persisted config fields existed.
+- Root cause:
+  - The Electron shell rendered a permanently open sidebar and never wired the Rust expand/collapse rail behavior.
+- Resolution:
+  - Added tested activity rail state helpers for active-tab detection, programmatic open, and user toggle.
+  - Rendered sidebar and resize handle only when `showProjectExplorer && projectExplorerExpanded`.
+  - Updated rail active styling to depend on the expanded state.
+  - Ensured programmatic Terminal Manager/Source Control reveal paths open the sidebar instead of toggling it closed.
+- Prevent recurrence:
+  - Keep activity rail toggle behavior covered in helper tests whenever shell navigation state changes.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/activityRail.ts`, `electron/renderer/src/lib/activityRail.test.ts`, `electron/renderer/src/lib/terminalManagerState.ts`, `electron/renderer/src/lib/terminalManagerState.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Check-list paneli bos projeleri gosteriyordu {#electron-checklist-items-only-parity}
+- Date: 2026-06-10
+- Context: Electron parity work found that Rust's floating Check-list panel lists only projects that currently have checklist items and shows a centered helper message when the list is empty, while Electron listed every project with `No items` rows.
+- Error signature:
+  1. Projects with empty checklist arrays appeared in the floating panel.
+  2. Empty state said `No projects with checklist items.` instead of Rust's two-line guidance.
+  3. Panel title used `Checklist` instead of `Check-list`.
+  4. Copy feedback used `item(s)` instead of Rust's `Copied N checklist items`, and item copy had no feedback.
+- Symptoms/Impact:
+  - The Check-list panel was noisier than Rust and less clear when there were no saved items.
+- Root cause:
+  - The Electron panel rendered the raw project list instead of Rust's prefiltered `projects_with_checklist` collection.
+- Resolution:
+  - Added tested checklist helpers for item-bearing project filtering, clipboard formatting, and feedback text.
+  - Updated the component to render only projects with checklist items.
+  - Aligned title, empty state, copy-all feedback, and item-copy feedback with Rust.
+- Prevent recurrence:
+  - Keep Check-list filtering and visible copy covered by `checklist.test.ts` when changing checklist UI behavior.
+- Files/Commands touched: `electron/renderer/src/components/Checklist.tsx`, `electron/renderer/src/lib/checklist.ts`, `electron/renderer/src/lib/checklist.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Check-list Browser acikken WebView'i gizliyordu {#electron-checklist-browser-coexistence}
+- Date: 2026-06-10
+- Context: Rust's floating Check-list is non-modal: it can coexist with the Browser panel and is offset to the left of the Browser so it does not cover the native WebView area. Electron hid Browser whenever Check-list was visible.
+- Error signature:
+  1. `checklistVisible` triggered `browser:hideAll`.
+  2. BrowserPanel received `hidden={settingsOpen || checklistVisible}`.
+  3. The Check-list popup always used a fixed right offset and could overlap the Browser panel area.
+- Symptoms/Impact:
+  - Opening Check-list made the embedded browser disappear, unlike Rust.
+  - Check-list and Browser could not be used side by side.
+- Root cause:
+  - Electron treated Check-list like a modal overlay instead of Rust's non-modal floating panel.
+- Resolution:
+  - Removed Check-list from Browser hide/hidden conditions; Settings remains modal and still hides Browser.
+  - Added tested Check-list right-offset calculation so the popup moves left of the Browser panel when Browser is visible.
+  - Passed the computed offset from App into the Check-list component.
+- Prevent recurrence:
+  - Keep Check-list/Browser coexistence covered by checklist positioning helpers and avoid adding `checklistVisible` back to Browser hide conditions.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/Checklist.tsx`, `electron/renderer/src/lib/checklist.ts`, `electron/renderer/src/lib/checklist.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser son project tab kapaninca paneli acik birakiyordu {#electron-browser-last-tab-closes-panel}
+- Date: 2026-06-10
+- Context: Rust's `close_browser_panel_tab()` closes the Browser panel for the project when the last tab in that scope is closed. Electron cleared the tab state but left the right Browser panel open for project-scoped tabs.
+- Error signature:
+  1. `BrowserPanel.closeTab()` called `onScopeEmpty(scope)` when no tabs remained.
+  2. App's `onScopeEmpty` only handled terminal-scoped browser override cleanup.
+  3. Project-scoped browser panels remained open with no tabs.
+- Symptoms/Impact:
+  - Closing the final Browser tab left an empty Browser panel instead of reclaiming the right-side space like Rust.
+- Root cause:
+  - Electron did not map the Rust project-panel close step to `browserOpenProjects` state.
+- Resolution:
+  - Added tested Browser toolbar helper for project-open set updates when a browser scope becomes empty.
+  - Wired project-scoped `onScopeEmpty` to remove the project from `browserOpenProjects`.
+  - Preserved terminal-scoped behavior so only the terminal override is cleared while the project Browser panel stays open.
+- Prevent recurrence:
+  - Keep Browser empty-scope lifecycle covered in `browserToolbar.test.ts`.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser screenshot butonlari metin agirlikliydi {#electron-browser-screenshot-icon-parity}
+- Date: 2026-06-10
+- Context: Rust renders the Browser screenshot controls as two compact icon buttons in a single bordered frame (`Full page` scan icon and `Visible area` scan-line icon). Electron still used visible `Full` and `Visible` text buttons.
+- Error signature:
+  1. Browser toolbar screenshot controls consumed extra horizontal space.
+  2. The visible labels did not match the icon-first Rust toolbar style.
+  3. Screenshot pending state was not reflected in the tooltip text.
+- Symptoms/Impact:
+  - The Electron Browser panel looked less like the Rust reference and became tighter at narrow widths.
+- Root cause:
+  - The Electron port used temporary text buttons instead of a shared toolbar metadata helper and grouped icon styling.
+- Resolution:
+  - Added tested screenshot button metadata for icon, tooltip, aria label, and full-page mapping.
+  - Replaced `Full` / `Visible` text buttons with two compact icon buttons in a bordered split group.
+  - Tracked screenshot requests in flight so tooltips can show the same pending copy as Rust.
+- Prevent recurrence:
+  - Keep Browser screenshot control labels covered in `browserToolbar.test.ts` before changing Browser toolbar JSX.
+- Files/Commands touched: `electron/renderer/src/components/BrowserPanel.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control header'i Rust ikon barindan sapmisti {#electron-source-control-header-icon-parity}
+- Date: 2026-06-10
+- Context: Rust's Source Control panel renders a compact `Project` label, a project selector, and four icon-only actions: Refresh Status, Fetch and Refresh, Open Project Folder, and Create Worktree. Electron kept status/branch text in the header and used a wide `+ Worktree` text button.
+- Error signature:
+  1. Source Control header consumed horizontal space with `Clean`/change count and branch text.
+  2. Create Worktree rendered as `+ Worktree` instead of an icon-only action.
+  3. Header action styling used bordered text-button chrome rather than Rust's lightweight icon controls.
+  4. Empty search text had a trailing period (`No matching files or worktrees.`) unlike Rust.
+- Symptoms/Impact:
+  - The Source Control panel looked denser and less like the Rust reference, especially in narrow sidebars.
+- Root cause:
+  - The Electron port carried an early operational header layout instead of the Rust sidebar toolbar pattern.
+- Resolution:
+  - Added tested Source Control toolbar metadata for the four Rust actions.
+  - Rebuilt the header as `Project` label + selector/name + icon-only action buttons.
+  - Added lightweight CSS for Source Control toolbar buttons, including the teal Create Worktree accent.
+  - Aligned no-match copy with Rust by removing the trailing period.
+- Prevent recurrence:
+  - Keep Source Control toolbar metadata and empty-search copy covered in `sourceControl.test.ts` when changing the panel header.
+- Files/Commands touched: `electron/renderer/src/components/SourceControl.tsx`, `electron/shared/sourceControl.ts`, `electron/renderer/src/lib/sourceControl.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control dosya listesi fazladan baslik ve ikonsuz menu kullaniyordu {#electron-source-control-file-row-menu-parity}
+- Date: 2026-06-10
+- Context: Rust lists matching changed files directly after the Source Control status/empty-state area and uses icon-prefixed context menu entries (`Open in Folder`, `Copy Relative Path`). Electron inserted a `Changed Files` header and rendered plain text context menu actions.
+- Error signature:
+  1. Electron displayed a `Changed Files` section header that Rust does not render.
+  2. Source Control file context menu actions lacked the leading folder/copy icons used in Rust.
+- Symptoms/Impact:
+  - The Source Control panel had extra vertical chrome and context menus looked less consistent with the Rust sidebar menus.
+- Root cause:
+  - The Electron port grouped changed files under a React-specific section heading and did not model Rust menu label metadata.
+- Resolution:
+  - Added tested metadata for Source Control file context menu labels.
+  - Removed the extra `Changed Files` heading so file rows appear directly like Rust.
+  - Rendered icon-prefixed file context menu labels.
+- Prevent recurrence:
+  - Keep Source Control file menu labels covered in `sourceControl.test.ts` before changing file row context menus.
+- Files/Commands touched: `electron/renderer/src/components/SourceControl.tsx`, `electron/shared/sourceControl.ts`, `electron/renderer/src/lib/sourceControl.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Input History satirlari FG/BG metni kullaniyordu {#electron-input-history-row-icon-parity}
+- Date: 2026-06-10
+- Context: Rust's Input History rows use icon-first terminal kind indicators (`Terminal` for foreground, `List` for background) and an icon-prefixed `Copy` context menu action. Electron used literal `FG` / `BG` labels and a plain `Copy` menu item.
+- Error signature:
+  1. Foreground/background kind was shown as text abbreviations instead of icons.
+  2. The context menu copy action did not include the Rust-style copy icon.
+- Symptoms/Impact:
+  - Input History looked less consistent with the Rust sidebar icon language.
+- Root cause:
+  - The Electron port rendered terminal kind as explicit text labels rather than carrying over Rust's row icon model.
+- Resolution:
+  - Added tested Input History row visual metadata for foreground/background icons.
+  - Swapped `FG` / `BG` labels for compact icon indicators.
+  - Added icon-prefixed copy context menu text.
+- Prevent recurrence:
+  - Keep Input History row visual helpers covered in `inputHistory.test.ts` when changing row rendering.
+- Files/Commands touched: `electron/renderer/src/components/InputHistory.tsx`, `electron/renderer/src/lib/inputHistory.ts`, `electron/renderer/src/lib/inputHistory.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Source Control worktree satirlari agir aksiyon butonlari gosteriyordu {#electron-source-control-worktree-row-parity}
+- Date: 2026-06-10
+- Context: Rust's Source Control worktree rows are lightweight sidebar rows: branch icon, label, path in tooltip, click-to-add only for worktrees not already registered, and a context menu for copying the branch name. Electron rendered inline `Add to Mergen`, `Remove from Mergen`, and `Delete Git Worktree` buttons inside every worktree row.
+- Error signature:
+  1. Worktree rows consumed much more horizontal space than Rust rows.
+  2. Registered and unregistered rows exposed different inline buttons instead of using Rust's simple click behavior.
+  3. Worktree paths were rendered inline instead of being kept in the row tooltip.
+- Symptoms/Impact:
+  - Source Control looked cluttered in the narrow sidebar and diverged from Rust's scan-friendly tree/list style.
+- Root cause:
+  - The Electron port exposed management actions directly in the row instead of modeling Rust's sidebar row behavior.
+- Resolution:
+  - Added tested worktree row model metadata for label, tooltip, current/registered state, branch copy name, and clickability.
+  - Replaced inline worktree action buttons with compact row rendering.
+  - Preserved unregistered worktree add behavior by making the row itself clickable.
+  - Kept branch-copy context menu behavior.
+- Prevent recurrence:
+  - Keep worktree row state covered in `sourceControl.test.ts` when changing Source Control worktree UI.
+- Files/Commands touched: `electron/renderer/src/components/SourceControl.tsx`, `electron/shared/sourceControl.ts`, `electron/renderer/src/lib/sourceControl.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser sekme limiti ve seridi Rust'tan sapmisti {#electron-browser-tab-strip-limit-parity}
+- Date: 2026-06-10
+- Context: Rust caps Browser tabs at 5 per scope and renders compact fixed-width tabs (`126x22`) with an icon-only `+` add button that becomes inactive at the limit. Electron allowed unlimited tabs and each tab widened to its full title.
+- Error signature:
+  1. `BrowserPanel.addTab()` always invoked `browser:addTab`.
+  2. `browserViewManager.browserAddTab()` had no max-tab guard.
+  3. Browser tab rows used inline flexible sizing instead of Rust's fixed compact tab metrics.
+- Symptoms/Impact:
+  - Users could create more Browser tabs than Rust supports.
+  - Long tab titles pushed the add button away and made the Browser toolbar visually unlike the Rust reference.
+- Root cause:
+  - The Electron port did not carry over `BROWSER_MAX_TABS_PER_PROJECT` semantics or tab strip geometry.
+- Resolution:
+  - Added a shared `BROWSER_MAX_TABS_PER_SCOPE = 5` constant and enforced it in the main Browser tab creation path.
+  - Added tested toolbar helpers for add-tab enabled state, tooltip text, and tab title fallback.
+  - Updated the Browser tab strip to fixed compact tab sizing with ellipsis labels and a disabled add button at the tab limit.
+- Prevent recurrence:
+  - Keep Browser add-tab limit and title fallback covered by `browserToolbar.test.ts` when changing Browser tab behavior.
+- Files/Commands touched: `electron/shared/types.ts`, `electron/main/browserViewManager.ts`, `electron/renderer/src/components/BrowserPanel.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser URL toolbar'i metinli aksiyonlar kullaniyordu {#electron-browser-url-toolbar-icon-parity}
+- Date: 2026-06-10
+- Context: Rust's Browser URL toolbar uses compact icon-only controls: Refresh, URL input with Enter submit and double-click select-all, Clear URL, Design Inspect, and screenshot buttons. Electron still had a visible `Go` text button plus text-heavy `Inspect` and a close-style `x` Clear URL button.
+- Error signature:
+  1. Browser URL toolbar rendered a separate `Go` button that Rust does not have.
+  2. Clear URL used an `x` glyph rather than a distinct clear/trash-style icon action.
+  3. Design Inspect used visible text instead of an icon-only toggle with ON/OFF tooltip copy.
+  4. URL double-click did not select the whole field like Rust.
+- Symptoms/Impact:
+  - The Electron toolbar consumed extra horizontal space and did not visually match Rust's browser chrome.
+- Root cause:
+  - The Electron port kept early temporary text buttons instead of carrying over Rust's icon-only Browser toolbar semantics.
+- Resolution:
+  - Added tested toolbar metadata for Refresh, Clear URL, and Design Inspect icon/tooltip/aria state.
+  - Removed the `Go` button; Enter remains the submit path, matching Rust.
+  - Converted Clear URL and Design Inspect to compact icon-only controls.
+  - Added URL input double-click select-all behavior.
+- Prevent recurrence:
+  - Keep Browser toolbar metadata covered in `browserToolbar.test.ts` before changing URL toolbar controls.
+- Files/Commands touched: `electron/renderer/src/components/BrowserPanel.tsx`, `electron/renderer/src/lib/browserToolbar.ts`, `electron/renderer/src/lib/browserToolbar.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron File Editor geri/ileri gecmisi yoktu {#electron-file-editor-navigation-history-parity}
+- Date: 2026-06-10
+- Context: Rust's built-in File Editor keeps a bounded navigation history (`back_stack`, `forward_stack`, `max_history = 20`) and exposes back/forward navigation state. Electron only tracked the currently visible file path/name.
+- Error signature:
+  1. Opening another file replaced the active editor target without any previous/next file history.
+  2. Switching to a terminal or ACP chat hid the editor but there was no reusable history state to restore navigation context.
+  3. The File Editor header had Save/Close actions only.
+- Symptoms/Impact:
+  - Users could not move between recently opened files from the editor, making Electron less capable than the Rust reference during source inspection.
+- Root cause:
+  - The Electron port modeled File Editor state as separate `open`, `path`, and `name` values instead of the Rust-style active file plus bounded navigation stacks.
+- Resolution:
+  - Added tested File Editor navigation helpers with active location, back stack, forward stack, hide, close, and max-history behavior.
+  - Converted App File Editor state to a single navigation state object.
+  - Added compact Back/Forward icon buttons to the File Editor header.
+  - Disabled navigation while the current file has unsaved edits so Electron does not discard dirty textarea state during path changes.
+- Prevent recurrence:
+  - Keep File Editor navigation behavior covered in `fileEditor.test.ts` when changing editor state or header controls.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/FileEditor.tsx`, `electron/renderer/src/lib/fileEditor.ts`, `electron/renderer/src/lib/fileEditor.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Terminal Manager path menusu ikonlu aksiyonlardan sapmisti {#electron-terminal-manager-path-menu-icon-parity}
+- Date: 2026-06-10
+- Context: Rust's path context menus use icon-prefixed actions for copying paths and opening folders. Electron Terminal Manager had the same actions, but rendered them as plain `Copy Path` and `Open in Folder` labels.
+- Error signature:
+  1. Project/worktree path context menu actions had no leading icon.
+  2. Terminal Manager context menu labels did not match the visual treatment already ported to other Electron panels.
+- Symptoms/Impact:
+  - The menu looked less like the Rust reference and less consistent with Source Control and Browser action menus.
+- Root cause:
+  - Terminal Manager kept early text-only labels after the Rust icon-prefixed context menu treatment was ported elsewhere.
+- Resolution:
+  - Added a tested Terminal Manager path menu label helper.
+  - Updated Copy Path and Open in Folder menu rows to use icon-prefixed labels.
+- Prevent recurrence:
+  - Keep Terminal Manager path menu labels covered in `terminalManagerState.test.ts`.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/terminalManagerState.ts`, `electron/renderer/src/lib/terminalManagerState.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron OpenCode ACP etiketleri Chat/ACP arasinda drift etmisti {#electron-opencode-acp-label-parity}
+- Date: 2026-06-10
+- Context: Rust standardized user-facing OpenCode ACP labels to `OpenCode ACP`, including the ACP panel header, Terminal Manager foreground row, launcher row, and Settings shortcut card. Electron still used a mix of `ACP Chat`, `OpenCode Chat`, `+ Chat`, and `Close Chat`.
+- Error signature:
+  1. ACP panel header rendered `ACP Chat - <project>`.
+  2. ACP welcome text rendered `Welcome to ACP Chat`.
+  3. Terminal Manager foreground row rendered `OpenCode Chat` and the open button rendered `+ Chat`.
+  4. Settings sections rendered generic `ACP Mode Toggle Shortcut` / `ACP Favorite Models`.
+- Symptoms/Impact:
+  - Users saw multiple names for the same terminal-less OpenCode ACP feature, making Electron look inconsistent with the Rust reference and with current docs.
+- Root cause:
+  - Electron kept labels from an earlier identity-leak mitigation phase after the Rust UI was later standardized back to `OpenCode ACP`.
+- Resolution:
+  - Added tested canonical OpenCode ACP label helpers in `acpUi.ts`.
+  - Updated ACP panel, Terminal Manager, close warning, and Settings labels to use the shared `OpenCode ACP` copy.
+- Prevent recurrence:
+  - Keep canonical ACP labels covered in `acpUi.test.ts`; avoid hardcoding `OpenCode Chat` / `ACP Chat` in user-facing UI.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/components/SettingsPopup.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Directory context menusu ve bos sonuc metni Rust'tan sapmisti {#electron-directory-context-menu-copy-parity}
+- Date: 2026-06-10
+- Context: Rust's Directory panel uses a noktasiz `No matching files or folders` empty search label and icon-prefixed context menu rows for Open in Editor, Reveal in Folder, and Copy Path. Electron had a trailing period in the empty label and plain text context menu rows.
+- Error signature:
+  1. Search no-result state rendered `No matching files or folders.` with a trailing period.
+  2. File context menu rows rendered `Open in Editor`, `Reveal in Folder`, and `Copy Path` without Rust-style leading icons.
+  3. Directory context menu rendered plain `Copy Path`.
+- Symptoms/Impact:
+  - Directory panel looked subtly inconsistent with the Rust reference and with the icon-prefixed context menu treatment already ported into Source Control and Terminal Manager.
+- Root cause:
+  - Directory panel labels were kept as local component strings instead of being centralized in the tested Directory helper layer.
+- Resolution:
+  - Added tested Directory empty-state and context action label helpers.
+  - Updated Project Explorer to use the shared helpers for no-match and context menu text.
+- Prevent recurrence:
+  - Keep Directory no-match and context menu labels covered in `directoryTree.test.ts` when changing Project Explorer row actions.
+- Files/Commands touched: `electron/renderer/src/components/ProjectExplorer.tsx`, `electron/renderer/src/lib/directoryTree.ts`, `electron/renderer/src/lib/directoryTree.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser MCP helper MCP protokolunu ilan etmiyordu {#electron-browser-mcp-helper-protocol-parity}
+- Date: 2026-06-10
+- Context: Rust's Browser MCP helper answers `initialize`, `tools/list`, and `tools/call`, advertises Rust-compatible `browser_*` tool names, and relays tool calls back to the running Mergen process through a local authenticated endpoint. Electron had BrowserView actions underneath, but the helper only relayed arbitrary methods through `process.send`, which is unavailable when OpenCode launches the MCP helper directly.
+- Error signature:
+  1. OpenCode-started `--browser-mcp-helper` could answer `initialize` but could not return a useful `tools/list`.
+  2. Direct helper calls had no parent IPC channel, so Browser MCP tools were effectively unavailable from normal OpenCode MCP startup.
+  3. Electron executor accepted early slash-style names like `browser/navigate` but not the Rust-compatible names such as `browser_navigate`, `browser_page_summary`, and `browser_take_screenshot`.
+- Symptoms/Impact:
+  - OpenCode could not discover or reliably call the embedded Mergen Browser tools from Electron, even though Browser navigation, screenshots, and DOM execution were implemented lower in the stack.
+- Root cause:
+  - The Electron helper implemented a process-child relay prototype instead of the Rust MCP server contract and lacked a local authenticated bridge reachable from OpenCode's helper child process.
+- Resolution:
+  - Added Browser MCP tool schema helpers with Rust-compatible names and capability filtering.
+  - Reworked the helper to answer `tools/list` / `tools/call`, format MCP text/image content, parse both `--caps=...` and `--caps ...`, and post tool calls to the running app.
+  - Added an authenticated `/browser-mcp` endpoint on the existing local hook TCP service and exported the same `MERGEN_BROWSER_MCP_*` env vars into terminal sessions.
+  - Expanded the Browser MCP executor to accept Rust-compatible tool names for navigation, tabs, page summaries, refs, clicks, typing, screenshots, evaluate, wait, highlight, and storage operations.
+- Prevent recurrence:
+  - Keep Browser MCP protocol helpers covered in `browserMcpTools.test.ts` and `browserMcpHelper.test.ts`.
+  - Keep OpenCode-launched helper scenarios in mind: `process.send` is only available for app-spawned helpers, not MCP helpers launched by a terminal process.
+- Files/Commands touched: `electron/main/browserMcpTools.ts`, `electron/main/browserMcpHelper.ts`, `electron/main/browserMcpService.ts`, `electron/main/hookService.ts`, `electron/main/pty.ts`, `electron/main/browserMcpTools.test.ts`, `electron/main/browserMcpHelper.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser MCP video recording araclari calismiyordu {#electron-browser-mcp-video-recording-parity}
+- Date: 2026-06-10
+- Context: Rust Browser MCP advertises `browser_start_video`, `browser_stop_video`, and `browser_video_chapter`, records visible Browser frames, saves the recording, and opens the saved video in a Browser tab. Electron's helper initially exposed the MCP protocol but still returned a not-implemented error for these video tools.
+- Error signature:
+  1. `browser_start_video`, `browser_stop_video`, and `browser_video_chapter` were not advertised by Electron `tools/list`.
+  2. Calling the video tools returned `Browser video recording is not implemented by Electron Browser MCP yet`.
+  3. Main-process Browser MCP tab creation was not mirrored into React tab state, so MCP-opened tabs could be invisible to the Browser panel UI.
+- Symptoms/Impact:
+  - OpenCode could not record embedded Browser interactions from Electron.
+  - Saved recording tabs could be loaded in the native BrowserView state without appearing in Electron's tab strip.
+- Root cause:
+  - The Electron Browser MCP port stopped at navigation/screenshot/DOM tools and did not carry over Rust's frame capture lifecycle.
+  - Browser tab state was split between the main BrowserView manager and renderer React state without a main-to-renderer tab-open event.
+- Resolution:
+  - Added video tool schemas to the vision capability.
+  - Implemented Browser MCP video state with frame capture at 10 FPS, chapter timestamps, stop-time encoding through Chromium `MediaRecorder`, WebM file output under the app browser recordings directory, and Browser tab opening for the saved file.
+  - Allowed programmatic BrowserView navigation to `file://` URLs for saved recording playback while leaving renderer URL input restrictions unchanged.
+  - Added `browser:tabOpened` IPC so Browser MCP-opened tabs are mirrored into renderer tabs, active tab state, URL draft, and visible Browser panel scope.
+- Prevent recurrence:
+  - Keep Browser MCP vision tool names covered in `browserMcpTools.test.ts`.
+  - When main-process Browser MCP opens/closes/switches tabs, keep renderer tab state in sync instead of mutating BrowserView state only.
+- Files/Commands touched: `electron/main/browserMcpTools.ts`, `electron/main/browserMcpService.ts`, `electron/main/browserMcpHelper.ts`, `electron/main/browserViewManager.ts`, `electron/main/browserMcpTools.test.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser MCP cookie araclari eksikti {#electron-browser-mcp-cookie-tool-parity}
+- Date: 2026-06-10
+- Context: Rust Browser MCP exposes cookie tools in the core tool set: `browser_cookie_list`, `browser_cookie_get`, `browser_cookie_set`, `browser_cookie_delete`, and `browser_cookie_clear`. Electron Browser MCP had navigation, DOM, storage, screenshots, and video recording, but still did not advertise or execute the cookie tool family.
+- Error signature:
+  1. `tools/list` did not include any `browser_cookie_*` tool.
+  2. OpenCode could not inspect, set, or clear embedded Browser cookies through the Electron MCP server.
+  3. Cookie parity tests only covered the Rust helper, not the Electron helper metadata.
+- Symptoms/Impact:
+  - Browser MCP sessions in Electron were less capable than the Rust reference for authenticated sites and stateful browser flows.
+- Root cause:
+  - The Electron port focused on DOM/session storage first and skipped Chromium session cookie APIs when copying the Rust tool surface.
+- Resolution:
+  - Added Rust-compatible cookie tool schemas to Electron Browser MCP core tools.
+  - Implemented cookie list/get/set/delete/clear through `webContents.session.cookies`, using explicit URL params or the active Browser page URL.
+  - Added regression coverage so the cookie tool family remains advertised and allowed.
+- Prevent recurrence:
+  - Keep Browser MCP core tool parity covered in `browserMcpTools.test.ts` when changing helper schemas.
+  - Prefer Electron session APIs for Browser state operations instead of DOM-only fallbacks when the Rust feature targets browser-level state.
+- Files/Commands touched: `electron/main/browserMcpTools.ts`, `electron/main/browserMcpService.ts`, `electron/main/browserMcpTools.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser MCP core/devtools tool listesi Rust ile tam hizali degildi {#electron-browser-mcp-tool-list-core-devtools-parity}
+- Date: 2026-06-10
+- Context: Rust Browser MCP advertises `browser_sessionstorage_*` in the core tool set and `browser_console_messages` in the devtools set. Electron advertised session storage only behind the optional `storage` capability and did not advertise the console messages tool. MCP-driven `browser_navigate` also mutated main-process BrowserView tab state without notifying the renderer tab model.
+- Error signature:
+  1. `tools/list --caps=devtools,vision` omitted `browser_sessionstorage_get` even though the Rust helper includes session storage in core tools.
+  2. `tools/list --caps=devtools` omitted `browser_console_messages`.
+  3. `browser_navigate` could create or retarget a BrowserView tab without mirroring that tab into React state, leaving the Browser panel tab strip stale.
+- Symptoms/Impact:
+  - OpenCode Browser MCP sessions in Electron saw a smaller tool surface than the Rust reference for the same capabilities.
+  - Agent-driven navigation could be active in the native BrowserView while the Electron UI did not show the corresponding tab/update.
+- Root cause:
+  - Electron's helper schema split session storage with local storage under `storage` instead of matching Rust's core/session-storage distinction.
+  - Main-process Browser MCP navigation reused BrowserView state without emitting the existing `browser:tabOpened` sync event.
+- Resolution:
+  - Moved `browser_sessionstorage_*` schemas into Electron Browser MCP core tools while keeping `browser_localstorage_*` under `storage`.
+  - Added the Rust-compatible `browser_console_messages` devtools schema with the same explicit not-implemented behavior.
+  - Changed `navigateBrowser()` to return the active tab snapshot and broadcast MCP navigation changes to renderer state.
+- Prevent recurrence:
+  - Keep Browser MCP capability placement covered in `browserMcpTools.test.ts`.
+  - When Browser MCP mutates main-process tabs, broadcast the changed tab state so renderer and BrowserView do not drift.
+- Files/Commands touched: `electron/main/browserMcpTools.ts`, `electron/main/browserMcpService.ts`, `electron/main/browserViewManager.ts`, `electron/main/browserMcpTools.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron ACP panel render hatasi tum ana ekrani karartabiliyordu {#electron-acp-panel-render-error-boundary}
+- Date: 2026-06-10
+- Context: The ACP chat panel is rendered directly inside the main content area. A renderer exception triggered from ACP-only UI state, such as slash command hint rendering or unexpected ACP event payloads, could tear down the React subtree and leave the user with a black main screen.
+- Error signature:
+  1. Typing `/` in the OpenCode ACP composer could make the UI go black instead of keeping the chat usable.
+  2. The failure was isolated to the ACP panel path, but there was no local error boundary around that path.
+- Symptoms/Impact:
+  - A malformed or unexpected ACP UI state could blank the active workspace view.
+  - Users had no in-app recovery action except closing/restarting or switching context.
+- Root cause:
+  - ACP-specific render failures were not isolated from the main area React tree.
+- Resolution:
+  - Added an `AcpErrorBoundary` component with a dark-theme fallback and close action.
+  - Wrapped `AcpChatPanel` with the boundary keyed by `chatId` so a new ACP chat resets the boundary state.
+- Prevent recurrence:
+  - Keep high-churn ACP UI paths, especially slash hints and permission/question cards, isolated behind the ACP boundary.
+  - Continue adding focused ACP UI helper tests for data-shape normalization before rendering.
+- Files/Commands touched: `electron/renderer/src/components/AcpErrorBoundary.tsx`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10; user report 2026-06-10
+
+---
+
+#### Electron ACP composer stack sirasi Rust gorunumunden sapmisti {#electron-acp-composer-stack-order-parity}
+- Date: 2026-06-10
+- Context: The Rust ACP chat panel stacks queued prompts above the composer body, slash command hints above the capsule, the composer capsule next, attachments and permission/question UI below the capsule, and a thin status row below the composer. Electron rendered the status row above the permission card and composer, and rendered attachment chips above the capsule.
+- Error signature:
+  1. The Electron ACP status row appeared between queued prompts and the interaction/composer area.
+  2. Attachment chips appeared above the rounded composer capsule instead of below it.
+  3. Permission/question UI was visually detached from the composer stack.
+- Symptoms/Impact:
+  - Electron ACP looked and behaved less like the Rust reference panel.
+  - Slash hints, permission cards, attachments, and status metadata did not preserve the same vertical relationship as the original.
+- Root cause:
+  - The first Electron ACP panel used a simpler React section order instead of the Rust composer stack layout.
+- Resolution:
+  - Reordered the Electron ACP panel so queued prompts remain above the composer, slash hints sit above the capsule, attachment chips and permission/question UI sit below the capsule, and the status row sits below the composer.
+  - Kept the single right-side composer action button behavior unchanged.
+- Prevent recurrence:
+  - When changing ACP UI, preserve the Rust stack order: queue, slash, capsule, attachments, permission/question, status.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser MCP tab secme/kapatma UI state'ini guncellemiyordu {#electron-browser-mcp-tab-snapshot-sync}
+- Date: 2026-06-10
+- Context: Rust keeps Browser MCP tab operations and UI state in the same app state. Electron split BrowserView state in the main process from React tab state in the renderer. Earlier parity work mirrored tab creation, but MCP-driven select/close operations still only changed main-process state.
+- Error signature:
+  1. `browser_tabs action=select` switched the native BrowserView tab but did not update the renderer active tab id.
+  2. `browser_tabs action=close` or `browser_close` removed/closed tabs in the main process but left stale tabs in the Browser panel.
+  3. Saved recording tabs opened through Browser MCP could be visible initially, but later MCP tab operations could drift from the React tab strip.
+- Symptoms/Impact:
+  - Browser MCP agents and the visible Browser panel could disagree about which tab is active or whether a tab still exists.
+  - Closing the last MCP-owned tab could leave stale UI chrome around an empty BrowserView state.
+- Root cause:
+  - Electron only emitted `browser:tabOpened` from Browser MCP, not a full tab snapshot after all MCP tab mutations.
+- Resolution:
+  - Added a main-process Browser tab snapshot helper.
+  - Added `browser:tabsChanged` IPC and renderer handling for tabs, active tab, URL draft, open project state, and terminal-scope visible override cleanup.
+  - Broadcast full snapshots after MCP navigate, new tab, select, close, `browser_close`, and saved recording tab creation.
+- Prevent recurrence:
+  - Browser MCP operations that mutate tabs must emit a full snapshot, not only one-off creation events.
+- Files/Commands touched: `electron/main/browserViewManager.ts`, `electron/main/browserMcpService.ts`, `electron/renderer/src/App.tsx`, `electron/shared/types.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron ACP queued row plan etiketi Rust gibi basliklandirilmiyordu {#electron-acp-queued-mode-label-parity}
+- Date: 2026-06-10
+- Context: Rust renders ACP mode labels with `plan` shown as `Plan`, hides the default `build` mode, and leaves custom mode ids visible. Electron already hid `build`, but rendered queued Plan prompts with the raw lowercase `plan` id.
+- Error signature:
+  1. Queued ACP rows showed `plan` instead of `Plan`.
+  2. Mode label formatting was embedded directly in the row instead of using a shared helper.
+- Symptoms/Impact:
+  - Electron ACP queued rows looked less polished and did not match the Rust panel.
+- Root cause:
+  - The Electron row only checked `modeId !== 'build'` and displayed the raw id.
+- Resolution:
+  - Added `acpModeUiLabel()` to mirror Rust's mode label behavior.
+  - Updated queued prompt rows to use the helper and added regression coverage.
+- Prevent recurrence:
+  - Keep ACP mode display formatting in `acpUi.ts` and cover plan/build/custom labels in `acpUi.test.ts`.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron ACP queued rows aksiyonsuzdu {#electron-acp-queued-row-actions-parity}
+- Date: 2026-06-10
+- Context: Rust ACP queued prompt rows expose compact actions for running a queued prompt next, copying the queued prompt text, and deleting a queued prompt. Electron displayed queued rows as passive status rows.
+- Error signature:
+  1. Queued ACP prompts could not be reordered from the visible row.
+  2. Users could not delete a stale queued ACP prompt without waiting for queue execution.
+  3. Copying queued prompt text required manual selection instead of the Rust row affordance.
+- Symptoms/Impact:
+  - Electron ACP was less usable during long-running turns with multiple queued prompts.
+  - The queue UI looked similar to Rust after earlier visual work, but missed the row-level controls users expect from the original panel.
+- Root cause:
+  - The Electron ACP service exposed only enqueue/flush behavior and no typed queue mutation IPC.
+- Resolution:
+  - Added typed IPC for `acp:queueRunNext` and `acp:queueDelete`.
+  - Added main-process queue mutation helpers that validate queue indexes, broadcast queue count updates, and flush immediately when the session is idle.
+  - Added compact queued row actions for run-next, copy, and delete, plus tested preview/reorder/remove helpers.
+- Prevent recurrence:
+  - ACP queue UI changes should keep row-level actions in sync with Rust: run next, copy, and delete at minimum.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Claude title algisi Rust Orca durumlarini ayirmiyordu {#electron-claude-title-status-parity}
+- Date: 2026-06-10
+- Context: Rust detects Claude Code terminal titles with Orca-compatible `Working`, `Idle`, and `Permission` semantics. Electron only checked whether the title contained `claude`/`orca` and always reported Claude as running.
+- Error signature:
+  1. Claude idle titles such as `✳ ...` did not produce an attention/turn-complete state.
+  2. Claude permission titles were not distinguished from ordinary running work.
+  3. PTY-originated `hook:status` events were sent as `(terminalId, event)` even though renderer listeners expect a single event payload.
+- Symptoms/Impact:
+  - Terminal Manager badges and OS notifications could stay in a running state after Claude had become idle or needed input.
+  - Title-based Claude detection from the PTY path could be ignored by renderer listeners because of the IPC payload shape mismatch.
+- Root cause:
+  - The Electron PTY title parser used a simple substring check instead of the Rust Orca-compatible title parser and reused the PTY data broadcast helper for `hook:status`.
+- Resolution:
+  - Added a shared Claude title parser and hook-event mapper matching the Rust status patterns.
+  - Updated PTY title parsing to emit `running`, `attention/turn_complete`, or `attention/permission` based on the parsed Claude title.
+  - Sent PTY-originated `hook:status` events with the typed single-event payload expected by the renderer.
+- Prevent recurrence:
+  - Keep Claude title parsing in the shared helper and cover new title conventions in `claudeTitle.test.ts` before changing PTY detection.
+- Files/Commands touched: `electron/shared/claudeTitle.ts`, `electron/shared/claudeTitle.test.ts`, `electron/main/pty.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `detect_claude_status_from_title`, Electron parity goal 2026-06-10
+
+---
+
+#### Electron Smart Input Claude oturumlarinda acilmiyordu {#electron-claude-smart-input-parity}
+- Date: 2026-06-11
+- Context: Rust shows Smart Input for Claude Code foreground sessions and auto-dispatches queued tasks when Claude returns to an idle/turn-complete title state. Electron only showed Smart Input for active OpenCode sessions.
+- Error signature:
+  1. A foreground Claude terminal detected from title updates did not show the Smart Input footer.
+  2. Queued Smart Input tasks could not auto-dispatch after Claude became idle.
+  3. Claude Smart Input would have shown OpenCode-specific Build/Plan mode controls if reused directly.
+- Symptoms/Impact:
+  - Claude foreground workflows missed the Rust Smart Input queue experience.
+  - Users had to type directly into the terminal or use saved messages instead of the same queue/after-done flow available in Rust.
+- Root cause:
+  - Electron coupled Smart Input visibility and auto-dispatch to `opencodeSessionActive` instead of checking supported AI tools separately.
+- Resolution:
+  - Added shared Smart Input helpers for footer visibility and Claude turn-complete dispatch readiness.
+  - Reused the existing Smart Input footer for Claude foreground terminals while hiding OpenCode-specific mode controls.
+  - Extended the renderer PTY state machine so Claude `attention/turn_complete` title events flush one queued task, while `attention/permission` keeps the queue paused.
+- Prevent recurrence:
+  - Keep Smart Input tool support in shared helper functions and test OpenCode/Claude visibility plus Claude dispatch gating.
+- Files/Commands touched: `electron/renderer/src/lib/smartInput.ts`, `electron/renderer/src/lib/smartInput.test.ts`, `electron/renderer/src/components/MainArea.tsx`, `electron/renderer/src/components/SmartInputFooter.tsx`, `electron/renderer/src/hooks/usePty.ts`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust Claude Smart Input behavior, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude launcher pending durumu gorunmuyordu {#electron-claude-launcher-pending-parity}
+- Date: 2026-06-11
+- Context: Rust claims Claude ownership immediately when the built-in Claude foreground launcher is used, shows the terminal as live while waiting for the first Claude title signal, and displays the configured launcher command rather than the sanitized bypass wrapper.
+- Error signature:
+  1. Electron foreground Claude launcher terminals stayed visually inactive until Claude emitted an OSC title.
+  2. Smart Input did not become available during the launch-pending window.
+  3. Saved-message sends to Claude did not mark the session as running, leaving queued Smart Input dispatch guards stale.
+- Symptoms/Impact:
+  - Claude launch feedback lagged behind the original Rust app.
+  - Users could see an inactive badge even though the foreground launcher command had already been submitted.
+- Root cause:
+  - Electron only claimed Claude ownership from PTY title detection and did not keep a renderer-side launch-pending state for explicit launcher clicks.
+- Resolution:
+  - Added renderer-side Claude launch-pending state and a `markClaudeLaunchPending` helper.
+  - Wired the built-in Claude launcher to set pending ownership and the configured command title immediately after spawning the foreground terminal.
+  - Treated pending Claude launch as `running` for display/Smart Input visibility while preserving the stored inactive status semantics until a real title event arrives.
+  - Updated saved-message sends to mark Claude as running and clear pending state.
+- Prevent recurrence:
+  - Keep explicit launcher ownership separate from title-detected status, and test display helpers for pending Claude launch semantics.
+- Files/Commands touched: `electron/renderer/src/hooks/usePty.ts`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/components/MainArea.tsx`, `electron/renderer/src/App.tsx`, `electron/renderer/src/lib/smartInput.ts`, `electron/renderer/src/lib/smartInput.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `mark_claude_launch_pending`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude Code Codex hook ayari eksikti {#electron-claude-code-codex-hook-setting-parity}
+- Date: 2026-06-11
+- Context: Rust exposes `claude_code_codex_hook_enabled` in app config, defaults it to enabled, migrates missing configs to enabled, and shows a Settings toggle for the Claude Code Codex plan/review pipeline.
+- Error signature:
+  1. Electron `AppConfig` had no Claude Code Codex hook setting.
+  2. Existing Electron configs could not persist a user choice for this hook.
+  3. Settings had no visible control matching the Rust General settings card.
+- Symptoms/Impact:
+  - Electron could not represent or preserve the Rust hook preference, blocking later parity work for the actual Claude/Codex orchestration flow.
+- Root cause:
+  - The Electron config schema stopped at generic `aiHooks` placeholders and did not include the Rust Claude Code Codex hook toggle.
+- Resolution:
+  - Added `claudeCodeCodexHookEnabled` to Electron `AppConfig` with a default of `true`.
+  - Normalized missing JSON configs to enabled and preserved legacy `claude_code_codex_hook_enabled` values.
+  - Added the Settings > General toggle and regression tests for default/migration behavior.
+- Prevent recurrence:
+  - Keep Electron config schema parity with Rust when adding AI workflow feature flags, including legacy config migration tests.
+- Files/Commands touched: `electron/shared/types.ts`, `electron/main/config.ts`, `electron/main/config.test.ts`, `electron/renderer/src/components/SettingsPopup.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `claude_code_codex_hook_enabled`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude Code Codex hook plan fazi yoktu {#electron-claude-code-codex-hook-plan-phase-parity}
+- Date: 2026-06-11
+- Context: Rust starts a Claude Code Codex hook session for Mergen-submitted Claude prompts by creating `.claude/plans/<session>.md`, running Codex in read-only planning mode, persisting the plan, and sending Claude an implementation prompt that references the plan file.
+- Error signature:
+  1. Electron could toggle the hook setting but did not create plan files.
+  2. Electron Smart Input prompts sent to Claude bypassed the Codex planning step.
+  3. The terminal had no visible hook progress band.
+- Symptoms/Impact:
+  - Enabling the setting did not yet move Electron toward the Rust plan/review workflow.
+  - Users could not see that Codex planning was in progress before Claude implementation.
+- Root cause:
+  - Electron lacked the Claude Code Codex hook service, plan-file renderer, Codex read-only exec runner, and terminal-scoped progress state.
+- Resolution:
+  - Added shared Claude Codex hook helpers for plan rendering, Codex planning prompt construction, Claude implementation prompt construction, and progress labels.
+  - Added a main-process `claudeCodex:runPlan` IPC handler that writes the pending plan file, runs Codex read-only, updates the plan file, and returns the Claude implementation prompt.
+  - Intercepted eligible Claude Smart Input submissions when the hook is enabled and attachment-free, then sent the implementation prompt to Claude after planning.
+  - Added a compact terminal progress band for `Codex planning` / `Claude implementing Codex plan`.
+- Remaining gap:
+  - Electron still needs the later Rust phases: post-implementation test discovery/execution, Codex review, review-fix rounds, and final done/blocked lifecycle.
+- Prevent recurrence:
+  - Keep hook phases covered by shared pure helper tests before wiring additional async lifecycle steps.
+- Files/Commands touched: `electron/shared/claudeCodexHook.ts`, `electron/shared/claudeCodexHook.test.ts`, `electron/main/claudeCodexHook.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `electron/renderer/src/hooks/usePty.ts`, `electron/renderer/src/components/MainArea.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `claude_codex_hook.rs`, `try_start_claude_codex_hook_session`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude Code Codex hook review/fix fazlari eksikti {#electron-claude-code-codex-hook-review-fix-parity}
+- Date: 2026-06-11
+- Context: Rust advances Claude Code Codex hook sessions after Claude returns to idle, runs detected tests, runs read-only Codex review, and either finishes cleanly or sends Claude a scoped fix prompt for actionable P0-P3 findings.
+- Error signature:
+  1. Electron stopped after sending the Codex-planned implementation prompt to Claude.
+  2. Claude `turn_complete` did not advance hook sessions to test/review.
+  3. Codex review findings could not trigger a follow-up Claude fix prompt.
+- Symptoms/Impact:
+  - Electron lacked the main quality gate that differentiates the Rust Claude Code Codex hook from a one-shot planning helper.
+- Root cause:
+  - The Electron hook service did not include test discovery/execution, Codex review prompt generation, actionable finding detection, or renderer lifecycle advancement on Claude turn-complete.
+- Resolution:
+  - Added test discovery for Cargo and npm `lint`/`typecheck`/`test` scripts, plus test result rendering into the plan file.
+  - Added read-only Codex review execution and Rust-style actionable finding detection.
+  - Added `claudeCodex:runReview` IPC and renderer advancement from `awaiting_implementation`/`awaiting_fix` when Claude reports `turn_complete`.
+  - Added fix prompt generation with the Rust three-round remediation limit and progress phases for testing, reviewing, awaiting fix, done, and blocked.
+- Remaining gap:
+  - Electron still does not queue Browser MCP UI verification screenshots after review completion; it writes a plan note for detected UI-facing files instead.
+- Prevent recurrence:
+  - Keep hook lifecycle transitions covered by shared helper tests and preserve the Rust phase names/progress language when adding later UI verification.
+- Files/Commands touched: `electron/shared/claudeCodexHook.ts`, `electron/shared/claudeCodexHook.test.ts`, `electron/main/claudeCodexHook.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `electron/renderer/src/components/MainArea.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `advance_claude_codex_hook_sessions`, `handle_claude_codex_tests_finished`, `handle_claude_codex_review_finished`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude Code Codex hook UI verification kuyrugu eksikti {#electron-claude-code-codex-hook-ui-verification-parity}
+- Date: 2026-06-11
+- Context: Rust queues a Browser visible-area screenshot after a clean Claude Code Codex hook review when UI-facing files changed and a browser URL is known.
+- Error signature:
+  1. Electron detected UI-facing files but left only a pending note in the plan file.
+  2. The Browser panel did not open automatically for hook UI verification.
+  3. The plan file was not updated with the final UI verification outcome.
+- Symptoms/Impact:
+  - Electron users had to manually open Browser and capture screenshots after Codex review, unlike the Rust flow.
+- Root cause:
+  - The Electron review result did not return changed UI-facing files to the renderer and there was no IPC to update the plan file after a renderer-side Browser screenshot attempt.
+- Resolution:
+  - Returned `uiChangedFiles` from `claudeCodex:runReview`.
+  - Added `claudeCodex:updateUiVerification` to replace the pending UI verification note in the plan file.
+  - When a clean review finishes with UI-facing changes, Electron opens the project Browser scope, navigates to the known project URL, requests a visible-area screenshot, downloads it, and writes the outcome into the plan file.
+- Remaining gap:
+  - Electron currently uses project-scoped `browserLastUrl` / active project browser tabs and does not yet mirror Rust's broader project-family URL fallback for all worktrees.
+- Prevent recurrence:
+  - Keep plan-file outcome updates in main-process helpers and add renderer-triggered UI verification coverage before changing hook completion behavior.
+- Files/Commands touched: `electron/main/claudeCodexHook.ts`, `electron/main/claudeCodexHook.test.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/claudeCodexHook.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `try_queue_claude_codex_ui_verification`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Browser URL worktree ailesi fallback'i eksikti {#electron-browser-url-worktree-family-fallback-parity}
+- Date: 2026-06-11
+- Context: Rust keeps Browser URLs synchronized across a project root and its worktrees, and Claude Code Codex hook UI verification falls back from the active Browser URL to the project-family last URL.
+- Error signature:
+  1. Electron persisted `browserLastUrl` only on the project whose Browser scope emitted `browser:urlChanged`.
+  2. Worktree UI verification could miss a root-project Browser URL even when the Rust app would reuse it.
+  3. Clearing a Browser URL already used family logic, but setting and lookup did not share that same rule.
+- Symptoms/Impact:
+  - Claude Code Codex hook UI verification could report "no browser URL is known" for a worktree even though the root project or sibling worktree had a usable Browser URL.
+  - Browser URL persistence behavior drifted from Rust's project-family model.
+- Root cause:
+  - Electron kept project-scope Browser URL selection inline in `App.tsx` and lacked a shared Browser project-family helper matching Rust's `browser_last_url_for_project_family` / `set_browser_last_url_for_project_family` flow.
+- Resolution:
+  - Added shared Browser scope helpers for project-family membership, root-first last URL fallback, active tab lookup, and project-family URL set/clear.
+  - Updated Browser URL persistence to write the observed URL to the whole root/worktree family.
+  - Updated Claude Code Codex hook UI verification to resolve URLs through active visible scope, family project tabs, and root-first family last URL fallback.
+  - Added regression tests for target visible active tabs, family active tab fallback, root-first persisted fallback, unrelated project isolation, and family set/clear.
+- Prevent recurrence:
+  - Keep Browser URL set, clear, and lookup behavior in the shared helper so worktree parity cannot drift between normal Browser use and hook UI verification.
+- Files/Commands touched: `electron/renderer/src/lib/browserScope.ts`, `electron/renderer/src/lib/browserScope.test.ts`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `browser_last_url_for_project_family`, `set_browser_last_url_for_project_family`, `try_queue_claude_codex_ui_verification`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP slash komut popup'i Rust gorunumunden gerideydi {#electron-acp-slash-command-popup-parity}
+- Date: 2026-06-11
+- Context: Rust renders ACP slash commands as a compact popup above the composer with a `Commands:` header, command name, and description rows.
+- Error signature:
+  1. Electron reduced slash command matches to plain string pills.
+  2. Command descriptions from `available_commands_update` were discarded before rendering.
+  3. The slash UI was less resilient to malformed command payloads than the shared helper path could be.
+- Symptoms/Impact:
+  - Typing `/` in the ACP composer produced a visually different and less informative UI than Rust.
+  - Users could not scan command descriptions before selecting a slash command.
+- Root cause:
+  - Electron exposed only `slashCommandHints()` as strings and kept popup rendering inline in `AcpChatPanel`.
+- Resolution:
+  - Added `slashCommandItems()` with normalized hint text, description preservation, dedupe, limit, and malformed payload filtering.
+  - Updated the ACP composer to show a Rust-style `Commands:` popup with full-width command rows and descriptions.
+  - Added regression tests for description preservation, dedupe, limit behavior, and existing hint filtering.
+- Prevent recurrence:
+  - Keep ACP slash command normalization in `acpUi.ts` and cover both malformed server payloads and visual item metadata in tests.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_slash_command_matches`, `draw_acp_slash_command_popup`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP cancel ve request id protokol paritesi eksikti {#electron-acp-cancel-request-id-protocol-parity}
+- Date: 2026-06-11
+- Context: Rust uses monotonic ACP JSON-RPC request ids and sends `session/cancel` as a notification without an `id`, while suppressing known cancel-specific ACP noise.
+- Error signature:
+  1. Electron generated ACP request ids with `Date.now()`, allowing duplicate ids during same-millisecond bursts.
+  2. Electron sent `session/cancel` as a request with an `id`, unlike Rust's notification format.
+  3. `Got response to unknown request 0` and cancel `Method not found: session/cancel` noise could be surfaced as confusing raw transport text.
+- Symptoms/Impact:
+  - OpenCode ACP could emit stale/unknown response warnings after user actions such as Stop or question/permission response.
+  - Cancel-related protocol noise risked turning a usable session into an error state.
+- Root cause:
+  - Electron's ACP service kept request id generation and cancel message construction inline instead of sharing Rust-equivalent protocol helpers.
+- Resolution:
+  - Added a monotonic ACP request-id generator.
+  - Added an id-less `session/cancel` JSON-RPC notification builder and used it from `cancelAcpPrompt`.
+  - Added cancel-noise and stale unknown-response classifiers, suppressing cancel noise during the post-Stop grace window and normalizing stale response warnings into readable non-fatal messages.
+  - Added protocol regression tests for monotonic ids, cancel notification shape, cancel noise classification, and stale-response warning normalization.
+- Prevent recurrence:
+  - Keep ACP JSON-RPC message shapes in `shared/acpProtocol.ts` and test protocol helpers before changing `acpService.ts`.
+- Files/Commands touched: `electron/shared/acpProtocol.ts`, `electron/main/acpService.ts`, `electron/renderer/src/lib/acpProtocol.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `NEXT_REQUEST_ID`, `AcpChatSession::send_cancel`, `handle_acp_error_event`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP slash popup komut event'iyle kendiliginden aciliyordu {#electron-acp-slash-popup-input-gating-parity}
+- Date: 2026-06-11
+- Context: Rust derives ACP slash popup visibility from the current composer input each frame; available command updates alone do not open the popup unless the prompt starts with `/`.
+- Error signature:
+  1. Electron populated slash popup state directly when `available_commands_update` arrived.
+  2. The popup could appear even when the composer input was empty or did not start with `/`.
+- Symptoms/Impact:
+  - A background ACP command refresh could make the composer show command UI unexpectedly.
+  - This increased the chance that `/`-adjacent ACP UI updates looked like a broken or black panel instead of a controlled popup.
+- Root cause:
+  - Slash popup state was event-driven rather than derived from both available commands and current input.
+- Resolution:
+  - Added `slashCommandItemsForInput()` to gate slash command items on slash-prefixed input.
+  - Updated `AcpChatPanel` to use the same helper from both `commands` events and input changes.
+  - Added regression coverage for empty/non-slash input.
+- Prevent recurrence:
+  - Keep slash popup visibility derived from composer input and use the shared helper for future ACP command UI changes.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_slash_command_matches`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP render hatasi tam siyah panele dusuyordu {#electron-acp-render-error-boundary-parity}
+- Date: 2026-06-11
+- Context: ACP UI rendering can fail after malformed or unexpected protocol/UI data. Rust keeps ACP failures inside the chat panel/status flow instead of replacing the whole area with an unstructured black surface.
+- Error signature:
+  1. Electron `AcpErrorBoundary` rendered a bare full-height dark fallback with only an error line and close button.
+  2. There was no retry path to recover the ACP panel after transient render state changed.
+  3. The fallback did not preserve the ACP header/status visual structure.
+- Symptoms/Impact:
+  - A slash-popup or ACP question render exception could look like the ACP screen went black.
+  - Users had to close the ACP panel instead of retrying the render.
+- Root cause:
+  - The error boundary fallback was implemented as a generic block, not as an ACP panel state.
+- Resolution:
+  - Reworked the fallback to preserve an ACP-style header, centered error panel, status row, close action, and `Retry ACP panel` action.
+  - Added a stable error message helper and regression tests for fallback message/state behavior.
+- Prevent recurrence:
+  - Keep render failures as structured ACP panel states, and add tests for fallback text/state before modifying ACP composer or question rendering.
+- Files/Commands touched: `electron/renderer/src/components/AcpErrorBoundary.tsx`, `electron/renderer/src/components/AcpErrorBoundary.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `handle_acp_error_event`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP unsupported cancel durumunu hatirlamiyordu {#electron-acp-cancel-unsupported-state-parity}
+- Date: 2026-06-11
+- Context: Rust marks ACP cancel as unsupported after `Method not found` / `-32601` cancel noise and skips future cancel RPCs for that session.
+- Error signature:
+  1. Electron suppressed cancel noise but did not remember that `session/cancel` was unsupported.
+  2. Later Stop attempts could resend the same unsupported notification and produce repeated transport noise.
+- Symptoms/Impact:
+  - Users could see repeated ACP cancel warnings/noise across multiple Stop attempts in the same session.
+  - Electron behavior drifted from Rust's quieter post-detection lifecycle.
+- Root cause:
+  - Electron had only a short cancel grace window and no session-level `cancelUnsupported` flag.
+- Resolution:
+  - Added `isAcpCancelUnsupported()` protocol helper.
+  - Stored `cancelUnsupported` on ACP sessions when unsupported cancel noise is observed.
+  - Skipped sending future `session/cancel` notifications when the current session already proved cancel unsupported, while still clearing local pending state and returning to idle.
+  - Added protocol regression coverage for unsupported-vs-generic cancel noise classification.
+- Prevent recurrence:
+  - Keep cancel capability state session-scoped in the ACP service and distinguish unsupported errors from generic cancel stderr noise.
+- Files/Commands touched: `electron/shared/acpProtocol.ts`, `electron/main/acpService.ts`, `electron/renderer/src/lib/acpProtocol.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `suppress_acp_cancel_error_if_needed`, `stop_acp_chat_session`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP JSON-RPC error response'larini fazla fatal sayiyordu {#electron-acp-json-rpc-error-warning-parity}
+- Date: 2026-06-11
+- Context: Rust treats ACP error events as non-fatal warnings when a session already exists or is still starting, unless the error is an `ACP JSON parse error`.
+- Error signature:
+  1. Electron marked every JSON-RPC `error` response as session `error`.
+  2. Non-parse ACP errors could clear pending interactions and stop the ACP activity lifecycle even when Rust would keep the session alive.
+- Symptoms/Impact:
+  - Recoverable ACP transport/server warnings could make the Electron ACP panel look broken.
+  - Queued prompts and active permission/question state could be cleared too aggressively.
+- Root cause:
+  - Electron's `handleAcpLine()` error path lacked Rust's `is_fatal = message.contains("ACP JSON parse error")` gating.
+- Resolution:
+  - Added `isAcpJsonParseError()` and `isAcpErrorFatalForSession()` protocol helpers.
+  - Updated JSON-RPC error handling to broadcast non-fatal warnings when `sessionId` exists or status is `starting`.
+  - Preserved fatal behavior for ACP JSON parse errors and pre-session non-starting errors.
+  - Added regression tests for fatal/non-fatal classification.
+- Prevent recurrence:
+  - Keep ACP fatality rules in shared protocol helpers and cover session-state combinations in tests before changing main-process error handling.
+- Files/Commands touched: `electron/shared/acpProtocol.ts`, `electron/main/acpService.ts`, `electron/renderer/src/lib/acpProtocol.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `handle_acp_error_event`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP slash popup session hazir olmadan acilabiliyordu {#electron-acp-slash-popup-controls-parity}
+- Date: 2026-06-11
+- Context: Rust hides ACP slash command popup content while composer action controls are disabled, using `acp_composer_slash_popup_height_for_controls(..., false) == 0`.
+- Error signature:
+  1. Electron derived slash popup rows from input and available commands only.
+  2. If stale/early command data existed before `sessionId`, typing `/` could show the command popup while other composer actions were disabled.
+- Symptoms/Impact:
+  - The ACP composer could expose command UI before the session was ready.
+  - This drifted from Rust's disabled-controls state and made startup/error states look less deterministic.
+- Root cause:
+  - Slash popup item generation did not include the shared action-control readiness gate.
+- Resolution:
+  - Added `slashCommandItemsForComposer()` to gate popup rows on composer controls.
+  - Updated `AcpChatPanel` command-event and input-change paths to use the gated helper.
+  - Added regression coverage for disabled vs enabled composer controls.
+- Prevent recurrence:
+  - Keep slash popup visibility derived from input, available commands, and action-control readiness together.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_composer_slash_popup_height_for_controls`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP composer hint metni Rust durum siralamasi ile eslesmiyordu {#electron-acp-composer-hint-parity}
+- Date: 2026-06-11
+- Context: Rust selects ACP composer hint text by priority: session readiness, welcome center, plan mode, then default message mode.
+- Error signature:
+  1. Electron used `Type a message to start...` for the welcome composer.
+  2. Electron did not show `Waiting for session...` before `sessionId`.
+  3. Electron did not show the plan-mode hint `Plan and design before coding...`.
+- Symptoms/Impact:
+  - The ACP composer gave weaker startup feedback while the session was still warming.
+  - Plan mode and welcome mode looked less like the original Rust UI.
+- Root cause:
+  - Composer placeholder text was inline in `AcpChatPanel` instead of using the Rust parity state order.
+- Resolution:
+  - Added `acpComposerHintText()` with Rust's hint priority and strings.
+  - Updated `AcpChatPanel` to use the helper for textarea placeholder text.
+  - Added regression coverage for waiting, welcome, plan, and default hints.
+- Prevent recurrence:
+  - Keep ACP composer text state in shared UI helpers and test the priority order whenever composer modes change.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_composer_hint_text`, `ACP_WELCOME_HINT`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP status row Kimi koruma ve Rust status metinlerini gostermiyordu {#electron-acp-status-row-kimi-parity}
+- Date: 2026-06-11
+- Context: Rust ACP status row shows branch, `Local`, an optional `Kimi protected` / `Kimi unprotected` badge for risky Kimi-family models, and user-facing status text such as `Running...`.
+- Error signature:
+  1. Electron showed raw ACP status ids like `running` / `idle` instead of Rust-style display text.
+  2. Electron did not show Kimi loop-protection state in the ACP status row.
+- Symptoms/Impact:
+  - The ACP panel looked less like the original Rust UI.
+  - Users could not see whether the active Kimi-risk model was protected directly from the ACP chat panel.
+- Root cause:
+  - Status row rendering was inline and lacked shared parity helpers for status text and Kimi risk classification.
+- Resolution:
+  - Added `acpStatusText()`, `opencodeModelHasKimiLoopRisk()`, and `acpKimiProtectionBadge()`.
+  - Updated `AcpChatPanel` to use Rust-style status text in header/status row.
+  - Added the Kimi protection badge beside `Local` when the active/fallback model is risky.
+  - Added regression coverage for status mapping and Kimi badge classification.
+- Prevent recurrence:
+  - Keep status display and model-risk labels in shared UI helpers, not inline JSX.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `opencode_model_has_kimi_loop_risk`, ACP status row rendering near `Kimi protected`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt edit aksiyonu eksikti {#electron-acp-queued-prompt-edit-parity}
+- Date: 2026-06-11
+- Context: Rust ACP queued prompt rows include Run Next, Copy, Edit, and Delete actions. Editing moves the queued item back into the composer draft and keeps a return target so Cancel can restore it.
+- Error signature:
+  1. Electron queued prompt rows had Run Next, Copy, and Delete but no Edit action.
+  2. A queued prompt could not be moved back to the composer for correction without deleting and recreating it manually.
+- Symptoms/Impact:
+  - Users had a slower correction path for queued ACP prompts.
+  - Electron queued prompt interaction did not match the original Rust ACP panel.
+- Root cause:
+  - ACP queue IPC exposed reorder/delete only; no restore path existed for queued-draft edit cancellation.
+- Resolution:
+  - Added `acp:queueRestore` IPC and `restoreAcpQueuedPrompt()` in the ACP service.
+  - Added a queued row Edit action that moves the prompt into the composer when the draft is empty.
+  - Added `Editing queued #N` with Cancel to restore the original queued item.
+  - Added helper coverage for the Rust-style draft-occupied edit guard message.
+- Prevent recurrence:
+  - Keep queued prompt row actions aligned with Rust's Run Next / Copy / Edit / Delete set.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `AcpQueuedPromptRowAction::Edit`, `move_acp_queued_prompt_to_draft_for_edit`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt panel basligi ve daraltma davranisi eksikti {#electron-acp-queued-prompt-panel-header-parity}
+- Date: 2026-06-11
+- Context: Rust ACP queued prompt panel renders a header (`Queued N` or `Editing queued #N`), optional `{count} Plan` metadata, a `Hide` / `Show` toggle, and caps visible rows to two while allowing scroll.
+- Error signature:
+  1. Electron rendered queued prompt rows directly above the composer with no panel header.
+  2. Electron had no `Hide` / `Show` toggle and no plan-count metadata.
+  3. Long queues could expand the composer area instead of using Rust's two-row visible cap.
+- Symptoms/Impact:
+  - The queued prompt area looked and behaved differently from Rust.
+  - Larger queues consumed more vertical space in the ACP chat panel.
+- Root cause:
+  - Queued prompt UI was implemented as a simple row list, not as a Rust-style panel with header state.
+- Resolution:
+  - Added shared queued-panel helpers for header labels, plan counts, and visible-row count.
+  - Updated `AcpChatPanel` to render the Rust-style header with `Hide` / `Show` or edit `Cancel`.
+  - Capped the visible queued prompt rows to two with scrolling for longer queues.
+  - Added regression coverage for the header and visible-row rules.
+- Prevent recurrence:
+  - Keep queued prompt panel layout state in shared helpers and preserve `ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS = 2`.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `draw_acp_queued_prompt_panel`, `acp_queued_prompt_visible_rows`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt satirlari tekrar eden Queued etiketi kullaniyordu {#electron-acp-queued-row-index-label-parity}
+- Date: 2026-06-11
+- Context: Rust queued prompt rows use compact row metadata (`1.`, optional `Plan`) before the preview. The `Queued N` label belongs to the panel header.
+- Error signature:
+  1. Electron displayed `Queued` inside every queued prompt row.
+  2. Plan mode metadata was rendered as a late pill after the preview instead of row metadata before the prompt text.
+- Symptoms/Impact:
+  - The queued prompt area repeated redundant text and looked less like Rust after adding the panel header.
+  - Rows were harder to scan by queue order.
+- Root cause:
+  - Electron row markup predated the Rust-style queued panel header and kept the old row label.
+- Resolution:
+  - Added `acpQueuedPromptIndexLabel()`.
+  - Updated queued rows to show `1.`, `2.`, etc. and place `Plan` metadata before the preview.
+  - Added regression coverage for row index labels.
+- Prevent recurrence:
+  - Keep queued-row metadata distinct from queued-panel header labels.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `draw_acp_queued_prompt_panel_row`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt onizlemesi Rust gibi bosluklari sikistirmiyordu {#electron-acp-queued-preview-collapse-parity}
+- Date: 2026-06-11
+- Context: Rust queued prompt rows call `acp_queued_prompt_preview()` on the queued prompt text. That helper collapses whitespace, limits the preview to 96 characters, and appends `...` when truncated.
+- Error signature:
+  1. Electron preview text only used `trim()`, so embedded newlines and repeated spaces were rendered differently.
+  2. Electron did not apply the Rust 96-character preview cap in shared helper logic.
+  3. Electron row preview preferred draft text over the final queued prompt text.
+- Symptoms/Impact:
+  - Queued rows could show multi-line attachment blocks or unusually long text unlike the Rust compact row.
+  - Attachment-only queued prompts displayed line breaks in the row preview instead of Rust's single-line collapsed text.
+- Root cause:
+  - The Electron helper implemented a simple display fallback and did not mirror Rust's `split_whitespace()` + character-limit behavior.
+- Resolution:
+  - Added `ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS = 96`.
+  - Updated `queuedPromptPreview()` to prefer `finalPromptText`, collapse whitespace to single spaces, and truncate by character count with `...`.
+  - Added regression coverage for whitespace collapse, final prompt priority, ASCII truncation, and non-ASCII character counting.
+- Prevent recurrence:
+  - Keep queued prompt preview formatting in the shared helper and compare it against Rust's `acp_queued_prompt_preview()` when changing ACP queue rows.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_queued_prompt_preview`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt Run next ikonu Rust yonunden sapmisti {#electron-acp-run-next-arrow-parity}
+- Date: 2026-06-11
+- Context: Rust queued prompt rows render `Run next` with the app's `arrow-right` icon.
+- Error signature:
+  1. Electron rendered the `Run next` action with an upward shift-like glyph.
+- Symptoms/Impact:
+  - The queued prompt row action did not visually match the Rust ACP panel.
+  - The glyph suggested moving upward rather than sending the queued prompt forward/next.
+- Root cause:
+  - The Electron row action used a placeholder text symbol instead of the Rust action direction.
+- Resolution:
+  - Changed the Electron `Run next` row glyph to a right arrow.
+- Prevent recurrence:
+  - Keep ACP queued row action glyphs aligned with Rust's `arrow-right`, `pencil`, and `trash` action order.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `draw_acp_queued_prompt_panel_row`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP header status rengi ve hizasi Rust ile uyusmuyordu {#electron-acp-header-status-color-parity}
+- Date: 2026-06-11
+- Context: Rust ACP chat header renders the `OpenCode ACP` title and status text in the same left-aligned row. Running, permission, and error states use distinct status colors; muted states stay gray. A separate muted status row remains below the composer.
+- Error signature:
+  1. Electron placed header status as a separate space-between item instead of next to the title.
+  2. Electron rendered header status with the same muted color for every state.
+- Symptoms/Impact:
+  - ACP header did not visually match the Rust panel.
+  - Running, permission, and error states lost their quick color signal in the header.
+- Root cause:
+  - Electron had only Rust-style status text mapping, not the Rust header color and layout mapping.
+- Resolution:
+  - Added `acpHeaderStatusColor()` with Rust-style status colors.
+  - Updated the ACP header to group title and status on the left and apply state-specific status color.
+  - Added regression coverage for the header status color map.
+- Prevent recurrence:
+  - Keep header status styling separate from the muted bottom status row styling.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust ACP header rendering around `header_rect`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP attachment prompt formati Rust ile uyusmuyordu {#electron-acp-attachment-prompt-format-parity}
+- Date: 2026-06-11
+- Context: Rust `build_acp_prompt_text()` appends attachment paths as plain newline-separated paths under `Attached file paths:`. It does not prefix paths with bullets.
+- Error signature:
+  1. Electron main ACP service generated `Attached file paths:\n- path` bullet lines.
+  2. Renderer test/helper logic used the same bullet format.
+- Symptoms/Impact:
+  - ACP prompts sent from Electron did not match the Rust app's final prompt text.
+  - Queued prompt previews for attachment prompts reflected the Electron-only bullet format.
+- Root cause:
+  - Electron duplicated the attachment prompt builder with markdown-style bullet lines instead of porting Rust's plain path list.
+- Resolution:
+  - Updated Electron main `buildAcpPromptText()` to append raw newline-separated attachment paths.
+  - Updated renderer `buildAcpPromptText()` and tests to assert the exact Rust attachment format.
+  - Updated ACP queued prompt preview fixture to use the Rust attachment block format.
+- Prevent recurrence:
+  - Keep attachment prompt format exact against Rust `opencode_acp::build_acp_prompt_text()` whenever ACP prompt construction changes.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/renderer/src/lib/acpParser.ts`, `electron/renderer/src/lib/acpParser.test.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `opencode_acp::build_acp_prompt_text`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP attachment mention silme bosluk temizligini Rust gibi yapmiyordu {#electron-acp-remove-mention-space-parity}
+- Date: 2026-06-11
+- Context: Rust `remove_mention_from_input()` removes the last matching attachment mention and also removes a preceding space when the mention is not at the start of the input.
+- Error signature:
+  1. Electron `removeMentionFromInput()` removed only the mention substring.
+  2. Removing the last attachment mention from text such as `hello @file.ts` left a trailing space.
+- Symptoms/Impact:
+  - Composer text could retain extra spaces after an attachment chip was removed.
+  - Electron attachment removal behavior diverged from the Rust composer.
+- Root cause:
+  - The Electron helper used a raw `lastIndexOf()` splice without Rust's preceding-space cleanup rule.
+- Resolution:
+  - Updated `removeMentionFromInput()` to remove one preceding space when present and when the mention is not at the start.
+  - Updated regression tests for duplicate mention removal and Rust's first-position behavior.
+- Prevent recurrence:
+  - Keep attachment mention add/remove behavior aligned with Rust `path_to_mention()`, `append_mentions_to_input()`, and `remove_mention_from_input()`.
+- Files/Commands touched: `electron/renderer/src/lib/acpParser.ts`, `electron/renderer/src/lib/acpParser.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `opencode_acp::remove_mention_from_input`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP attachment mention uretimi Rust helperini kullanmiyordu {#electron-acp-path-to-mention-parity}
+- Date: 2026-06-11
+- Context: Rust generates attachment composer mentions through `path_to_mention()` and `append_mentions_to_input()`, using the path basename plus mojibake display repair before inserting `@file`.
+- Error signature:
+  1. Electron generated attachment mentions inline in `AcpChatPanel`.
+  2. Electron did not reuse a shared path-to-mention helper for both add and remove flows.
+  3. Mojibake-repaired file names were not covered by ACP mention tests.
+- Symptoms/Impact:
+  - ACP attachment mention behavior could drift between add and remove paths.
+  - CP1252-corrupted Turkish file names could appear unrepaired in composer mentions.
+- Root cause:
+  - The Electron port only had generic mention removal logic and left ACP mention creation in component UI code.
+- Resolution:
+  - Added `pathToMention()` and `appendMentionsToInput()` to the renderer ACP parser helpers.
+  - Updated `AcpChatPanel` attachment add/remove flows to use the shared helpers.
+  - Added regression tests for Windows paths, Unicode file names, mojibake repair, empty input, existing input, multiple paths, and empty path lists.
+- Prevent recurrence:
+  - Keep ACP attachment mention creation and removal centralized in parser helpers, aligned with Rust `path_to_mention()`, `append_mentions_to_input()`, and `remove_mention_from_input()`.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpParser.ts`, `electron/renderer/src/lib/acpParser.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `opencode_acp::path_to_mention` and `opencode_acp::append_mentions_to_input`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP sohbet basligi ilk prompttan uretilmiyordu {#electron-acp-chat-title-from-prompt-parity}
+- Date: 2026-06-11
+- Context: Rust derives an ACP chat title from the first prompt by collapsing whitespace, truncating at 72 characters, and using that title in Terminal Manager rows after the chat has started.
+- Error signature:
+  1. Electron ACP sessions had no `title` state.
+  2. Terminal Manager always displayed `OpenCode ACP` for active ACP rows, even after a prompt had started the chat.
+  3. Renderer had no shared helper for Rust-style ACP chat title and row label formatting.
+- Symptoms/Impact:
+  - Multiple ACP conversations were harder to distinguish in Terminal Manager.
+  - The Electron ACP row did not match Rust's `OpenCode ACP - <prompt title>` behavior.
+- Root cause:
+  - The Electron ACP service tracked messages and queues but never persisted a derived chat title.
+- Resolution:
+  - Added Rust-style chat title derivation in the ACP service when a prompt is queued or sent.
+  - Added `title` to ACP session snapshots.
+  - Added renderer helpers for chat title, started-state, display title, and Terminal Manager row label.
+  - Passed active ACP session snapshots into Terminal Manager and used the derived row label.
+  - Added regression coverage for whitespace collapse, 72-character truncation, Unicode character counting, started-state, and row label formatting.
+- Prevent recurrence:
+  - Keep ACP chat row labels driven by session title snapshots rather than a fixed `OpenCode ACP` string after a chat starts.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_chat_title_from_prompt`, `acp_chat_display_title`, and `acp_terminal_manager_row_label`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP panel header proje adini basliga ekliyordu {#electron-acp-panel-header-title-parity}
+- Date: 2026-06-11
+- Context: Rust ACP panel header renders the fixed `OpenCode ACP` title next to the status text. Project and branch context is shown elsewhere, not in the header title.
+- Error signature:
+  1. Electron rendered `OpenCode ACP - <project>` in the ACP panel header.
+- Symptoms/Impact:
+  - The ACP panel header was visually wider and did not match Rust's compact title/status row.
+  - Project context was duplicated between the surrounding project selection and ACP panel title.
+- Root cause:
+  - Electron's `openCodeAcpPanelTitle()` helper encoded project context into the panel title instead of matching Rust's fixed header label.
+- Resolution:
+  - Updated `openCodeAcpPanelTitle()` to return the fixed `OpenCode ACP` label.
+  - Updated regression coverage for the Rust-style panel title.
+- Prevent recurrence:
+  - Keep per-chat prompt titles in Terminal Manager/thread rows and keep the ACP panel header label fixed.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust ACP header rendering around `header_rect`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Terminal Manager ACP acma butonu OpenCode terminaline bagliydi {#electron-terminal-manager-acp-button-visibility-parity}
+- Date: 2026-06-11
+- Context: Rust exposes OpenCode ACP as a synthetic foreground launcher row independent of whether a foreground OpenCode terminal is already running.
+- Error signature:
+  1. Electron showed the `+ ACP` button only when the project already had a foreground OpenCode terminal.
+  2. Projects without an OpenCode foreground terminal could not start ACP from Terminal Manager.
+- Symptoms/Impact:
+  - ACP discovery and launch flow differed from Rust.
+  - Users had to create or keep an OpenCode terminal before opening terminal-less ACP chat.
+- Root cause:
+  - The Electron Terminal Manager button condition conflated ACP availability with existing foreground OpenCode terminal presence.
+- Resolution:
+  - Added `shouldShowOpenCodeAcpButton()` helper.
+  - Updated Terminal Manager to show `+ ACP` whenever the Foreground filter is active and the project has no active ACP chat.
+  - Added regression coverage that the ACP button no longer requires an existing OpenCode terminal.
+- Prevent recurrence:
+  - Keep ACP launch visibility based on Terminal Manager filter and active ACP state, not terminal process presence.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/terminalManagerState.ts`, `electron/renderer/src/lib/terminalManagerState.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust foreground launcher synthetic `OpenCode ACP` row, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP queued prompt satirinda ekstra kopya ikonu ve farkli ek etiketi vardi {#electron-acp-queued-row-actions-attachment-parity}
+- Date: 2026-06-11
+- Context: Rust queued prompt rows copy by clicking the preview text and reserve the icon buttons for Run Next, Edit, and Delete. Attachment metadata is rendered as `{count} file`.
+- Error signature:
+  1. Electron rendered an extra copy icon button in each queued row.
+  2. Electron rendered attachment metadata as `+N` in a pill instead of Rust's `N file` text.
+- Symptoms/Impact:
+  - Queued row actions did not match Rust's three-icon layout.
+  - Attachment rows had different visual weight and wording.
+- Root cause:
+  - Electron row UI carried a standalone copy button from the earlier simple-list implementation.
+- Resolution:
+  - Added `acpQueuedPromptAttachmentLabel()`.
+  - Updated queued rows to keep preview-click copy behavior and remove the explicit copy icon.
+  - Changed attachment metadata to Rust-style `N file`.
+  - Added regression coverage for attachment label formatting.
+- Prevent recurrence:
+  - Keep queued row action buttons limited to Run Next, Edit, and Delete; preview click remains the copy affordance.
+- Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `draw_acp_queued_prompt_panel_row`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Terminal Manager ACP satiri sabit mavi nokta gosteriyordu {#electron-acp-terminal-manager-badge-parity}
+- Date: 2026-06-11
+- Context: Rust Terminal Manager renders ACP rows with status-specific badge visuals: gray spinner while starting/running, amber pulse/solid for permission, green pulse for completed turns, red solid for errors, and no idle badge.
+- Error signature:
+  1. Electron always rendered the ACP row with a static blue dot.
+  2. Permission and completed-turn attention states were not visible in Terminal Manager.
+- Symptoms/Impact:
+  - ACP chat state was harder to scan from Terminal Manager.
+  - Electron did not match Rust's attention model for ACP sessions.
+- Root cause:
+  - Electron tracked only the active ACP session snapshot and did not maintain Terminal Manager attention reasons.
+  - The row renderer used a fixed decorative dot instead of deriving badge visuals from status and attention.
+- Resolution:
+  - Added Rust-style ACP Terminal Manager badge helpers and tests.
+  - Added renderer attention tracking for permission and turn-complete ACP events.
+  - Replaced the fixed blue dot with spinner, pulse, and solid badge visuals using Rust colors.
+  - Cleared attention when the ACP chat is opened, a new prompt starts, permission/question responses arrive, or the chat is removed.
+- Prevent recurrence:
+  - Keep ACP Terminal Manager row badges driven by `acpTerminalManagerBadgeVisual()` and `nextAcpTerminalManagerAttention()` rather than hard-coded row decoration.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_terminal_manager_badge_visual`, `AcpTerminalManagerAttentionReason`, and `draw_ai_badge_visual_with_tooltip`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP Terminal Manager satiri mavi secili kart gibi gorunuyordu {#electron-acp-terminal-manager-row-chrome-parity}
+- Date: 2026-06-11
+- Context: Rust renders ACP rows with the same neutral `terminal_manager_row_chrome()` used by terminal rows: active rows get a dark gray fill/stroke, hovered rows get a subtle soft fill, and inactive rows stay unfilled.
+- Error signature:
+  1. Electron rendered every active ACP row with a fixed blue-tinted background.
+  2. ACP row text stayed blue instead of using the normal Terminal Manager row title color.
+- Symptoms/Impact:
+  - ACP rows looked like a separate blue callout rather than a native Terminal Manager row.
+  - Active and hover states did not match terminal rows or the Rust UI.
+- Root cause:
+  - The ACP row JSX had hard-coded background/text colors and did not receive the currently active ACP project id.
+- Resolution:
+  - Passed `activeAcpProjectId` into Terminal Manager project rows.
+  - Reused `terminalManagerRowChrome()` for ACP row active and hover states.
+  - Removed the fixed blue row background/text and kept error rows red like Rust.
+  - Kept badge and close actions above the row background with stable z-ordering.
+- Prevent recurrence:
+  - Keep ACP row chrome tied to the shared Terminal Manager row chrome helper instead of introducing ACP-specific callout styling.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Original Rust `terminal_manager_row_chrome()` and ACP row rendering around `terminal_manager_acp_row_select`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Claude/OpenCode varsayilanlari eski cc ve Kimi ayarlarini kullaniyordu {#electron-claude-opencode-mimo-config-parity}
+- Date: 2026-06-11
+- Context: Rust tarafinda Claude Code gercek npm `claude.cmd` komutuna, OpenCode build varsayilani da Mimo modeline tasindi. Electron worktree ayni davranisi henuz tasimiyordu.
+- Error signature:
+  1. Electron config normalizasyonu eski Claude `cc` launcher alias'ini koruyabiliyordu.
+  2. OpenCode build varsayilani ve eski Kimi K2.6 migrasyonu Mimo'ya gecmiyordu.
+  3. Electron OpenCode runtime/terminal config uretimi Mimo provider bilgilerini yazmiyor, model bos kalinca `sonnet` kullanabiliyordu.
+- Symptoms/Impact:
+  - Claude Code acilinca eski shell wrapper/env ayarlari devreye girebiliyor ve Mimo/key akisi bozulabiliyordu.
+  - OpenCode build modu Electron tarafinda Rust ile ayni Mimo varsayilanini ve provider env ayarini kullanmiyordu.
+- Root cause:
+  - Electron shared config ve renderer launcher helper'lari Rust'taki yeni Claude launcher sanitization/migration davranisindan ayrismisti.
+  - OpenCode config generator yalnizca temel agent/mode alanlarini yaziyor, provider injection yapmiyordu.
+- Resolution:
+  - Added shared Claude launch command normalization and migrated legacy `cc`, `cc.cmd`, bare `claude`, and `claude.ps1` to the platform default Claude CLI command while preserving explicit custom `claude.cmd` paths.
+  - Changed Electron OpenCode build default to `mimo/mimo-v2.5-pro` and migrated old Kimi K2.5/K2.6 slot A values to Mimo.
+  - Wrote Mimo provider metadata (`MIMO_API_KEY`, Mimo base URL, model id/name) into generated OpenCode terminal/runtime configs.
+  - Updated Electron Settings placeholder so new launchers do not suggest `cc`.
+- Prevent recurrence:
+  - Keep Electron launcher/model defaults and migrations aligned with Rust `models.rs`, `config.rs`, and `opencode_config.rs` whenever AI CLI defaults change.
+- Files/Commands touched: `electron/shared/types.ts`, `electron/main/config.ts`, `electron/main/opencode.ts`, `electron/renderer/src/lib/launcher.ts`, `electron/renderer/src/components/SettingsPopup.tsx`, `electron/main/config.test.ts`, `electron/main/opencode.test.ts`, `electron/renderer/src/lib/launcher.test.ts`, `.agents/claude-code.md`, `AGENTS.md`, `.gitignore`, `KNOWN_ISSUES.md`
+- References: Rust Mimo/Claude launcher parity update, Electron parity goal 2026-06-11
+
+---
+
+#### Project-local Claude settings override forced Fireworks/Kimi despite Mimo env {#claude-project-local-settings-override}
+- Date: 2026-06-11
+- Context: User reported that launching Claude Code from the foreground launcher still opened as Kimi even though the launch command exported Mimo Anthropic env vars.
+- Error signature:
+  1. Global `~/.claude/settings.json` pointed to Mimo and `mimo-key-helper.cmd`.
+  2. The selected project had `.claude/settings.local.json` with `apiKeyHelper` pointing to `fireworks-firepass-key-helper.cmd`, Fireworks base URL, and Kimi model overrides.
+  3. Claude Code loaded the project-local settings after the global settings, so the local Fireworks/Kimi values won.
+- Symptoms/Impact:
+  - Claude Code startup failed with a missing Fireworks helper error.
+  - Foreground Claude sessions in that project used Kimi/Fireworks config instead of Mimo.
+- Root cause:
+  - Mergen repaired only global Claude settings before launching Claude Code and ignored existing project-local `.claude/settings.local.json` overrides.
+- Resolution:
+  - Added project-local Claude settings repair for existing `project/.claude/settings.local.json` files.
+  - Updated the foreground Claude launcher path to repair both global and selected-project local settings before submitting the launch command.
+  - Repaired the current ignored `.claude/settings.local.json` to Mimo and removed stale Emdash hooks.
+- Prevent recurrence:
+  - Added regression tests for missing local settings, local Fireworks/Kimi override repair, permission preservation, and stale hook cleanup.
+- Files/Commands touched: `src/claude_settings.rs`, `src/app.rs`, `.claude/settings.local.json`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-06-11
+
+---
+
+#### Smart Input queue stuck on ACP stderr error and Claude fresh session not dispatching {#smart-input-queue-acp-claude-dispatch}
+- Date: 2026-06-10
+- Context: User reported that Smart Input queued prompts were never sent when OpenCode ACP emitted a `SessionStart:startup hook error` on stderr, and that Claude Code Smart Input auto-dispatch never worked for fresh sessions.
+- Error signature:
+  1. `stderr_thread` in `src/opencode_acp.rs` sends ALL stderr lines as `AcpChatEvent::Error`.
+  2. `handle_acp_error_event` unconditionally set `session.status = AcpChatStatus::Error` for any `Error` event, killing the session before `SessionCreated` could arrive and flush the queue.
+  3. `apply_claude_status` only set `claude_attention_pending = true` on `Working -> Idle` transition (`previous_normalized_status == Some(Working)`). For fresh Claude sessions, `previous_normalized_status` is `None` on the first `Idle` detection, so `claude_attention_pending` was never set.
+  4. `smart_input_auto_dispatch_ready` for Claude requires `claude_attention_pending == true`, so fresh sessions could never auto-dispatch.
+  5. `clear_claude_state` and `mark_claude_launch_pending` did NOT reset `claude_attention_pending`, leaving stale state across session restarts.
+- Symptoms/Impact:
+  1. After submitting a Smart Input `After Done` task, if OpenCode ACP printed any stderr line, the queue got stuck forever because the session status became `Error`.
+  2. Claude Code Smart Input `After Done` tasks never auto-dispatched for new terminals; the queue grew indefinitely.
+- Root cause:
+  - `handle_acp_error_event` treated all stderr as fatal.
+  - `apply_claude_status` had an asymmetric `claude_attention_pending` transition that only covered `Working -> Idle`, not `None -> Idle` or `Permission -> Idle`.
+- Resolution:
+  - Changed `handle_acp_error_event` to treat non-fatal stderr as transient warnings when the session has `session_id` or is `Starting` (only "ACP JSON parse error" remains fatal). The session stays alive so `SessionCreated` or `PromptResponse` can still flush the queue.
+  - Changed `apply_claude_status` to trigger `claude_attention_pending` on any transition to `Idle`/`Permission` except `Idle -> Idle`, covering `None -> Idle`, `Working -> Idle`, and `Permission -> Idle`.
+  - Added `claude_attention_pending = false` to `clear_claude_state` and `mark_claude_launch_pending` to prevent stale state.
+  - Added `claude_prompt_submit_since = None` to `mark_claude_launch_pending`.
+  - Added 7 regression tests for ACP stderr warning behavior and Claude attention-pending transitions.
+- Prevent recurrence:
+  - Updated AGENTS.md with the "ACP `session/new` must include `cwd` and `mcpServers`" and related ACP standby guidelines.
+  - Recorded this entry in KNOWN_ISSUES.md.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: `/implement-plan` request 2026-06-10
+
+---
+
+#### Clipboard image paste cross-app leakage and accidental Smart Input attachment {#clipboard-image-paste-leakage}
+- Date: 2026-06-09
+- Context: User reported that pressing Ctrl+V in another application while Mergen was running in the background caused image paste to leak into the active terminal, and that auto-focused Smart Input was creating accidental image attachments.
+- Error signature:
+  1. `native_primary_paste_shortcut_down()` uses Windows `GetAsyncKeyState` which is global and fires even when Mergen is unfocused.
+  2. `raw_input_hook` processed `native_primary_paste_requested` without checking `raw_input.focused`, so clipboard image paste from another app leaked into Mergen.
+  3. `native_image_paste_target()` used `capture_keyboard` fallback and `active_smart_input_draft_request()` which returned auto-focused Smart Input, causing image paste to create attachments even when the user never explicitly clicked the Smart Input field.
+  4. `ensure_smart_input_focus()` auto-focuses Smart Input when no other UI input is focused, which is why explicit-click tracking is necessary to distinguish intentional clicks.
+- Symptoms/Impact:
+  1. Copying an image in another app while Mergen was in background would unexpectedly paste it into the active terminal.
+  2. Auto-focused Smart Input (without explicit click) received image paste and created unwanted attachment chips.
+  3. Image paste could leak to the wrong terminal after switching terminals because stale focus state persisted.
+- Root cause:
+  - No focus gate on native (global key poll) image paste.
+  - No explicit-click tracking for Smart Input; auto-focus was treated the same as user click.
+- Resolution:
+  - Added `raw_input.focused` gate before processing `native_primary_paste_requested` image paste.
+  - Added `smart_input_explicit_focus: Option<u64>` field to `AdeApp` to track explicit clicks vs auto-focus.
+  - Added `smart_input_explicitly_clicked: bool` to `SmartInputPaneAction`; set when draft/edit `TextEdit` is clicked.
+  - Modified `raw_input_hook` to only use explicit targets for native paste: `terminal_output_paste_target` and `smart_input_explicit_request`.
+  - Cleared `smart_input_explicit_focus` on terminal output click, terminal switch, terminal close, popup/modal open, ACP chat visible, and terminal output override active.
+  - Added 8 regression tests covering unfocused blocking, explicit terminal output click, explicit Smart Input click, auto-focus blocking, and focus clearing on terminal switch/ACP visible.
+- Prevent recurrence:
+  - Updated AGENTS.md Clipboard Paste Guidelines with `raw_input.focused` gate, explicit-click routing, and `smart_input_explicit_focus` clearing rules.
+  - Recorded this entry in KNOWN_ISSUES.md.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-06-09
+
+---
+
 #### Smart Input Build/Plan mode chip text not centered {#smart-input-mode-chip-center}
 - Date: 2026-06-09
 - Context: User reported that the "Build" text inside the Smart Input mode pill and the queued-task mode badge was not centered inside the chip rectangle.
@@ -3721,37 +5923,35 @@
 
 ---
 
-#### Smart Input Build/Plan mode switch not working — stale state and delayed Enter interference {#smart-input-mode-switch-bug}
+#### Smart Input Build/Plan mode switch not working - stale state and delayed Enter interference {#smart-input-mode-switch-bug}
 - Date: 2026-06-09
-- Context: User reported that when an OpenCode terminal is in Plan mode and a queued Smart Input task is in Build mode, the prompt does not switch to Build mode and continues running in Plan mode ("terminalde plan mode var sıradaki mesaj build mode ama değişmiyor builde, plandan devam ediyor").
+- Context: User reported that when an OpenCode terminal is in Plan mode and a queued Smart Input task is in Build mode, the prompt does not switch to Build mode and continues running in Plan mode.
 - Error signature:
   1. `smart_input_prepare_opencode_mode` checked `if let Some(pending) = terminal.opencode_pending_mode_switch.clone()` but never used the `pending` value when it was settled. It unconditionally set `opencode_last_known_mode = Some(target.to_owned())` instead of `Some(pending.clone())`, causing the recorded mode to drift from the actual TUI state.
   2. When a stale pending switch settled to a mode different from the current task's target, the function returned `true` immediately instead of sending another `Tab` to reach the correct mode.
-  3. Old delayed confirmation Enters (`pending_second_enter`) from previously dispatched tasks were not cleared before sending the mode-switch `Tab`. An old Enter could arrive while OpenCode's TUI was in the mode-selection state, causing the wrong prompt to be confirmed or preventing the agent switch from taking effect.
-  4. `smart_input_prepare_opencode_mode` did not request a repaint after setting a pending mode switch, so the prompt dispatch could stall until unrelated input triggered a frame.
+  3. Old delayed confirmation Enters (`pending_second_enter`) from previously dispatched tasks were not cleared before sending the mode-switch `Tab`.
+  4. `smart_input_prepare_opencode_mode` did not request a repaint after setting a pending mode switch, so prompt dispatch could stall until unrelated input triggered a frame.
 - Symptoms/Impact:
-  1. Queued tasks in a different mode than the current OpenCode TUI mode were submitted without a proper mode switch, causing the AI to run in the wrong agent (e.g., a Build task running in Plan mode).
-  2. Stale delayed Enters interfered with the mode switch, making the behavior appear random or consistently broken.
-  3. After a failed mode switch, `opencode_last_known_mode` became permanently out of sync with the actual TUI, so subsequent tasks in the same mode also skipped the Tab switch.
+  1. Queued tasks in a different mode than the current OpenCode TUI mode were submitted without a proper mode switch.
+  2. Stale delayed Enters interfered with the mode switch, making behavior appear random or consistently broken.
+  3. After a failed mode switch, `opencode_last_known_mode` became permanently out of sync with the actual TUI.
 - Root cause:
   - `smart_input_prepare_opencode_mode` had a logic bug where the settled `pending` value was read but not used for updating `last_known_mode`.
   - No cleanup of stale `pending_second_enter` was performed before sending the `Tab` keystroke.
-  - No `request_repaint_after` was issued when the function entered a pending state, so the settle timeout could be missed.
+  - No `request_repaint_after` was issued when the function entered a pending state.
 - Resolution:
-  - Changed `smart_input_prepare_opencode_mode` to record `opencode_last_known_mode = Some(pending.clone())` when the pending switch settles. If the settled mode differs from the task target, it now falls through to send another `Tab` instead of returning `true` prematurely.
-  - Added `self.pending_second_enter.retain(|(tid, _)| *tid != terminal_id)` before sending the mode-switch `Tab` to prevent stale confirmation Enters from interfering.
-  - Added `ctx.request_repaint_after(Duration::from_millis(OPENCODE_MODE_SWITCH_SETTLE_MS))` after setting the pending state so the prompt dispatch resumes promptly after the settle window.
-  - Added `ctx` parameter to `smart_input_prepare_opencode_mode` so it can schedule repaints.
-  - Updated both callers (`process_smart_input_queues` and `handle_smart_input_pane_action`) to pass `ctx`.
-  - Added regression tests:
-    - `smart_input_settled_pending_target_mismatch_sends_second_tab` — verifies settled pending mismatch triggers a second Tab.
-    - `smart_input_mode_switch_clears_stale_delayed_enters` — verifies stale delayed Enters are drained before Tab.
-    - `smart_input_plan_to_build_dispatches_tab_then_prompt_after_settle` — end-to-end test for Plan → Build dispatch.
+  - Changed `smart_input_prepare_opencode_mode` to record `opencode_last_known_mode = Some(pending.clone())` when the pending switch settles.
+  - If the settled mode differs from the task target, it now falls through to send another `Tab` instead of returning `true` prematurely.
+  - Added `self.pending_second_enter.retain(|(tid, _)| *tid != terminal_id)` before sending the mode-switch `Tab`.
+  - Added `ctx.request_repaint_after(Duration::from_millis(OPENCODE_MODE_SWITCH_SETTLE_MS))` after setting the pending state.
+  - Added regression tests for settled pending mismatch, stale delayed Enter cleanup, and Plan to Build dispatch.
 - Prevent recurrence:
-  - Updated AGENTS.md with two new Smart Input guidelines: "Smart Input mode switch must clear stale delayed confirmation Enters before sending Tab" and "Smart Input mode switch must record the actual settled mode, not the task target".
+  - Updated AGENTS.md with Smart Input mode-switch guidelines.
   - Recorded this entry in KNOWN_ISSUES.md.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-06-09
+
+---
 
 #### Smart Input mode selector moved from header to draft area {#smart-input-mode-selector-moved}
 - Date: 2026-06-09
@@ -3760,12 +5960,11 @@
   - Added constants `SMART_INPUT_MODE_SELECTOR_WIDTH`, `SMART_INPUT_MODE_SELECTOR_HEIGHT`, and `SMART_INPUT_MODE_SELECTOR_GAP` near other Smart Input constants.
   - Removed the single mode pill from the header row in `draw_smart_input_footer()`.
   - Added a two-segment `[Build | Plan]` mode selector inside the draft `ui.horizontal` layout, before the TextEdit.
-  - Active mode uses the same highlight colors as the previous header pill (orange for Plan, white/grey for Build); inactive mode uses muted colors.
+  - Active mode uses the same highlight colors as the previous header pill; inactive mode uses muted colors.
   - Clicking a segment sets `draft_mode` and requests keyboard focus on the draft.
   - TextEdit width is reduced by `mode_selector_reserved` when the selector is visible so the layout remains balanced.
   - Updated `AGENTS.md` Smart Input guideline to note the new draft-area location.
-  - Added regression test `smart_input_mode_selector_in_draft_area_for_opencode` verifying both labels render and are positioned near each other.
-  - Existing tests `smart_input_footer_hides_mode_pill_for_claude` and `smart_input_footer_omits_global_mode_buttons_and_shows_queue_count` continue to pass.
+  - Added regression test `smart_input_mode_selector_in_draft_area_for_opencode`.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 
 ---

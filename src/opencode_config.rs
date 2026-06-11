@@ -256,10 +256,6 @@ fn apply_runtime_safety_to_config(
     value: &mut JsonValue,
     defaults: &OpenCodeRuntimeDefaults,
 ) -> io::Result<bool> {
-    if !defaults.loop_protection_enabled {
-        return Ok(false);
-    }
-
     let root = value.as_object_mut().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -268,65 +264,69 @@ fn apply_runtime_safety_to_config(
     })?;
     let mut changed = false;
 
-    let agent = root
-        .entry("agent")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "agent must be an object"))?;
-    let build = agent
-        .entry("build")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "agent.build must be an object")
-        })?;
-    changed |= apply_build_agent_safety(build, defaults)?;
+    if defaults.loop_protection_enabled {
+        let agent = root
+            .entry("agent")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "agent must be an object"))?;
+        let build = agent
+            .entry("build")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "agent.build must be an object")
+            })?;
+        changed |= apply_build_agent_safety(build, defaults)?;
 
-    let mode = root
-        .entry("mode")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mode must be an object"))?;
-    let mode_build = mode
-        .entry("build")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "mode.build must be an object")
-        })?;
-    changed |= apply_build_agent_safety(mode_build, defaults)?;
+        let mode = root
+            .entry("mode")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mode must be an object"))?;
+        let mode_build = mode
+            .entry("build")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "mode.build must be an object")
+            })?;
+        changed |= apply_build_agent_safety(mode_build, defaults)?;
 
-    if defaults.uses_fireworks_provider() {
-        let provider = root
-            .entry("provider")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "provider must be an object")
-            })?;
-        let fireworks = provider
-            .entry("fireworks-ai")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "provider.fireworks-ai must be an object",
-                )
-            })?;
-        let options = fireworks
-            .entry("options")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "provider.fireworks-ai.options must be an object",
-                )
-            })?;
-        changed |= set_json_u64_min(options, "timeout", defaults.fireworks_timeout_ms);
-        changed |= set_json_u64_min(options, "chunkTimeout", defaults.fireworks_chunk_timeout_ms);
+        if defaults.uses_fireworks_provider() {
+            let provider = root
+                .entry("provider")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "provider must be an object")
+                })?;
+            let fireworks = provider
+                .entry("fireworks-ai")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "provider.fireworks-ai must be an object",
+                    )
+                })?;
+            let options = fireworks
+                .entry("options")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "provider.fireworks-ai.options must be an object",
+                    )
+                })?;
+            changed |= set_json_u64_min(options, "timeout", defaults.fireworks_timeout_ms);
+            changed |=
+                set_json_u64_min(options, "chunkTimeout", defaults.fireworks_chunk_timeout_ms);
+        }
     }
+
     if defaults.uses_mimo_provider() {
         let provider = root
             .entry("provider")

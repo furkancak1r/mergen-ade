@@ -1,0 +1,310 @@
+import { spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import type { GitWorktreeInfo } from '../shared/types';
+import type { SourceControlStatus } from '../shared/types';
+import type { GitDiffSummary } from '../shared/gitDiffSummary';
+import { countTextLineBytes, parseGitNumstatTotals, parseGitPathList } from '../shared/gitDiffSummary';
+import { parseBranchHeader, parseSourceControlStatusLine } from '../shared/sourceControl';
+
+export function parseGitWorktreeList(output: string): GitWorktreeInfo[] {
+  const worktrees: GitWorktreeInfo[] = [];
+  const lines = output.split('\n');
+  let current: Partial<GitWorktreeInfo> | null = null;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (current && current.path) {
+        worktrees.push({
+          path: current.path,
+          branch: current.branch ?? '',
+          head: current.head,
+          detached: current.detached ?? false,
+          locked: current.locked ?? false,
+          prunable: current.prunable ?? false,
+        });
+      }
+      current = null;
+      continue;
+    }
+
+    if (trimmed.startsWith('worktree ')) {
+      current = { path: trimmed.slice(9).trim() };
+    } else if (current) {
+      if (trimmed.startsWith('HEAD ')) {
+        current.head = trimmed.slice(5).trim();
+      } else if (trimmed.startsWith('branch ')) {
+        current.branch = trimmed.slice(7).trim().replace(/^refs\/heads\//, '');
+      } else if (trimmed === 'detached') {
+        current.detached = true;
+      } else if (trimmed.startsWith('locked ')) {
+        current.locked = true;
+      } else if (trimmed === 'locked') {
+        current.locked = true;
+      } else if (trimmed === 'prunable') {
+        current.prunable = true;
+      }
+    }
+  }
+
+  if (current && current.path) {
+    worktrees.push({
+      path: current.path,
+      branch: current.branch ?? '',
+      head: current.head,
+      detached: current.detached ?? false,
+      locked: current.locked ?? false,
+      prunable: current.prunable ?? false,
+    });
+  }
+
+  return worktrees;
+}
+
+export function discoverWorktrees(repoPath: string): Promise<GitWorktreeInfo[]> {
+  return new Promise((resolve) => {
+    const proc = spawn('git', ['worktree', 'list', '--porcelain'], { cwd: repoPath });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (data) => { stdout += data; });
+    proc.stderr.on('data', (data) => { stderr += data; });
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        resolve([]);
+        return;
+      }
+      resolve(parseGitWorktreeList(stdout));
+    });
+    proc.on('error', () => {
+      resolve([]);
+    });
+  });
+}
+
+export function createWorktree(repoPath: string, branch: string, wtPath: string, baseBranch?: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const args = ['worktree', 'add', '-b', branch, wtPath];
+    if (baseBranch) {
+      args.push(baseBranch);
+    }
+    const proc = spawn('git', args, { cwd: repoPath });
+    proc.on('close', (code) => {
+      if (code === 0) {
+        // Copy root .env* files to new worktree so runtime commands work immediately
+        copyEnvFiles(repoPath, wtPath);
+      }
+      resolve(code === 0);
+    });
+    proc.on('error', () => {
+      resolve(false);
+    });
+  });
+}
+
+function copyEnvFiles(fromDir: string, toDir: string): void {
+  if (!fromDir || typeof fromDir !== 'string' || !toDir || typeof toDir !== 'string') {
+    return;
+  }
+  try {
+    const entries = fs.readdirSync(fromDir);
+    for (const entry of entries) {
+      if (entry.startsWith('.env')) {
+        const src = fromDir + path.sep + entry;
+        const dest = toDir + path.sep + entry;
+        const stat = fs.statSync(src);
+        if (stat.isFile()) {
+          fs.copyFileSync(src, dest);
+        }
+      }
+    }
+  } catch {
+    // ignore copy failures
+  }
+}
+
+export function cleanupOrphanWorktrees(
+  registeredPaths: string[],
+  repoPath: string,
+): Promise<string[]> {
+  return new Promise((resolve) => {
+    discoverWorktrees(repoPath).then((discovered) => {
+      const orphanPaths: string[] = [];
+      for (const registered of registeredPaths) {
+        const stillExists = discovered.some((d) => d.path === registered);
+        const pathOnDisk = fs.existsSync(registered);
+        if (!stillExists && !pathOnDisk) {
+          orphanPaths.push(registered);
+        }
+      }
+      resolve(orphanPaths);
+    });
+  });
+}
+
+export function removeWorktree(repoPath: string, path: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const proc = spawn('git', ['worktree', 'remove', path], { cwd: repoPath });
+    proc.on('close', (code) => {
+      resolve(code === 0);
+    });
+    proc.on('error', () => {
+      resolve(false);
+    });
+  });
+}
+
+export async function getGitStatus(repoPath: string, runFetch = false): Promise<SourceControlStatus> {
+  if (runFetch) {
+    try {
+      const fetch = await runGitCommand(repoPath, ['fetch', '--all', '--prune']);
+      if (fetch.code !== 0) {
+        return {
+          files: [],
+          branch: '',
+          ahead: 0,
+          behind: 0,
+          error: fetch.stderr.trim() ? `Fetch failed: ${fetch.stderr.trim()}` : 'git fetch failed',
+        };
+      }
+    } catch (error) {
+      return {
+        files: [],
+        branch: '',
+        ahead: 0,
+        behind: 0,
+        error: `Fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  try {
+    const output = await runGitCommand(repoPath, ['status', '--porcelain', '-b']);
+    if (output.code !== 0) {
+      return {
+        files: [],
+        branch: '',
+        ahead: 0,
+        behind: 0,
+        error: output.stderr.trim() || 'Not a git repository',
+      };
+    }
+
+    const lines = output.stdout.split('\n');
+    let branch = '';
+    let ahead = 0;
+    let behind = 0;
+    const files: { path: string; status: string; staged: boolean }[] = [];
+    for (const line of lines) {
+      if (line.startsWith('## ')) {
+        const parsed = parseBranchHeader(line.slice(3));
+        branch = parsed.branch;
+        ahead = parsed.ahead;
+        behind = parsed.behind;
+      } else {
+        const file = parseSourceControlStatusLine(line);
+        if (file) files.push(file);
+      }
+    }
+    return { files, branch: branch || 'detached', ahead, behind };
+  } catch (error) {
+    return {
+      files: [],
+      branch: '',
+      ahead: 0,
+      behind: 0,
+      error: `Status failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+export async function getGitDiffSummary(repoPath: string): Promise<GitDiffSummary> {
+  try {
+    const base = await resolveGitDiffBase(repoPath);
+    const output = await runGitCommand(repoPath, ['diff', base, '--numstat']);
+    if (output.code !== 0) {
+      return {
+        status: 'error',
+        addedLines: 0,
+        removedLines: 0,
+        error: output.stderr.trim() || 'git diff --numstat failed',
+      };
+    }
+
+    const totals = parseGitNumstatTotals(output.stdout);
+    const untrackedAddedLines = await countUntrackedTextFileLines(repoPath);
+    return {
+      status: 'ready',
+      addedLines: totals.addedLines + untrackedAddedLines,
+      removedLines: totals.removedLines,
+    };
+  } catch (error) {
+    return {
+      status: 'error',
+      addedLines: 0,
+      removedLines: 0,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function resolveGitDiffBase(repoPath: string): Promise<string> {
+  const head = await runGitCommand(repoPath, ['rev-parse', '--verify', 'HEAD']);
+  if (head.code === 0) return 'HEAD';
+
+  const emptyTree = await runGitCommand(repoPath, ['hash-object', '-t', 'tree', '--stdin'], '');
+  if (emptyTree.code !== 0) {
+    throw new Error(emptyTree.stderr.trim() || 'git hash-object failed');
+  }
+
+  const oid = emptyTree.stdout.trim();
+  if (!oid) throw new Error('git hash-object returned an empty tree id');
+  return oid;
+}
+
+async function countUntrackedTextFileLines(repoPath: string): Promise<number> {
+  const output = await runGitCommand(repoPath, ['ls-files', '--others', '--exclude-standard', '-z']);
+  if (output.code !== 0) {
+    throw new Error(output.stderr.trim() || 'git ls-files --others failed');
+  }
+
+  let addedLines = 0;
+  for (const relativePath of parseGitPathList(output.stdout)) {
+    const lines = countTextFileLines(path.join(repoPath, relativePath));
+    if (lines !== undefined) {
+      addedLines += lines;
+    }
+  }
+  return addedLines;
+}
+
+function countTextFileLines(filePath: string): number | undefined {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return undefined;
+    return countTextLineBytes(fs.readFileSync(filePath));
+  } catch {
+    return undefined;
+  }
+}
+
+function runGitCommand(
+  repoPath: string,
+  args: string[],
+  input?: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', args, { cwd: repoPath, windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout?.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr?.on('data', (data) => { stderr += data.toString(); });
+    proc.on('close', (code) => resolve({ code: code ?? 0, stdout, stderr }));
+    proc.on('error', reject);
+
+    if (input !== undefined) {
+      proc.stdin?.end(input);
+    }
+  });
+}

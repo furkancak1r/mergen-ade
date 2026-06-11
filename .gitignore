@@ -6,8 +6,8 @@
 
 # Local tool artifacts
 /.claude/
-/.firecrawl/
 /.opencode/
+/.firecrawl/
 
 # Cargo
 **/*.rs.bk
@@ -24,3 +24,17 @@ Desktop.ini
 
 # Logs
 *.log
+
+# Local release artifacts
+/mergen-ade.exe
+/mergen-ade-*-portable.zip
+
+# Node.js
+node_modules/
+/package-lock.json
+
+# Electron build artifacts
+/electron/out/
+/electron/renderer/dist/
+/electron/renderer/dist-electron/
+/electron/renderer/renderer/

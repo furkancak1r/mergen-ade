@@ -1516,10 +1516,6 @@ impl TestTerminalRuntimeCapture {
         self.captured.lock().unwrap().clone()
     }
 
-    pub(crate) fn clear(&self) {
-        self.captured.lock().unwrap().clear();
-    }
-
     pub(crate) fn take_mouse_wheel_events(&self) -> Vec<TerminalWheelEvent> {
         let mut events = Vec::new();
         while let Ok(command) = self.command_rx.try_recv() {

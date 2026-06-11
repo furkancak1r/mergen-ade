@@ -198,8 +198,6 @@ pub struct LauncherEntry {
     #[serde(default = "default_launcher_enabled")]
     pub enabled: bool,
     pub icon_key: LauncherIconKey,
-    #[serde(default)]
-    pub bypass_permissions: Option<bool>,
 }
 
 impl LauncherEntry {
@@ -211,15 +209,7 @@ impl LauncherEntry {
             launch_command: kind.default_launch_command().to_owned(),
             enabled: true,
             icon_key: kind.icon_key(),
-            bypass_permissions: Some(kind == BuiltinLauncherKind::Claude),
         }
-    }
-
-    pub fn bypass_permissions_effective(&self) -> bool {
-        if self.builtin == Some(BuiltinLauncherKind::Claude) {
-            return true;
-        }
-        self.bypass_permissions.unwrap_or(false)
     }
 }
 
@@ -253,7 +243,6 @@ pub fn normalize_launcher_entries(entries: &mut Vec<LauncherEntry>) {
                 launch_command: normalize_builtin_launch_command(builtin, &existing.launch_command),
                 enabled: existing.enabled,
                 icon_key: builtin.icon_key(),
-                bypass_permissions: existing.bypass_permissions,
             });
         } else {
             normalized.push(LauncherEntry::builtin(builtin));
@@ -281,7 +270,6 @@ pub fn normalize_launcher_entries(entries: &mut Vec<LauncherEntry>) {
             launch_command: entry.launch_command.clone(),
             enabled: entry.enabled,
             icon_key: entry.icon_key,
-            bypass_permissions: entry.bypass_permissions,
         });
     }
 
@@ -1064,8 +1052,6 @@ impl AcpStartupMode {
 pub struct AppConfig {
     pub version: u32,
     pub default_shell: ShellKind,
-    #[serde(default = "default_claude_code_codex_hook_enabled")]
-    pub claude_code_codex_hook_enabled: bool,
     pub ui: UiConfig,
     #[serde(default = "default_launchers")]
     pub launchers: Vec<LauncherEntry>,
@@ -1083,16 +1069,11 @@ pub struct AppConfig {
     pub acp_startup_mode: AcpStartupMode,
 }
 
-pub const fn default_claude_code_codex_hook_enabled() -> bool {
-    true
-}
-
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: APP_CONFIG_VERSION,
             default_shell: ShellKind::default(),
-            claude_code_codex_hook_enabled: default_claude_code_codex_hook_enabled(),
             ui: UiConfig::default(),
             launchers: default_launchers(),
             terminal_shortcuts: default_terminal_shortcuts(),
@@ -1197,13 +1178,6 @@ mod tests {
         let config = AppConfig::default();
 
         assert_eq!(config.terminal_shortcuts, default_terminal_shortcuts());
-    }
-
-    #[test]
-    fn app_config_default_enables_claude_code_codex_hook() {
-        let config = AppConfig::default();
-
-        assert!(config.claude_code_codex_hook_enabled);
     }
 
     #[test]
@@ -1460,7 +1434,6 @@ mod tests {
             launch_command: "my-cli".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::Rocket,
-            bypass_permissions: Some(false),
         }];
 
         normalize_launcher_entries(&mut launchers);
@@ -1469,79 +1442,6 @@ mod tests {
         assert_eq!(launchers[0].builtin, Some(BuiltinLauncherKind::OpenCode));
         assert_eq!(launchers[4].builtin, None);
         assert_eq!(launchers[4].display_name, "Custom");
-    }
-
-    #[test]
-    fn normalize_launcher_entries_preserves_bypass_permissions_none_for_builtins() {
-        let mut launchers = vec![LauncherEntry {
-            id: "claude".to_owned(),
-            builtin: Some(BuiltinLauncherKind::Claude),
-            display_name: "Claude".to_owned(),
-            launch_command: "claude".to_owned(),
-            enabled: true,
-            icon_key: LauncherIconKey::Claude,
-            bypass_permissions: None,
-        }];
-
-        normalize_launcher_entries(&mut launchers);
-
-        let claude = launchers
-            .iter()
-            .find(|l| l.builtin == Some(BuiltinLauncherKind::Claude))
-            .unwrap();
-        assert_eq!(claude.bypass_permissions, None);
-        assert!(
-            claude.bypass_permissions_effective(),
-            "Claude should default to bypass permissions when field is None (old config)"
-        );
-    }
-
-    #[test]
-    fn normalize_launcher_entries_keeps_explicit_bypass_permissions_false_but_claude_effective_true(
-    ) {
-        let mut launchers = vec![LauncherEntry {
-            id: "claude".to_owned(),
-            builtin: Some(BuiltinLauncherKind::Claude),
-            display_name: "Claude".to_owned(),
-            launch_command: "claude".to_owned(),
-            enabled: true,
-            icon_key: LauncherIconKey::Claude,
-            bypass_permissions: Some(false),
-        }];
-
-        normalize_launcher_entries(&mut launchers);
-
-        let claude = launchers
-            .iter()
-            .find(|l| l.builtin == Some(BuiltinLauncherKind::Claude))
-            .unwrap();
-        assert_eq!(claude.bypass_permissions, Some(false));
-        assert!(
-            claude.bypass_permissions_effective(),
-            "Claude Code invocation must force bypass permissions even if old config stored false"
-        );
-    }
-
-    #[test]
-    fn normalize_launcher_entries_keeps_explicit_bypass_permissions_true() {
-        let mut launchers = vec![LauncherEntry {
-            id: "claude".to_owned(),
-            builtin: Some(BuiltinLauncherKind::Claude),
-            display_name: "Claude".to_owned(),
-            launch_command: "claude".to_owned(),
-            enabled: true,
-            icon_key: LauncherIconKey::Claude,
-            bypass_permissions: Some(true),
-        }];
-
-        normalize_launcher_entries(&mut launchers);
-
-        let claude = launchers
-            .iter()
-            .find(|l| l.builtin == Some(BuiltinLauncherKind::Claude))
-            .unwrap();
-        assert_eq!(claude.bypass_permissions, Some(true));
-        assert!(claude.bypass_permissions_effective());
     }
 
     #[test]

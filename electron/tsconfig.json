@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./out",
+    "types": ["node", "react", "react-dom", "vitest/globals"]
+  },
+  "include": ["main/**/*", "preload/**/*", "renderer/src/**/*", "shared/**/*"],
+  "exclude": ["node_modules", "out", "renderer/dist"]
+}
