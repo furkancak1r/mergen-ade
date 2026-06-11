@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Notification, dialog, shell, clipboard, nativeImage, Tray } from 'electron';
+import { app, BrowserWindow, ipcMain, Notification, dialog, shell, clipboard, nativeImage, Tray, Menu } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { registerIpcHandlers } from './ipcHandlers';
@@ -162,6 +162,9 @@ function clearTray() {
 }
 
 app.whenReady().then(() => {
+  // Remove all menus from menu bar
+  Menu.setApplicationMenu(null);
+
   console.log('Electron app ready');
   registerIpcHandlers();
   startHookService();
