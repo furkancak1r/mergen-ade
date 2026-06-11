@@ -118,6 +118,62 @@ body {
   background: #141414;
 }
 
+.acp-terminal-manager-badge-slot {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 16px;
+  position: relative;
+  z-index: 1;
+}
+
+.acp-terminal-manager-badge {
+  display: inline-block;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+
+.acp-terminal-manager-badge--spinner {
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
+  border-style: solid;
+  background: transparent;
+  animation: acp-terminal-manager-spin 0.8s linear infinite;
+}
+
+.acp-terminal-manager-badge--pulse {
+  width: 7px;
+  height: 7px;
+  animation: acp-terminal-manager-pulse 1.5s ease-in-out infinite;
+}
+
+.acp-terminal-manager-badge--solid {
+  width: 7px;
+  height: 7px;
+}
+
+@keyframes acp-terminal-manager-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes acp-terminal-manager-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.7);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.35);
+  }
+}
+
 .resize-handle {
   background: #2d2d2d;
   flex-shrink: 0;

@@ -22,7 +22,13 @@ import {
   withBrowserLastUrlForProjectFamily,
   withoutBrowserLastUrlForProjectFamily,
 } from './lib/browserScope';
-import { nextAcpActivityState, type AcpEventLike } from './lib/acpUi';
+import {
+  OPENCODE_ACP_LABEL,
+  nextAcpActivityState,
+  nextAcpTerminalManagerAttention,
+  type AcpEventLike,
+  type AcpTerminalManagerAttentionReason,
+} from './lib/acpUi';
 import type { SmartInputModeId } from './lib/smartInputMode';
 import { shouldShowSmartInputFooter } from './lib/smartInput';
 import { terminalWheelEnabled } from './lib/terminalWheel';
@@ -36,7 +42,6 @@ import { recordInputHistory, removeProjectsInputHistory } from './lib/inputHisto
 import { activityRailItem, isLeftSidebarTabActive, withLeftSidebarRailToggle, withLeftSidebarTabOpen } from './lib/activityRail';
 import { checklistRightOffset } from './lib/checklist';
 import { browserProjectIdsAfterScopeEmpty } from './lib/browserToolbar';
-import { OPENCODE_ACP_LABEL } from './lib/acpUi';
 import {
   fileEditorLocationFromPath,
   initialFileEditorNavigationState,
@@ -73,6 +78,7 @@ function App() {
   const [activeAcpChat, setActiveAcpChat] = useState<{ chatId: string; projectId: number } | null>(null);
   const [activeAcpChatByProject, setActiveAcpChatByProject] = useState<Map<number, string>>(new Map());
   const [activeAcpSessionByProject, setActiveAcpSessionByProject] = useState<Map<number, AcpChatSession>>(new Map());
+  const [activeAcpAttentionByProject, setActiveAcpAttentionByProject] = useState<Map<number, AcpTerminalManagerAttentionReason>>(new Map());
   const [acpRunning, setAcpRunning] = useState(false);
   const [acpQueuedPrompts, setAcpQueuedPrompts] = useState(false);
 
@@ -221,6 +227,18 @@ function App() {
       const projectEntry = Array.from(activeAcpChatByProject.entries()).find(([, chatId]) => chatId === eventChatId);
       if (projectEntry) {
         const [projectId] = projectEntry;
+        setActiveAcpAttentionByProject((prev) => {
+          const currentReason = prev.get(projectId);
+          const nextReason = nextAcpTerminalManagerAttention(currentReason, event);
+          if (nextReason === currentReason) return prev;
+          const next = new Map(prev);
+          if (nextReason) {
+            next.set(projectId, nextReason);
+          } else {
+            next.delete(projectId);
+          }
+          return next;
+        });
         api.invoke('acp:getSession', eventChatId).then((session) => {
           setActiveAcpSessionByProject((prev) => {
             const next = new Map(prev);
@@ -439,6 +457,12 @@ function App() {
   const restoreActiveAcpForProject = useCallback((projectId: number) => {
     const chatId = activeAcpChatByProject.get(projectId);
     if (chatId) {
+      setActiveAcpAttentionByProject((prev) => {
+        if (!prev.has(projectId)) return prev;
+        const next = new Map(prev);
+        next.delete(projectId);
+        return next;
+      });
       setActiveAcpChat({ chatId, projectId });
       setFileEditorState((prev) => withFileEditorHidden(prev));
       setActiveTab(LeftSidebarTabEnum.TerminalManager);
@@ -830,6 +854,12 @@ function App() {
       next.set(projectId, chatId);
       return next;
     });
+    setActiveAcpAttentionByProject((prev) => {
+      if (!prev.has(projectId)) return prev;
+      const next = new Map(prev);
+      next.delete(projectId);
+      return next;
+    });
     const session = await api.invoke('acp:getSession', chatId) as AcpChatSession | undefined;
     if (session) {
       setActiveAcpSessionByProject((prev) => {
@@ -856,6 +886,11 @@ function App() {
       return next;
     });
     setActiveAcpSessionByProject((prev) => {
+      const next = new Map(prev);
+      next.delete(projectId);
+      return next;
+    });
+    setActiveAcpAttentionByProject((prev) => {
       const next = new Map(prev);
       next.delete(projectId);
       return next;
@@ -1099,35 +1134,28 @@ function App() {
   useEffect(() => {
     if (!config) return;
     const existingIds = new Set(config.projects.map((p) => p.id));
-    let changed = false;
-    const removedIds: number[] = [];
+    const removedIds = Array.from(activeAcpChatByProject.keys()).filter((projectId) => !existingIds.has(projectId));
+    if (removedIds.length === 0) return;
+    const removedIdSet = new Set(removedIds);
+
     setActiveAcpChatByProject((prev) => {
       const next = new Map(prev);
-      for (const [projectId] of prev) {
-        if (!existingIds.has(projectId)) {
-          next.delete(projectId);
-          removedIds.push(projectId);
-          changed = true;
-        }
-      }
-      if (changed) {
-        // Also clear activeAcpChat if its project was removed
-        if (activeAcpChat && !existingIds.has(activeAcpChat.projectId)) {
-          setActiveAcpChat(null);
-        }
-        return next;
-      }
-      return prev;
+      for (const projectId of removedIdSet) next.delete(projectId);
+      return next;
     });
-    if (removedIds.length > 0) {
-      setActiveAcpSessionByProject((prev) => {
-        const next = new Map(prev);
-        for (const projectId of removedIds) {
-          next.delete(projectId);
-        }
-        return next;
-      });
+    if (activeAcpChat && removedIdSet.has(activeAcpChat.projectId)) {
+      setActiveAcpChat(null);
     }
+    setActiveAcpSessionByProject((prev) => {
+      const next = new Map(prev);
+      for (const projectId of removedIdSet) next.delete(projectId);
+      return next;
+    });
+    setActiveAcpAttentionByProject((prev) => {
+      const next = new Map(prev);
+      for (const projectId of removedIdSet) next.delete(projectId);
+      return next;
+    });
     // Kill visible ACP chats and clear standby for removed projects
     for (const projectId of removedIds) {
       const chatId = activeAcpChatByProject.get(projectId);
@@ -1307,6 +1335,8 @@ function App() {
             }}
             activeAcpChatByProject={activeAcpChatByProject}
             activeAcpSessionByProject={activeAcpSessionByProject}
+            activeAcpAttentionByProject={activeAcpAttentionByProject}
+            activeAcpProjectId={activeAcpChat?.projectId ?? null}
             onActivateAcpChat={restoreActiveAcpForProject}
             onRemoveAcpChat={removeAcpChatForProject}
             onOpenAcpChat={openAcpChat}

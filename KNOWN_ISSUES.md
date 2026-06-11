@@ -5744,3 +5744,50 @@
   - Keep queued row action buttons limited to Run Next, Edit, and Delete; preview click remains the copy affordance.
 - Files/Commands touched: `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
 - References: Original Rust `draw_acp_queued_prompt_panel_row`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Terminal Manager ACP satiri sabit mavi nokta gosteriyordu {#electron-acp-terminal-manager-badge-parity}
+- Date: 2026-06-11
+- Context: Rust Terminal Manager renders ACP rows with status-specific badge visuals: gray spinner while starting/running, amber pulse/solid for permission, green pulse for completed turns, red solid for errors, and no idle badge.
+- Error signature:
+  1. Electron always rendered the ACP row with a static blue dot.
+  2. Permission and completed-turn attention states were not visible in Terminal Manager.
+- Symptoms/Impact:
+  - ACP chat state was harder to scan from Terminal Manager.
+  - Electron did not match Rust's attention model for ACP sessions.
+- Root cause:
+  - Electron tracked only the active ACP session snapshot and did not maintain Terminal Manager attention reasons.
+  - The row renderer used a fixed decorative dot instead of deriving badge visuals from status and attention.
+- Resolution:
+  - Added Rust-style ACP Terminal Manager badge helpers and tests.
+  - Added renderer attention tracking for permission and turn-complete ACP events.
+  - Replaced the fixed blue dot with spinner, pulse, and solid badge visuals using Rust colors.
+  - Cleared attention when the ACP chat is opened, a new prompt starts, permission/question responses arrive, or the chat is removed.
+- Prevent recurrence:
+  - Keep ACP Terminal Manager row badges driven by `acpTerminalManagerBadgeVisual()` and `nextAcpTerminalManagerAttention()` rather than hard-coded row decoration.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_terminal_manager_badge_visual`, `AcpTerminalManagerAttentionReason`, and `draw_ai_badge_visual_with_tooltip`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP Terminal Manager satiri mavi secili kart gibi gorunuyordu {#electron-acp-terminal-manager-row-chrome-parity}
+- Date: 2026-06-11
+- Context: Rust renders ACP rows with the same neutral `terminal_manager_row_chrome()` used by terminal rows: active rows get a dark gray fill/stroke, hovered rows get a subtle soft fill, and inactive rows stay unfilled.
+- Error signature:
+  1. Electron rendered every active ACP row with a fixed blue-tinted background.
+  2. ACP row text stayed blue instead of using the normal Terminal Manager row title color.
+- Symptoms/Impact:
+  - ACP rows looked like a separate blue callout rather than a native Terminal Manager row.
+  - Active and hover states did not match terminal rows or the Rust UI.
+- Root cause:
+  - The ACP row JSX had hard-coded background/text colors and did not receive the currently active ACP project id.
+- Resolution:
+  - Passed `activeAcpProjectId` into Terminal Manager project rows.
+  - Reused `terminalManagerRowChrome()` for ACP row active and hover states.
+  - Removed the fixed blue row background/text and kept error rows red like Rust.
+  - Kept badge and close actions above the row background with stable z-ordering.
+- Prevent recurrence:
+  - Keep ACP row chrome tied to the shared Terminal Manager row chrome helper instead of introducing ACP-specific callout styling.
+- Files/Commands touched: `electron/renderer/src/App.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: Original Rust `terminal_manager_row_chrome()` and ACP row rendering around `terminal_manager_acp_row_select`, Electron parity goal 2026-06-11

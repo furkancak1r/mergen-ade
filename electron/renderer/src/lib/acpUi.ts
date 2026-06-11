@@ -28,6 +28,14 @@ export interface AcpKimiProtectionBadge {
   color: string;
 }
 
+export type AcpTerminalManagerAttentionReason = 'permission' | 'turn_complete';
+export type AcpTerminalManagerBadgeKind = 'spinner' | 'pulse' | 'solid';
+
+export interface AcpTerminalManagerBadgeVisual {
+  kind: AcpTerminalManagerBadgeKind;
+  color: string;
+}
+
 export const ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS = 2;
 export const ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS = 96;
 export const ACP_CHAT_TITLE_MAX_CHARS = 72;
@@ -110,6 +118,57 @@ export function acpHeaderStatusColor(status: AcpChatSession['status'] | undefine
     default:
       return 'rgb(138, 138, 138)';
   }
+}
+
+export function acpTerminalManagerBadgeVisual(
+  status: AcpChatSession['status'] | undefined,
+  attentionReason?: AcpTerminalManagerAttentionReason,
+): AcpTerminalManagerBadgeVisual | undefined {
+  switch (status) {
+    case 'starting':
+    case 'connected':
+    case 'session_created':
+    case 'running':
+      return { kind: 'spinner', color: 'rgb(170, 170, 170)' };
+    case 'permission':
+      return {
+        kind: attentionReason === 'permission' ? 'pulse' : 'solid',
+        color: 'rgb(210, 170, 80)',
+      };
+    case 'idle':
+      return attentionReason === 'turn_complete'
+        ? { kind: 'pulse', color: 'rgb(90, 185, 90)' }
+        : undefined;
+    case 'error':
+      return { kind: 'solid', color: 'rgb(170, 50, 50)' };
+    default:
+      return undefined;
+  }
+}
+
+export function nextAcpTerminalManagerAttention(
+  previous: AcpTerminalManagerAttentionReason | undefined,
+  event: AcpEventLike,
+): AcpTerminalManagerAttentionReason | undefined {
+  const queuedCount = event.queuedPrompts ?? event.count;
+
+  if (event.type === 'permission') return 'permission';
+  if (event.type === 'promptResponse') {
+    return (queuedCount ?? 0) > 0 ? undefined : 'turn_complete';
+  }
+  if (
+    event.type === 'promptSent'
+    || event.type === 'permissionResponse'
+    || event.type === 'questionResponse'
+    || event.type === 'cancelled'
+    || event.type === 'sessionCreated'
+    || event.type === 'exit'
+    || event.type === 'error'
+  ) {
+    return undefined;
+  }
+
+  return previous;
 }
 
 export function nextAcpActivityState(previous: AcpActivityState, event: AcpEventLike): AcpActivityState {

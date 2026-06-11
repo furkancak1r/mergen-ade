@@ -21,9 +21,11 @@ import {
   acpQueuedPromptPlanCount,
   acpQueuedPromptVisibleRowCount,
   acpStatusText,
+  acpTerminalManagerBadgeVisual,
   acpTerminalManagerRowLabel,
   hasConfigSelectorOptions,
   moveQueuedPromptToFront,
+  nextAcpTerminalManagerAttention,
   nextAcpActivityState,
   openCodeAcpPanelTitle,
   openCodeAcpWelcomeText,
@@ -108,6 +110,28 @@ describe('acpUi', () => {
     expect(acpHeaderStatusColor('idle')).toBe('rgb(138, 138, 138)');
     expect(acpHeaderStatusColor('starting')).toBe('rgb(138, 138, 138)');
     expect(acpHeaderStatusColor(undefined)).toBe('rgb(138, 138, 138)');
+  });
+
+  it('maps ACP Terminal Manager badge visuals to Rust status and attention states', () => {
+    expect(acpTerminalManagerBadgeVisual('starting')).toEqual({ kind: 'spinner', color: 'rgb(170, 170, 170)' });
+    expect(acpTerminalManagerBadgeVisual('connected')).toEqual({ kind: 'spinner', color: 'rgb(170, 170, 170)' });
+    expect(acpTerminalManagerBadgeVisual('session_created')).toEqual({ kind: 'spinner', color: 'rgb(170, 170, 170)' });
+    expect(acpTerminalManagerBadgeVisual('running')).toEqual({ kind: 'spinner', color: 'rgb(170, 170, 170)' });
+    expect(acpTerminalManagerBadgeVisual('permission', 'permission')).toEqual({ kind: 'pulse', color: 'rgb(210, 170, 80)' });
+    expect(acpTerminalManagerBadgeVisual('permission')).toEqual({ kind: 'solid', color: 'rgb(210, 170, 80)' });
+    expect(acpTerminalManagerBadgeVisual('idle', 'turn_complete')).toEqual({ kind: 'pulse', color: 'rgb(90, 185, 90)' });
+    expect(acpTerminalManagerBadgeVisual('idle')).toBeUndefined();
+    expect(acpTerminalManagerBadgeVisual('error')).toEqual({ kind: 'solid', color: 'rgb(170, 50, 50)' });
+    expect(acpTerminalManagerBadgeVisual(undefined)).toBeUndefined();
+  });
+
+  it('updates ACP Terminal Manager attention state like Rust ACP events', () => {
+    expect(nextAcpTerminalManagerAttention(undefined, { type: 'permission' })).toBe('permission');
+    expect(nextAcpTerminalManagerAttention('permission', { type: 'permissionResponse' })).toBeUndefined();
+    expect(nextAcpTerminalManagerAttention(undefined, { type: 'promptResponse', queuedPrompts: 0 })).toBe('turn_complete');
+    expect(nextAcpTerminalManagerAttention(undefined, { type: 'promptResponse', queuedPrompts: 1 })).toBeUndefined();
+    expect(nextAcpTerminalManagerAttention('turn_complete', { type: 'promptSent' })).toBeUndefined();
+    expect(nextAcpTerminalManagerAttention('permission', { type: 'stderr' })).toBe('permission');
   });
 
   it('does not show welcome while queued prompts are visible', () => {

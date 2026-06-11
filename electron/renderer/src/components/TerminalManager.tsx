@@ -4,7 +4,15 @@ import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalMana
 import type { GitDiffSummary } from '../../../shared/gitDiffSummary';
 import { gitDiffSummaryLabel } from '../../../shared/gitDiffSummary';
 import type { TerminalInstance } from '../hooks/usePty';
-import { OPENCODE_ACP_CLOSE_TOOLTIP, OPENCODE_ACP_LABEL, OPENCODE_ACP_OPEN_BUTTON_LABEL, acpTerminalManagerRowLabel } from '../lib/acpUi';
+import {
+  OPENCODE_ACP_CLOSE_TOOLTIP,
+  OPENCODE_ACP_LABEL,
+  OPENCODE_ACP_OPEN_BUTTON_LABEL,
+  acpStatusText,
+  acpTerminalManagerBadgeVisual,
+  acpTerminalManagerRowLabel,
+  type AcpTerminalManagerAttentionReason,
+} from '../lib/acpUi';
 import { effectiveLauncherCommand } from '../lib/launcher';
 import { effectiveAiStatusForDisplay } from '../lib/smartInput';
 import { shouldShowOpenCodeAcpButton, terminalManagerPathMenuLabel } from '../lib/terminalManagerState';
@@ -84,6 +92,8 @@ interface TerminalManagerProps {
   onUpdateForegroundMessage?: (projectId: number, index: number, message: string) => void;
   activeAcpChatByProject?: Map<number, string>;
   activeAcpSessionByProject?: Map<number, AcpChatSession>;
+  activeAcpAttentionByProject?: Map<number, AcpTerminalManagerAttentionReason>;
+  activeAcpProjectId?: number | null;
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number) => void;
@@ -108,6 +118,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onUpdateForegroundMessage,
   activeAcpChatByProject,
   activeAcpSessionByProject,
+  activeAcpAttentionByProject,
+  activeAcpProjectId,
   onActivateAcpChat,
   onRemoveAcpChat,
   onOpenAcpChat,
@@ -434,6 +446,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 rootProject={project}
                 activeAcpChatByProject={activeAcpChatByProject}
                 activeAcpSessionByProject={activeAcpSessionByProject}
+                activeAcpAttentionByProject={activeAcpAttentionByProject}
+                activeAcpProjectId={activeAcpProjectId}
                 onActivateAcpChat={onActivateAcpChat}
                 onRemoveAcpChat={onRemoveAcpChat}
                 onOpenAcpChat={onOpenAcpChat}
@@ -488,6 +502,8 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                     isWorktree
                     activeAcpChatByProject={activeAcpChatByProject}
                     activeAcpSessionByProject={activeAcpSessionByProject}
+                    activeAcpAttentionByProject={activeAcpAttentionByProject}
+                    activeAcpProjectId={activeAcpProjectId}
                     onActivateAcpChat={onActivateAcpChat}
                     onRemoveAcpChat={onRemoveAcpChat}
                     onOpenAcpChat={onOpenAcpChat}
@@ -726,6 +742,8 @@ interface ProjectGroupProps {
   isWorktree?: boolean;
   activeAcpChatByProject?: Map<number, string>;
   activeAcpSessionByProject?: Map<number, AcpChatSession>;
+  activeAcpAttentionByProject?: Map<number, AcpTerminalManagerAttentionReason>;
+  activeAcpProjectId?: number | null;
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number) => void;
@@ -767,6 +785,8 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   isWorktree,
   activeAcpChatByProject,
   activeAcpSessionByProject,
+  activeAcpAttentionByProject,
+  activeAcpProjectId,
   onActivateAcpChat,
   onRemoveAcpChat,
   onOpenAcpChat,
@@ -782,6 +802,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
 }) => {
   const [hoveredRow, setHoveredRow] = useState<number | null>(null);
   const [hoveredProject, setHoveredProject] = useState(false);
+  const [hoveredAcpRow, setHoveredAcpRow] = useState(false);
   const effectiveSavedMessages = isWorktree && rootProject ? rootProject.savedMessages : project.savedMessages;
   const hasSavedMessages = effectiveSavedMessages.length > 0;
   const hasFgMessages = project.foregroundSavedMessages.length > 0;
@@ -789,6 +810,12 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   const isSelected = activeTerminalId !== null && terminals.some((t) => t.id === activeTerminalId);
   const hasLiveTerminal = terminals.some((t) => !t.exited);
   const hasActiveAcpChat = activeAcpChatByProject?.has(project.id) ?? false;
+  const activeAcpSession = activeAcpSessionByProject?.get(project.id);
+  const activeAcpStatus = hasActiveAcpChat ? (activeAcpSession?.status ?? 'starting') : undefined;
+  const activeAcpAttention = activeAcpAttentionByProject?.get(project.id);
+  const activeAcpBadge = acpTerminalManagerBadgeVisual(activeAcpStatus, activeAcpAttention);
+  const activeAcpRow = activeAcpProjectId === project.id;
+  const activeAcpRowChrome = terminalManagerRowChrome(activeAcpRow, hoveredAcpRow);
   const showOpenCodeAcpButton = shouldShowOpenCodeAcpButton(filter, hasActiveAcpChat);
   const diffLabel = gitDiffSummaryLabel(diffSummary, diffSummaryLoading);
   const showReadyDiff = Boolean(
@@ -1151,23 +1178,55 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                 display: 'flex',
                 alignItems: 'center',
                 gap: 4,
-                padding: isWorktree ? '3px 8px 3px 36px' : '3px 8px 3px 24px',
+                height: CONTROL_ROW_HEIGHT,
+                padding: isWorktree ? '0 8px 0 36px' : '0 8px 0 24px',
                 cursor: 'pointer',
                 borderRadius: 8,
-                background: 'rgba(0,120,212,0.15)',
                 margin: '1px 4px',
+                position: 'relative',
               }}
               onClick={() => onActivateAcpChat?.(project.id)}
+              onMouseEnter={() => setHoveredAcpRow(true)}
+              onMouseLeave={() => setHoveredAcpRow(false)}
             >
+              {(activeAcpRow || hoveredAcpRow) && (
+                <div style={{
+                  position: 'absolute',
+                  inset: 1,
+                  borderRadius: 8,
+                  background: activeAcpRowChrome.fill,
+                  border: activeAcpRowChrome.stroke,
+                  pointerEvents: 'none',
+                }} />
+              )}
+              {activeAcpBadge && (
+                <span
+                  className="acp-terminal-manager-badge-slot"
+                  title={`OpenCode ACP: ${acpStatusText(activeAcpStatus)}`}
+                >
+                  <span
+                    className={`acp-terminal-manager-badge acp-terminal-manager-badge--${activeAcpBadge.kind}`}
+                    style={
+                      activeAcpBadge.kind === 'spinner'
+                        ? {
+                            borderColor: 'rgba(170, 170, 170, 0.28)',
+                            borderTopColor: activeAcpBadge.color,
+                          }
+                        : { background: activeAcpBadge.color }
+                    }
+                  />
+                </span>
+              )}
               <span style={{
-                width: 6,
-                height: 6,
-                borderRadius: '50%',
-                background: '#7ec0ee',
-                flexShrink: 0,
-              }} />
-              <span style={{ fontSize: 11, color: '#7ec0ee', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {acpTerminalManagerRowLabel(activeAcpSessionByProject?.get(project.id))}
+                fontSize: 11,
+                color: activeAcpStatus === 'error' ? BTN_RED : activeAcpRowChrome.titleColor,
+                flex: 1,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                zIndex: 1,
+              }}>
+                {acpTerminalManagerRowLabel(activeAcpSession)}
               </span>
               <button
                 onClick={(e) => {
@@ -1183,6 +1242,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   borderRadius: 3,
                   cursor: 'pointer',
                   flexShrink: 0,
+                  zIndex: 1,
                 }}
                 title={OPENCODE_ACP_CLOSE_TOOLTIP}
               >
