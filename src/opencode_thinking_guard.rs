@@ -181,6 +181,7 @@ pub fn thought_loop_cleared(samples: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::{TerminalColor, TerminalStyle, TerminalStyledRun};
 
     fn test_run(text: &str) -> TerminalStyledRun {
         TerminalStyledRun {

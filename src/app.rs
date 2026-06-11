@@ -7576,11 +7576,19 @@ impl AdeApp {
                         Ok(crate::claude_settings::ClaudeSettingsRepairOutcome::Updated {
                             path,
                             backup_path,
+                            helper_path,
                         }) => {
                             log::info!(
-                                "Repaired Claude settings before launch: {} (backup: {})",
+                                "Repaired Claude settings before launch: {} (backup: {}, helper: {})",
                                 path.display(),
-                                backup_path.display()
+                                backup_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_else(|| "none".to_owned()),
+                                helper_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_else(|| "unchanged".to_owned())
                             );
                             launcher_status_note = Some("Claude settings repaired".to_owned());
                         }
@@ -19364,17 +19372,40 @@ impl AdeApp {
         match shell {
             ShellKind::PowerShell => {
                 let command = Self::powershell_invocation_command(&command);
+                let mimo_env = Self::powershell_mimo_claude_env_assignments();
                 format!(
-                    "Remove-Item Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY,Env:ANTHROPIC_BASE_URL,Env:ANTHROPIC_MODEL,Env:ANTHROPIC_SMALL_FAST_MODEL,Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:CLAUDE_CODE_SUBAGENT_MODEL -ErrorAction SilentlyContinue; {command}"
+                    "Remove-Item Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue; {mimo_env}; {command}"
                 )
             }
             ShellKind::Cmd => {
+                let mimo_env = Self::cmd_mimo_claude_env_assignments();
                 format!(
-                    "set ANTHROPIC_AUTH_TOKEN= & set ANTHROPIC_API_KEY= & set ANTHROPIC_BASE_URL= & set ANTHROPIC_MODEL= & set ANTHROPIC_SMALL_FAST_MODEL= & set ANTHROPIC_DEFAULT_SONNET_MODEL= & set ANTHROPIC_DEFAULT_HAIKU_MODEL= & set ANTHROPIC_DEFAULT_OPUS_MODEL= & set CLAUDE_CODE_SUBAGENT_MODEL= & {command}"
+                    "set ANTHROPIC_AUTH_TOKEN= & set ANTHROPIC_API_KEY= & {mimo_env} & {command}"
                 )
             }
             ShellKind::Zsh => command,
         }
+    }
+
+    fn powershell_mimo_claude_env_assignments() -> String {
+        crate::claude_settings::MIMO_CLAUDE_ENV
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "$env:{key}='{}'",
+                    Self::escape_powershell_single_quoted_string(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn cmd_mimo_claude_env_assignments() -> String {
+        crate::claude_settings::MIMO_CLAUDE_ENV
+            .iter()
+            .map(|(key, value)| format!("set {key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" & ")
     }
 
     fn claude_command_with_bypass_permissions(configured_command: &str) -> String {
@@ -56142,6 +56173,16 @@ mod tests {
             "PowerShell command should clear ANTHROPIC_AUTH_TOKEN"
         );
         assert!(
+            cmd.contains(
+                "$env:ANTHROPIC_BASE_URL='https://token-plan-sgp.xiaomimimo.com/anthropic'"
+            ),
+            "PowerShell command should set the Mimo Claude base URL"
+        );
+        assert!(
+            cmd.contains("$env:ANTHROPIC_MODEL='mimo-v2.5-pro'"),
+            "PowerShell command should set the Mimo Claude model"
+        );
+        assert!(
             cmd.ends_with("; claude.cmd --permission-mode bypassPermissions"),
             "PowerShell command should invoke the real Claude Code npm shim"
         );
@@ -56171,6 +56212,14 @@ mod tests {
         assert!(
             cmd.contains("set ANTHROPIC_AUTH_TOKEN="),
             "CMD command should clear ANTHROPIC_AUTH_TOKEN"
+        );
+        assert!(
+            cmd.contains("set ANTHROPIC_BASE_URL=https://token-plan-sgp.xiaomimimo.com/anthropic"),
+            "CMD command should set the Mimo Claude base URL"
+        );
+        assert!(
+            cmd.contains("set ANTHROPIC_MODEL=mimo-v2.5-pro"),
+            "CMD command should set the Mimo Claude model"
         );
         assert!(
             cmd.ends_with("& claude.cmd --permission-mode bypassPermissions"),

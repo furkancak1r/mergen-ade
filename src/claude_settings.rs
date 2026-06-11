@@ -3,13 +3,36 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
+
+pub const MIMO_CLAUDE_MODEL: &str = "mimo-v2.5-pro";
+pub const MIMO_ANTHROPIC_BASE_URL: &str = "https://token-plan-sgp.xiaomimimo.com/anthropic";
+pub const MIMO_KEY_HELPER_FILE_NAME: &str = "mimo-key-helper.cmd";
+pub const MIMO_CLAUDE_ENV: [(&str, &str); 9] = [
+    ("ANTHROPIC_BASE_URL", MIMO_ANTHROPIC_BASE_URL),
+    ("ANTHROPIC_MODEL", MIMO_CLAUDE_MODEL),
+    ("ANTHROPIC_SMALL_FAST_MODEL", MIMO_CLAUDE_MODEL),
+    ("ANTHROPIC_DEFAULT_SONNET_MODEL", MIMO_CLAUDE_MODEL),
+    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", MIMO_CLAUDE_MODEL),
+    ("ANTHROPIC_DEFAULT_OPUS_MODEL", MIMO_CLAUDE_MODEL),
+    ("CLAUDE_CODE_SUBAGENT_MODEL", MIMO_CLAUDE_MODEL),
+    ("DISABLE_AUTOUPDATER", "1"),
+    ("DISABLE_UPDATES", "1"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeSettingsRepairOutcome {
-    Missing { path: PathBuf },
-    Unchanged { path: PathBuf },
-    Updated { path: PathBuf, backup_path: PathBuf },
+    Missing {
+        path: PathBuf,
+    },
+    Unchanged {
+        path: PathBuf,
+    },
+    Updated {
+        path: PathBuf,
+        backup_path: Option<PathBuf>,
+        helper_path: Option<PathBuf>,
+    },
 }
 
 pub fn user_claude_settings_path() -> io::Result<PathBuf> {
@@ -23,27 +46,70 @@ pub fn user_claude_settings_path() -> io::Result<PathBuf> {
 }
 
 pub fn repair_user_claude_settings() -> io::Result<ClaudeSettingsRepairOutcome> {
-    let path = user_claude_settings_path()?;
-    repair_claude_settings_file(&path)
+    let base_dirs = BaseDirs::new().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "User home directory is unavailable",
+        )
+    })?;
+    let home_dir = base_dirs.home_dir();
+    let helper_path = mimo_key_helper_path_for_home(home_dir);
+    let helper_updated = ensure_mimo_key_helper(&helper_path)?;
+    let path = home_dir.join(".claude").join("settings.json");
+    let outcome = repair_claude_settings_file_with_helper(&path, &helper_path)?;
+
+    match (outcome, helper_updated) {
+        (
+            ClaudeSettingsRepairOutcome::Unchanged { path }
+            | ClaudeSettingsRepairOutcome::Missing { path },
+            true,
+        ) => Ok(ClaudeSettingsRepairOutcome::Updated {
+            path,
+            backup_path: None,
+            helper_path: Some(helper_path),
+        }),
+        (
+            ClaudeSettingsRepairOutcome::Updated {
+                path, backup_path, ..
+            },
+            true,
+        ) => Ok(ClaudeSettingsRepairOutcome::Updated {
+            path,
+            backup_path,
+            helper_path: Some(helper_path),
+        }),
+        (other, false) => Ok(other),
+    }
 }
 
 pub fn repair_claude_settings_file(path: &Path) -> io::Result<ClaudeSettingsRepairOutcome> {
+    let helper_path = path
+        .parent()
+        .map(|claude_dir| claude_dir.join("bin").join(MIMO_KEY_HELPER_FILE_NAME))
+        .unwrap_or_else(|| PathBuf::from(MIMO_KEY_HELPER_FILE_NAME));
+    repair_claude_settings_file_with_helper(path, &helper_path)
+}
+
+fn repair_claude_settings_file_with_helper(
+    path: &Path,
+    helper_path: &Path,
+) -> io::Result<ClaudeSettingsRepairOutcome> {
     let raw_settings = match fs::read_to_string(path) {
         Ok(raw_settings) => raw_settings,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Ok(ClaudeSettingsRepairOutcome::Missing {
-                path: path.to_path_buf(),
-            });
-        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err),
     };
 
-    let mut settings = serde_json::from_str::<JsonValue>(&raw_settings).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Claude settings JSON is invalid: {err}"),
-        )
-    })?;
+    let mut settings = if raw_settings.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<JsonValue>(&raw_settings).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Claude settings JSON is invalid: {err}"),
+            )
+        })?
+    };
 
     if !settings.is_object() {
         return Err(io::Error::new(
@@ -52,33 +118,50 @@ pub fn repair_claude_settings_file(path: &Path) -> io::Result<ClaudeSettingsRepa
         ));
     }
 
-    if !repair_claude_settings_value(&mut settings) {
+    if !repair_claude_settings_value(&mut settings, helper_path) {
         return Ok(ClaudeSettingsRepairOutcome::Unchanged {
             path: path.to_path_buf(),
         });
     }
 
-    let backup_path = next_backup_path(path);
-    fs::copy(path, &backup_path)?;
+    let backup_path = if raw_settings.trim().is_empty() {
+        None
+    } else {
+        let backup_path = next_backup_path(path);
+        fs::copy(path, &backup_path)?;
+        Some(backup_path)
+    };
 
     let rendered = serde_json::to_string_pretty(&settings)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(path, rendered)?;
 
     Ok(ClaudeSettingsRepairOutcome::Updated {
         path: path.to_path_buf(),
         backup_path,
+        helper_path: None,
     })
 }
 
-pub(crate) fn repair_claude_settings_value(settings: &mut JsonValue) -> bool {
+pub(crate) fn repair_claude_settings_value(settings: &mut JsonValue, helper_path: &Path) -> bool {
+    if !settings.is_object() {
+        return false;
+    }
+    let mut changed = apply_mimo_claude_config(settings, helper_path);
+    changed |= repair_claude_hooks(settings);
+    changed
+}
+
+fn repair_claude_hooks(settings: &mut JsonValue) -> bool {
     let Some(root) = settings.as_object_mut() else {
         return false;
     };
     let Some(hooks) = root.get_mut("hooks").and_then(JsonValue::as_object_mut) else {
         return false;
     };
-
     let event_names = hooks.keys().cloned().collect::<Vec<_>>();
     let mut changed = false;
 
@@ -156,6 +239,47 @@ pub(crate) fn repair_claude_settings_value(settings: &mut JsonValue) -> bool {
     changed
 }
 
+fn apply_mimo_claude_config(settings: &mut JsonValue, helper_path: &Path) -> bool {
+    let root = settings
+        .as_object_mut()
+        .expect("caller verified Claude settings root is an object");
+    let mut changed = false;
+
+    changed |= set_json_string(root, "model", MIMO_CLAUDE_MODEL);
+    changed |= set_json_string(
+        root,
+        "apiKeyHelper",
+        &helper_path.to_string_lossy().replace('\\', "/"),
+    );
+
+    if !root.get("env").is_some_and(JsonValue::is_object) {
+        root.insert("env".to_owned(), json!({}));
+        changed = true;
+    }
+    let env = root
+        .get_mut("env")
+        .and_then(JsonValue::as_object_mut)
+        .expect("env value must be an object");
+
+    for (key, value) in MIMO_CLAUDE_ENV {
+        changed |= set_json_string(env, key, value);
+    }
+
+    changed
+}
+
+fn set_json_string(
+    object: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    value: &str,
+) -> bool {
+    let changed = object.get(key).and_then(JsonValue::as_str) != Some(value);
+    if changed {
+        object.insert(key.to_owned(), JsonValue::String(value.to_owned()));
+    }
+    changed
+}
+
 fn is_stale_claude_hook(hook: &JsonValue) -> bool {
     let Some(command) = hook.get("command").and_then(JsonValue::as_str) else {
         return false;
@@ -202,15 +326,56 @@ fn next_backup_path(path: &Path) -> PathBuf {
     unreachable!("unbounded suffix search must return an available backup path")
 }
 
+pub fn mimo_key_helper_path_for_home(home_dir: &Path) -> PathBuf {
+    home_dir
+        .join(".claude")
+        .join("bin")
+        .join(MIMO_KEY_HELPER_FILE_NAME)
+}
+
+pub fn ensure_mimo_key_helper(helper_path: &Path) -> io::Result<bool> {
+    let contents = mimo_key_helper_contents();
+    let current = fs::read_to_string(helper_path).ok();
+    if current.as_deref() == Some(contents) {
+        return Ok(false);
+    }
+    if let Some(parent) = helper_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(helper_path, contents)?;
+    Ok(true)
+}
+
+fn mimo_key_helper_contents() -> &'static str {
+    r#"@echo off
+setlocal
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$key = $env:MIMO_API_KEY; if ([string]::IsNullOrWhiteSpace($key)) { $key = [Environment]::GetEnvironmentVariable('MIMO_API_KEY','User') }; if ([string]::IsNullOrWhiteSpace($key)) { $desktop = [Environment]::GetFolderPath('Desktop'); $paths = @((Join-Path $desktop 'key.txt'), (Join-Path $env:USERPROFILE 'Desktop\key.txt')) | Select-Object -Unique; foreach ($path in $paths) { if (Test-Path -LiteralPath $path) { foreach ($line in Get-Content -LiteralPath $path) { $candidate = $line.Trim(); if ([string]::IsNullOrWhiteSpace($candidate)) { continue }; if ($candidate -match '^https?://') { continue }; if ($candidate -match '(?i)protocol\s*:?\s*$') { continue }; if ($candidate -ieq 'mimo-v2.5-pro') { continue }; $key = $candidate; break }; if (-not [string]::IsNullOrWhiteSpace($key)) { break } } } }; if ([string]::IsNullOrWhiteSpace($key)) { [Console]::Error.WriteLine('MIMO_API_KEY not found'); exit 1 }; [Console]::Out.WriteLine($key)"
+exit /b %ERRORLEVEL%
+"#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn helper_path() -> PathBuf {
+        PathBuf::from("C:/Users/example/.claude/bin/mimo-key-helper.cmd")
+    }
+
     fn settings_with_hooks(hooks: JsonValue) -> JsonValue {
         serde_json::json!({
-            "apiKeyHelper": "C:/Users/example/.claude/mimo-key-helper.cmd",
+            "apiKeyHelper": "C:/Users/example/.claude/bin/mimo-key-helper.cmd",
+            "model": "mimo-v2.5-pro",
             "env": {
-                "ANTHROPIC_MODEL": "mimo-v2.5-pro"
+                "ANTHROPIC_BASE_URL": "https://token-plan-sgp.xiaomimimo.com/anthropic",
+                "ANTHROPIC_MODEL": "mimo-v2.5-pro",
+                "ANTHROPIC_SMALL_FAST_MODEL": "mimo-v2.5-pro",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "mimo-v2.5-pro",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "mimo-v2.5-pro",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "mimo-v2.5-pro",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "mimo-v2.5-pro",
+                "DISABLE_AUTOUPDATER": "1",
+                "DISABLE_UPDATES": "1"
             },
             "hooks": hooks
         })
@@ -227,7 +392,7 @@ mod tests {
             }
         }));
 
-        assert!(repair_claude_settings_value(&mut settings));
+        assert!(repair_claude_settings_value(&mut settings, &helper_path()));
         assert!(settings["hooks"]["Stop"].is_array());
         assert_eq!(
             settings["hooks"]["Stop"][0]["hooks"][0]["command"],
@@ -253,7 +418,7 @@ mod tests {
             }
         }));
 
-        assert!(repair_claude_settings_value(&mut settings));
+        assert!(repair_claude_settings_value(&mut settings, &helper_path()));
         assert!(settings["hooks"].get("Stop").is_none());
         assert!(settings["hooks"].get("SubagentStart").is_none());
     }
@@ -275,7 +440,7 @@ mod tests {
             }]
         }));
 
-        assert!(repair_claude_settings_value(&mut settings));
+        assert!(repair_claude_settings_value(&mut settings, &helper_path()));
         let hooks = settings["hooks"]["TaskCompleted"][0]["hooks"]
             .as_array()
             .expect("hook handlers");
@@ -294,7 +459,7 @@ mod tests {
             }]
         }));
 
-        assert!(repair_claude_settings_value(&mut settings));
+        assert!(repair_claude_settings_value(&mut settings, &helper_path()));
         assert!(settings["hooks"].get("Stop").is_none());
     }
 
@@ -311,7 +476,33 @@ mod tests {
         }));
         let original = settings.clone();
 
-        assert!(!repair_claude_settings_value(&mut settings));
+        assert!(!repair_claude_settings_value(&mut settings, &helper_path()));
         assert_eq!(settings, original);
+    }
+
+    #[test]
+    fn repair_updates_kimi_settings_to_mimo() {
+        let mut settings = serde_json::json!({
+            "apiKeyHelper": "C:/Users/example/.claude/bin/kimi-key-helper.cmd",
+            "model": "kimi-k2",
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.kimi.example/anthropic",
+                "ANTHROPIC_MODEL": "kimi-k2",
+                "CUSTOM_ENV": "preserved"
+            }
+        });
+
+        assert!(repair_claude_settings_value(&mut settings, &helper_path()));
+        assert_eq!(
+            settings["apiKeyHelper"],
+            "C:/Users/example/.claude/bin/mimo-key-helper.cmd"
+        );
+        assert_eq!(settings["model"], "mimo-v2.5-pro");
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://token-plan-sgp.xiaomimimo.com/anthropic"
+        );
+        assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "mimo-v2.5-pro");
+        assert_eq!(settings["env"]["CUSTOM_ENV"], "preserved");
     }
 }
