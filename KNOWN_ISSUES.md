@@ -3772,3 +3772,24 @@
   - Regression tests cover legacy Claude launcher migration, alias bypass during sanitized launch command construction, Mimo OpenCode defaults, and Mimo provider injection in runtime configs.
 - Files/Commands touched: `src/models.rs`, `src/config.rs`, `src/app.rs`, `src/opencode_config.rs`, `AGENTS.md`, `~/.claude/settings.json`, `~/.claude/bin/mimo-key-helper.cmd`, Mergen user config, OpenCode user config
 - References: User request 2026-06-11
+
+---
+
+#### Terminal Manager saved-message popup vanished on hover loss and foreground send removed reusable messages {#terminal-manager-saved-message-hover-loss}
+- Date: 2026-06-11
+- Context: User reported that saved messages in Foreground/Background Terminal Manager rows could not be sent reliably because the controls disappeared or behaved inconsistently on hover, and foreground saved messages vanished after sending.
+- Symptoms/Impact:
+  - Moving the pointer from a hovered terminal row into its saved-message menu could cause the row to lose hover state and redraw the menu button as a hidden placeholder.
+  - Foreground saved/task messages were removed automatically after sending, making reusable saved messages appear lost.
+  - Project/worktree header action buttons were always visible while terminal row actions were hover-gated, making the Terminal Manager feel inconsistent.
+- Root cause:
+  - Saved-message controls used `ui.menu_button` only while the row was hovered; when hover moved to the popup, the next frame no longer drew the live menu button.
+  - Foreground saved messages still used queue semantics and called `foreground_saved_messages.remove(...)` after send.
+- Resolution:
+  - Replaced Terminal Manager saved-message menus with stable `Area` popups that keep the source button alive while the popup is open.
+  - Changed foreground saved-message send behavior to preserve messages; deletion is manual through the trash action.
+  - Gated project and worktree header action buttons on row hover, matching terminal row behavior.
+- Prevent recurrence:
+  - Added regression tests for message popup survival after row-hover loss and foreground send preserving the saved-message list.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-06-11

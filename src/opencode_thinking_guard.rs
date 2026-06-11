@@ -1,8 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::terminal::{
-    TerminalColor, TerminalSnapshot, TerminalStyle, TerminalStyledLine, TerminalStyledRun,
-};
+use crate::terminal::{TerminalSnapshot, TerminalStyledLine};
 
 pub const THOUGHT_SAMPLE_INTERVAL_MS: u64 = 500;
 pub const THOUGHT_SAMPLE_CAPACITY: usize = 8;

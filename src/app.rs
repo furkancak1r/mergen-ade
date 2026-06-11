@@ -1828,6 +1828,8 @@ const SMART_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 5.0;
 const SMART_INPUT_TOOLTIP_MAX_CHARS: usize = 140;
 // Foreground tasks UI limits
 const FOREGROUND_TASKS_MENU_MAX_HEIGHT: f32 = 300.0; // Max height for task list dropdown
+const TERMINAL_SAVED_MESSAGE_MENU_WIDTH: f32 = 220.0;
+const TERMINAL_FOREGROUND_MESSAGE_MENU_WIDTH: f32 = 220.0;
 const FOREGROUND_LAUNCHER_MENU_WIDTH: f32 = 168.0; // Fixed width for foreground launcher dropdown
 const FOREGROUND_LAUNCHER_MENU_PADDING_X: f32 = 4.0; // Horizontal padding between menu border and row backgrounds
 const FOREGROUND_LAUNCHER_MENU_PADDING_Y: f32 = 4.0; // Vertical padding before first row / after last row
@@ -7535,6 +7537,7 @@ impl AdeApp {
         self.bump_layout_epoch();
 
         if let Some(launcher) = selected_launcher {
+            let mut launcher_status_note = None;
             match launcher.builtin {
                 Some(BuiltinLauncherKind::Droid) => {
                     let _ = self.mark_factory_droid_launch_pending(terminal_id);
@@ -7569,6 +7572,34 @@ impl AdeApp {
                     let _ = self.mark_opencode_launch_pending(terminal_id, baseline);
                 }
                 Some(BuiltinLauncherKind::Claude) => {
+                    match Self::repair_claude_settings_before_launch() {
+                        Ok(crate::claude_settings::ClaudeSettingsRepairOutcome::Updated {
+                            path,
+                            backup_path,
+                        }) => {
+                            log::info!(
+                                "Repaired Claude settings before launch: {} (backup: {})",
+                                path.display(),
+                                backup_path.display()
+                            );
+                            launcher_status_note = Some("Claude settings repaired".to_owned());
+                        }
+                        Ok(crate::claude_settings::ClaudeSettingsRepairOutcome::Missing {
+                            path,
+                        }) => {
+                            log::debug!(
+                                "Claude settings file not found before launch: {}",
+                                path.display()
+                            );
+                        }
+                        Ok(crate::claude_settings::ClaudeSettingsRepairOutcome::Unchanged {
+                            ..
+                        }) => {}
+                        Err(err) => {
+                            log::warn!("Claude settings repair failed before launch: {err}");
+                            launcher_status_note = Some("Claude settings repair failed".to_owned());
+                        }
+                    }
                     let _ = self.mark_claude_launch_pending(terminal_id);
                 }
                 _ => {}
@@ -7592,10 +7623,17 @@ impl AdeApp {
                         Self::set_terminal_title_from_command(terminal, &launcher.launch_command);
                     }
                 }
-                self.status_line = format!(
-                    "Opened {} launcher in {}",
-                    launcher.display_name, project.name
-                );
+                self.status_line = if let Some(note) = launcher_status_note {
+                    format!(
+                        "Opened {} launcher in {} ({note})",
+                        launcher.display_name, project.name
+                    )
+                } else {
+                    format!(
+                        "Opened {} launcher in {}",
+                        launcher.display_name, project.name
+                    )
+                };
             } else {
                 self.status_line = format!(
                     "Created terminal, but failed to submit {}",
@@ -7610,6 +7648,22 @@ impl AdeApp {
 
     fn factory_droid_hook_inbox_path_for_dir(dir: &Path, terminal_id: u64) -> PathBuf {
         dir.join(format!("{terminal_id}.jsonl"))
+    }
+
+    #[cfg(not(test))]
+    fn repair_claude_settings_before_launch(
+    ) -> std::io::Result<crate::claude_settings::ClaudeSettingsRepairOutcome> {
+        crate::claude_settings::repair_user_claude_settings()
+    }
+
+    #[cfg(test)]
+    fn repair_claude_settings_before_launch(
+    ) -> std::io::Result<crate::claude_settings::ClaudeSettingsRepairOutcome> {
+        Ok(
+            crate::claude_settings::ClaudeSettingsRepairOutcome::Unchanged {
+                path: PathBuf::from("test-claude-settings.json"),
+            },
+        )
     }
 
     fn codex_notify_inbox_path_for_dir(dir: &Path, terminal_id: u64, inbox_token: &str) -> PathBuf {
@@ -24795,6 +24849,7 @@ impl AdeApp {
                         if kind == TerminalKind::Background {
                             let message_response = draw_terminal_saved_message_menu_button_visible(
                                 ui,
+                                terminal_data.id,
                                 &saved_messages,
                                 &mut send_message,
                                 row_hovered,
@@ -24804,6 +24859,7 @@ impl AdeApp {
                             let (fg_send, fg_edit, fg_delete, fg_add) =
                                 draw_terminal_foreground_message_menu_button_visible(
                                     ui,
+                                    terminal_data.id,
                                     &foreground_messages,
                                     row_hovered,
                                 );
@@ -24915,22 +24971,6 @@ impl AdeApp {
 
             if let Some(message) = send_message {
                 self.send_saved_message_to_terminal(ctx, terminal_entry_id, &message);
-
-                // If this was a foreground terminal, remove the message from the queue
-                if kind == TerminalKind::Foreground {
-                    if let Some(project) = self.projects.get_mut(&project_id) {
-                        // Find and remove the sent message from foreground queue
-                        if let Some(pos) = project
-                            .foreground_saved_messages
-                            .iter()
-                            .position(|m| m == &message)
-                        {
-                            project.foreground_saved_messages.remove(pos);
-                            self.note_projects_changed();
-                            self.persist_config();
-                        }
-                    }
-                }
             }
 
             // Handle foreground message queue edits/deletes/adds
@@ -35251,6 +35291,10 @@ fn draw_terminal_manager_worktree_row(
     let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
     let desired_size = egui::vec2(available_width, desired_height);
     let (rect, _response) = ui.allocate_exact_size(desired_size, Sense::hover());
+    let row_hovered = ui
+        .ctx()
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|pos| rect.contains(pos));
 
     // Separate body and action interaction areas
     let body_rect = egui::Rect::from_min_size(rect.min, egui::vec2(label_width, rect.height()));
@@ -35270,7 +35314,7 @@ fn draw_terminal_manager_worktree_row(
     let mut selected_action = None;
 
     if ui.is_rect_visible(rect) {
-        if body_response.hovered() || body_response.highlighted() || body_response.has_focus() {
+        if row_hovered || body_response.highlighted() || body_response.has_focus() {
             if let Some(fill_color) = directory_file_row_hover_fill(true) {
                 ui.painter()
                     .rect_filled(rect.shrink2(egui::vec2(1.0, 1.0)), 8.0, fill_color);
@@ -35303,7 +35347,7 @@ fn draw_terminal_manager_worktree_row(
                 .layout(Layout::right_to_left(Align::Center)),
             |ui| {
                 if action_kind == TerminalKind::Foreground {
-                    selected_action = styled_launcher_menu_button(
+                    selected_action = styled_launcher_menu_button_with_visible(
                         app,
                         ui,
                         icons::TERMINAL,
@@ -35312,11 +35356,20 @@ fn draw_terminal_manager_worktree_row(
                         BTN_ICON_ACTIVE,
                         "Open Foreground Launcher",
                         foreground_launchers,
+                        row_hovered,
                     );
                 } else {
                     let (icon, bg, hover_bg, tooltip) =
                         project_group_header_action_spec(TerminalKind::Background);
-                    if styled_icon_button(ui, icon, bg, hover_bg, BTN_ICON_ACTIVE, tooltip) {
+                    if styled_icon_button_with_visible(
+                        ui,
+                        icon,
+                        bg,
+                        hover_bg,
+                        BTN_ICON_ACTIVE,
+                        tooltip,
+                        row_hovered,
+                    ) {
                         spawn_clicked = true;
                     }
                 }
@@ -37359,57 +37412,90 @@ fn draw_smart_input_footer(
 
 fn draw_terminal_saved_message_menu_button(
     ui: &mut Ui,
+    terminal_id: u64,
     saved_messages: &[String],
     send_message: &mut Option<String>,
 ) -> egui::Response {
-    let message_menu = with_minimal_button_chrome(ui, |ui| {
-        ui.menu_button(format!("{}", icons::CHAT_TEXT), |ui| {
-            with_minimal_button_chrome(ui, |ui| {
-                if saved_messages.is_empty() {
-                    ui.label(RichText::new("No saved messages").color(TEXT_MUTED));
-                    return;
-                }
+    let popup_id = Id::new(("terminal_saved_message_popup", terminal_id));
+    let (response, popup_open) = draw_terminal_message_menu_icon_button(
+        ui,
+        popup_id,
+        true,
+        with_alpha(TEXT_PRIMARY, 190),
+        "Send saved message",
+    );
 
-                for message in saved_messages {
-                    if ui.button(message).clicked() {
-                        *send_message = Some(message.clone());
-                        ui.close_menu();
-                    }
-                }
+    if popup_open {
+        let ctx = ui.ctx().clone();
+        let popup_pos = foreground_launcher_popup_position(ui, &response);
+        let mut close_popup = false;
+        let popup_response = egui::Area::new(popup_id)
+            .kind(egui::UiKind::Popup)
+            .order(egui::Order::Foreground)
+            .fixed_pos(popup_pos)
+            .fade_in(false)
+            .show(&ctx, |ui| {
+                foreground_launcher_popup_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(TERMINAL_SAVED_MESSAGE_MENU_WIDTH);
+                    ui.set_max_width(TERMINAL_SAVED_MESSAGE_MENU_WIDTH);
+                    with_minimal_button_chrome(ui, |ui| {
+                        if saved_messages.is_empty() {
+                            ui.label(RichText::new("No saved messages").color(TEXT_MUTED));
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .id_salt(("terminal_saved_messages_menu_scroll", terminal_id))
+                                .max_height(FOREGROUND_TASKS_MENU_MAX_HEIGHT)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    for message in saved_messages {
+                                        let button = ui
+                                            .add_sized(
+                                                egui::vec2(
+                                                    TERMINAL_SAVED_MESSAGE_MENU_WIDTH,
+                                                    CONTROL_ROW_HEIGHT,
+                                                ),
+                                                egui::Button::new(capped_hover_text(message, 48)),
+                                            )
+                                            .on_hover_text(capped_hover_text(
+                                                message,
+                                                FOREGROUND_TASK_TOOLTIP_MAX_CHARS,
+                                            ))
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        if button.clicked() {
+                                            *send_message = Some(message.clone());
+                                            close_popup = true;
+                                        }
+                                    }
+                                });
+                        }
+                    });
+                });
             });
-        })
-    });
-    let response = message_menu
-        .response
-        .on_hover_text("Send saved message")
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+
+        let clicked_outside =
+            response.clicked_elsewhere() && popup_response.response.clicked_elsewhere();
+        if close_popup || clicked_outside || ctx.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            ctx.memory_mut(|mem| mem.close_popup());
+        }
     }
+
     response
 }
 
 fn draw_terminal_saved_message_menu_button_visible(
     ui: &mut Ui,
+    terminal_id: u64,
     saved_messages: &[String],
     send_message: &mut Option<String>,
     visible: bool,
 ) -> egui::Response {
-    if visible {
-        draw_terminal_saved_message_menu_button(ui, saved_messages, send_message)
+    let popup_id = Id::new(("terminal_saved_message_popup", terminal_id));
+    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    if visible || popup_open {
+        draw_terminal_saved_message_menu_button(ui, terminal_id, saved_messages, send_message)
     } else {
-        let response = with_minimal_button_chrome_visible(ui, false, |ui| {
-            ui.add_sized(
-                egui::vec2(TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH, CONTROL_ROW_HEIGHT),
-                egui::Button::new(format!("{}", icons::CHAT_TEXT))
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::NONE)
-                    .sense(Sense::hover()),
-            )
-        });
-        response
-            .on_hover_text("Send saved message")
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
+        draw_hidden_terminal_message_menu_icon_button(ui)
     }
 }
 
@@ -37417,39 +37503,31 @@ fn draw_terminal_saved_message_menu_button_visible(
 /// Returns (send_message, edit_index, delete_index, add_new_clicked)
 fn draw_terminal_foreground_message_menu_button_visible(
     ui: &mut Ui,
+    terminal_id: u64,
     foreground_messages: &[String],
     visible: bool,
 ) -> (Option<String>, Option<usize>, Option<usize>, bool) {
-    if visible {
-        draw_terminal_foreground_message_menu_button(ui, foreground_messages)
+    let popup_id = Id::new(("terminal_foreground_message_popup", terminal_id));
+    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    if visible || popup_open {
+        draw_terminal_foreground_message_menu_button(ui, terminal_id, foreground_messages)
     } else {
-        let icon_color = if foreground_messages.is_empty() {
-            with_alpha(TEXT_PRIMARY, 0)
-        } else {
-            Color32::TRANSPARENT
-        };
-        let _response = with_minimal_button_chrome_visible(ui, false, |ui| {
-            ui.add_sized(
-                egui::vec2(TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH, CONTROL_ROW_HEIGHT),
-                egui::Button::new(RichText::new(format!("{}", icons::CHAT_TEXT)).color(icon_color))
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::NONE)
-                    .sense(Sense::hover()),
-            )
-        });
+        let _response = draw_hidden_terminal_message_menu_icon_button(ui);
         (None, None, None, false)
     }
 }
 
 fn draw_terminal_foreground_message_menu_button(
     ui: &mut Ui,
+    terminal_id: u64,
     foreground_messages: &[String],
 ) -> (Option<String>, Option<usize>, Option<usize>, bool) {
-    draw_terminal_foreground_message_menu_button_inner(ui, foreground_messages)
+    draw_terminal_foreground_message_menu_button_inner(ui, terminal_id, foreground_messages)
 }
 
 fn draw_terminal_foreground_message_menu_button_inner(
     ui: &mut Ui,
+    terminal_id: u64,
     foreground_messages: &[String],
 ) -> (Option<String>, Option<usize>, Option<usize>, bool) {
     let mut send_message: Option<String> = None;
@@ -37463,120 +37541,192 @@ fn draw_terminal_foreground_message_menu_button_inner(
         Color32::from_rgb(90, 185, 90)
     };
 
-    let message_menu = with_minimal_button_chrome(ui, |ui| {
-        ui.menu_button(
-            RichText::new(format!("{}", icons::CHAT_TEXT)).color(icon_color),
-            |ui| {
-                with_minimal_button_chrome(ui, |ui| {
-                    if foreground_messages.is_empty() {
-                        ui.label(RichText::new("No tasks in queue").color(TEXT_MUTED));
-                    } else {
-                        ui.label(
-                            RichText::new("Click to send (removes from queue)")
-                                .small()
-                                .color(TEXT_MUTED),
-                        );
+    let popup_id = Id::new(("terminal_foreground_message_popup", terminal_id));
+    let (response, popup_open) =
+        draw_terminal_message_menu_icon_button(ui, popup_id, true, icon_color, "Foreground tasks");
+
+    if popup_open {
+        let ctx = ui.ctx().clone();
+        let popup_pos = foreground_launcher_popup_position(ui, &response);
+        let mut close_popup = false;
+        let popup_response = egui::Area::new(popup_id)
+            .kind(egui::UiKind::Popup)
+            .order(egui::Order::Foreground)
+            .fixed_pos(popup_pos)
+            .fade_in(false)
+            .show(&ctx, |ui| {
+                foreground_launcher_popup_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(TERMINAL_FOREGROUND_MESSAGE_MENU_WIDTH);
+                    ui.set_max_width(TERMINAL_FOREGROUND_MESSAGE_MENU_WIDTH);
+                    with_minimal_button_chrome(ui, |ui| {
+                        if foreground_messages.is_empty() {
+                            ui.label(RichText::new("No tasks in queue").color(TEXT_MUTED));
+                        } else {
+                            ui.label(RichText::new("Click to send").small().color(TEXT_MUTED));
+                            ui.add_space(4.0);
+
+                            // Fixed menu width to prevent infinite expansion
+                            // Use set_min_width on the menu button wrapper to constrain layout
+                            let menu_fixed_width = TERMINAL_FOREGROUND_MESSAGE_MENU_WIDTH;
+                            // Fixed width for action buttons area (2 icon buttons + gap)
+                            let action_button_width = CONTROL_ROW_HEIGHT * 2.0 + 4.0;
+                            let message_width =
+                                (menu_fixed_width - action_button_width - 8.0).max(80.0);
+
+                            // Wrap task list in ScrollArea to prevent overflow with many/long tasks
+                            egui::ScrollArea::vertical()
+                                .id_salt("foreground_tasks_menu_scroll")
+                                .max_height(FOREGROUND_TASKS_MENU_MAX_HEIGHT)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for (index, message) in foreground_messages.iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            // Constrain horizontal layout to fixed width
+                                            ui.set_min_width(menu_fixed_width);
+                                            ui.set_max_width(menu_fixed_width);
+
+                                            // Message button - sends reusable task without removing it.
+                                            let msg_button = ui
+                                                .add_sized(
+                                                    egui::vec2(message_width, CONTROL_ROW_HEIGHT),
+                                                    egui::Button::new(RichText::new(
+                                                        capped_hover_text(message, 35),
+                                                    ))
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_text(capped_hover_text(
+                                                    message,
+                                                    FOREGROUND_TASK_TOOLTIP_MAX_CHARS,
+                                                ))
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                            if msg_button.clicked() {
+                                                send_message = Some(message.clone());
+                                                close_popup = true;
+                                            }
+
+                                            ui.add_space(4.0);
+
+                                            // Edit button (fixed position on right)
+                                            if styled_icon_button(
+                                                ui,
+                                                AppIcon::Code,
+                                                BTN_SUBTLE,
+                                                BTN_BLUE_HOVER,
+                                                BTN_ICON_ACTIVE,
+                                                "Edit",
+                                            ) {
+                                                edit_index = Some(index);
+                                                close_popup = true;
+                                            }
+
+                                            // Delete button (fixed position on right)
+                                            if styled_icon_button(
+                                                ui,
+                                                AppIcon::Trash,
+                                                BTN_SUBTLE,
+                                                BTN_RED_HOVER,
+                                                Color32::from_rgb(170, 50, 50),
+                                                "Delete",
+                                            ) {
+                                                delete_index = Some(index);
+                                                close_popup = true;
+                                            }
+                                        });
+                                    }
+                                });
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
                         ui.add_space(4.0);
 
-                        // Fixed menu width to prevent infinite expansion
-                        // Use set_min_width on the menu button wrapper to constrain layout
-                        let menu_fixed_width = 160.0f32;
-                        // Fixed width for action buttons area (2 icon buttons + gap)
-                        let action_button_width = CONTROL_ROW_HEIGHT * 2.0 + 4.0;
-                        let message_width =
-                            (menu_fixed_width - action_button_width - 8.0).max(80.0);
-
-                        // Wrap task list in ScrollArea to prevent overflow with many/long tasks
-                        egui::ScrollArea::vertical()
-                            .id_salt("foreground_tasks_menu_scroll")
-                            .max_height(FOREGROUND_TASKS_MENU_MAX_HEIGHT)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for (index, message) in foreground_messages.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        // Constrain horizontal layout to fixed width
-                                        ui.set_min_width(menu_fixed_width);
-                                        ui.set_max_width(menu_fixed_width);
-
-                                        // Message button - sends and removes from queue (fixed width)
-                                        let msg_button = ui
-                                            .add_sized(
-                                                egui::vec2(message_width, CONTROL_ROW_HEIGHT),
-                                                egui::Button::new(RichText::new(
-                                                    capped_hover_text(message, 35),
-                                                ))
-                                                .sense(egui::Sense::click()),
-                                            )
-                                            .on_hover_text(capped_hover_text(
-                                                message,
-                                                FOREGROUND_TASK_TOOLTIP_MAX_CHARS,
-                                            ))
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                        if msg_button.clicked() {
-                                            send_message = Some(message.clone());
-                                            ui.close_menu();
-                                        }
-
-                                        ui.add_space(4.0);
-
-                                        // Edit button (fixed position on right)
-                                        if styled_icon_button(
-                                            ui,
-                                            AppIcon::Code,
-                                            BTN_SUBTLE,
-                                            BTN_BLUE_HOVER,
-                                            BTN_ICON_ACTIVE,
-                                            "Edit",
-                                        ) {
-                                            edit_index = Some(index);
-                                            ui.close_menu();
-                                        }
-
-                                        // Delete button (fixed position on right)
-                                        if styled_icon_button(
-                                            ui,
-                                            AppIcon::Trash,
-                                            BTN_SUBTLE,
-                                            BTN_RED_HOVER,
-                                            Color32::from_rgb(170, 50, 50),
-                                            "Delete",
-                                        ) {
-                                            delete_index = Some(index);
-                                            ui.close_menu();
-                                        }
-                                    });
-                                }
-                            });
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    // Add new button
-                    if ui
-                        .button(format!("{} Add New", icons::PLUS))
-                        .on_hover_text("Add new task to queue")
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        add_new_clicked = true;
-                        ui.close_menu();
-                    }
+                        // Add new button
+                        if ui
+                            .button(format!("{} Add New", icons::PLUS))
+                            .on_hover_text("Add new task to queue")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            add_new_clicked = true;
+                            close_popup = true;
+                        }
+                    });
                 });
-            },
-        )
-    });
+            });
 
-    let response = message_menu
-        .response
-        .on_hover_text("Foreground tasks")
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        let clicked_outside =
+            response.clicked_elsewhere() && popup_response.response.clicked_elsewhere();
+        if close_popup || clicked_outside || ctx.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            ctx.memory_mut(|mem| mem.close_popup());
+        }
     }
 
     (send_message, edit_index, delete_index, add_new_clicked)
+}
+
+fn draw_terminal_message_menu_icon_button(
+    ui: &mut Ui,
+    popup_id: Id,
+    visible: bool,
+    icon_color: Color32,
+    tooltip: &str,
+) -> (egui::Response, bool) {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH, CONTROL_ROW_HEIGHT),
+        Sense::click(),
+    );
+    let popup_open_before = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let effective_visible = visible || popup_open_before;
+    let response = if effective_visible {
+        response
+            .on_hover_text(tooltip)
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    };
+
+    if effective_visible && response.clicked() {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+
+    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let effective_visible = visible || popup_open;
+    if effective_visible {
+        if response.hovered() || response.is_pointer_button_down_on() || popup_open {
+            ui.painter()
+                .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+        }
+        let resolved_icon_color =
+            if response.hovered() || response.is_pointer_button_down_on() || popup_open {
+                TEXT_PRIMARY
+            } else {
+                icon_color
+            };
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{}", icons::CHAT_TEXT),
+            egui::FontId::proportional(14.0),
+            resolved_icon_color,
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+
+    (response, popup_open)
+}
+
+fn draw_hidden_terminal_message_menu_icon_button(ui: &mut Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH, CONTROL_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    if ui.is_rect_visible(rect) {
+        // Reserve stable row geometry without drawing a hidden interactive control.
+    }
+    response
 }
 
 fn project_group_header_actions_width(action_kind: TerminalKind, _section_gap: f32) -> f32 {
@@ -37905,19 +38055,16 @@ fn draw_project_group_header(
 
     // Allocate the full row for visual layout, but we'll create separate interactions
     let (_, row_rect) = ui.allocate_space(egui::vec2(row_width, row_height));
+    let row_hovered = ui
+        .ctx()
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|pos| row_rect.contains(pos));
 
     // Calculate action buttons rect
     let actions_rect = egui::Rect::from_min_size(
         egui::pos2(row_rect.right() - actions_width, row_rect.top()),
         egui::vec2(actions_width, row_height),
     );
-    let _action_hover_response = ui
-        .interact(
-            actions_rect,
-            ui.id().with(("project_group_action", project_name)),
-            Sense::hover(),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
 
     // Create interaction area for the non-button portion of the row (for click)
     let body_rect = egui::Rect::from_min_size(
@@ -37985,7 +38132,7 @@ fn draw_project_group_header(
         |ui| {
             let (icon, bg, hover_bg, tooltip) = project_group_header_action_spec(action_kind);
             if action_kind == TerminalKind::Foreground {
-                selected_action = styled_launcher_menu_button(
+                selected_action = styled_launcher_menu_button_with_visible(
                     app,
                     ui,
                     icon,
@@ -37994,18 +38141,28 @@ fn draw_project_group_header(
                     BTN_ICON_ACTIVE,
                     tooltip,
                     foreground_launchers,
+                    row_hovered,
                 );
-                if styled_icon_button(
+                if styled_icon_button_with_visible(
                     ui,
                     icons::FOLDER_PLUS,
                     BTN_TEAL,
                     BTN_TEAL_HOVER,
                     BTN_ICON_ACTIVE,
                     "Create Worktree",
+                    row_hovered,
                 ) {
                     *create_worktree_clicked = true;
                 }
-            } else if styled_icon_button(ui, icon, bg, hover_bg, BTN_ICON_ACTIVE, tooltip) {
+            } else if styled_icon_button_with_visible(
+                ui,
+                icon,
+                bg,
+                hover_bg,
+                BTN_ICON_ACTIVE,
+                tooltip,
+                row_hovered,
+            ) {
                 spawn_clicked = true;
             }
         },
@@ -38038,9 +38195,13 @@ fn styled_icon_button_with_visible(
         egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
         Sense::click(),
     );
-    let response = response
-        .on_hover_text(tooltip)
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let response = if visible {
+        response
+            .on_hover_text(tooltip)
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    };
 
     if visible {
         if response.hovered() {
@@ -38570,26 +38731,51 @@ fn styled_launcher_menu_button(
     tooltip: &str,
     launchers: &[LauncherEntry],
 ) -> Option<ForegroundLauncherAction> {
+    styled_launcher_menu_button_with_visible(
+        app, ui, icon, _bg, _hover_bg, _active_bg, tooltip, launchers, true,
+    )
+}
+
+fn styled_launcher_menu_button_with_visible(
+    app: &mut AdeApp,
+    ui: &mut Ui,
+    icon: AppIcon,
+    _bg: Color32,
+    _hover_bg: Color32,
+    _active_bg: Color32,
+    tooltip: &str,
+    launchers: &[LauncherEntry],
+    visible: bool,
+) -> Option<ForegroundLauncherAction> {
     let mut selected_action = None;
     let (button_rect, button_response) = ui.allocate_exact_size(
         egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
         Sense::click(),
     );
-    let response = button_response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(if launchers.is_empty() {
-            "No foreground launchers enabled"
-        } else {
-            tooltip
-        });
-    let popup_id = response.id.with("foreground_launcher_popup");
+    let popup_id = button_response.id.with("foreground_launcher_popup");
+    let popup_open_before = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let effective_visible = visible || popup_open_before;
+    let response = if effective_visible {
+        button_response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if launchers.is_empty() {
+                "No foreground launchers enabled"
+            } else {
+                tooltip
+            })
+    } else {
+        button_response
+    };
 
-    if response.clicked() {
+    if effective_visible && response.clicked() {
         ui.memory_mut(|mem| mem.toggle_popup(popup_id));
     }
 
     let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
-    if response.hovered() || response.is_pointer_button_down_on() || popup_open {
+    let effective_visible = visible || popup_open;
+    if effective_visible
+        && (response.hovered() || response.is_pointer_button_down_on() || popup_open)
+    {
         ui.painter().rect_filled(
             button_rect.shrink(1.0),
             8.0,
@@ -38597,20 +38783,23 @@ fn styled_launcher_menu_button(
         );
     }
 
-    let icon_color = if response.hovered() || response.is_pointer_button_down_on() || popup_open {
-        TEXT_PRIMARY
-    } else {
-        with_alpha(TEXT_PRIMARY, 170)
-    };
-    ui.painter().text(
-        button_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        format!("{icon}"),
-        egui::FontId::proportional(14.0),
-        icon_color,
-    );
+    if effective_visible {
+        let icon_color = if response.hovered() || response.is_pointer_button_down_on() || popup_open
+        {
+            TEXT_PRIMARY
+        } else {
+            with_alpha(TEXT_PRIMARY, 170)
+        };
+        ui.painter().text(
+            button_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{icon}"),
+            egui::FontId::proportional(14.0),
+            icon_color,
+        );
+    }
 
-    if response.hovered() {
+    if effective_visible && response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
@@ -43883,6 +44072,7 @@ mod tests {
     struct TerminalManagerRowTestLayout {
         selection_rect: egui::Rect,
         title_click_pos: egui::Pos2,
+        message_button_rect: egui::Rect,
         visibility_button_rect: Option<egui::Rect>,
     }
 
@@ -43921,6 +44111,15 @@ mod tests {
                     egui::pos2(row_rect.right() - super::CONTROL_ROW_HEIGHT, row_rect.top()),
                     egui::vec2(super::CONTROL_ROW_HEIGHT, row_height),
                 );
+                let message_button_rect = egui::Rect::from_min_max(
+                    egui::pos2(
+                        close_button_rect.left()
+                            - section_gap
+                            - super::TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH,
+                        row_rect.top(),
+                    ),
+                    egui::pos2(close_button_rect.left() - section_gap, row_rect.bottom()),
+                );
                 let visibility_button_rect = show_visibility_toggle.then(|| {
                     let max_x = close_button_rect.left() - section_gap;
                     egui::Rect::from_min_max(
@@ -43931,6 +44130,7 @@ mod tests {
                 observed = Some(TerminalManagerRowTestLayout {
                     selection_rect,
                     title_click_pos: pos2(title_x, row_rect.center().y),
+                    message_button_rect,
                     visibility_button_rect,
                 });
             });
@@ -43978,6 +44178,7 @@ mod tests {
                         let mut send_message = None;
                         let response = super::draw_terminal_saved_message_menu_button(
                             ui,
+                            2,
                             &[String::from("git status")],
                             &mut send_message,
                         );
@@ -44003,6 +44204,7 @@ mod tests {
                         let mut send_message = None;
                         let _ = super::draw_terminal_saved_message_menu_button(
                             ui,
+                            2,
                             &[String::from("git status")],
                             &mut send_message,
                         );
@@ -44010,6 +44212,33 @@ mod tests {
                 );
             });
         })
+    }
+
+    fn draw_terminal_message_icon_button_in_test_ui(
+        ctx: &Context,
+        raw_input: RawInput,
+        visible: bool,
+    ) -> (egui::FullOutput, bool) {
+        let mut popup_open = false;
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(120.0, super::CONTROL_ROW_HEIGHT),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let (_, open) = super::draw_terminal_message_menu_icon_button(
+                            ui,
+                            Id::new("terminal-message-icon-test-popup"),
+                            visible,
+                            super::TEXT_PRIMARY,
+                            "Messages",
+                        );
+                        popup_open = open;
+                    },
+                );
+            });
+        });
+        (output, popup_open)
     }
 
     #[test]
@@ -44198,6 +44427,54 @@ mod tests {
         assert_eq!(
             output.platform_output.cursor_icon,
             egui::CursorIcon::PointingHand
+        );
+    }
+
+    #[test]
+    fn terminal_message_icon_button_stays_open_without_row_hover() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        ctx.memory_mut(|mem| mem.open_popup(Id::new("terminal-message-icon-test-popup")));
+
+        let (_, still_open) = draw_terminal_message_icon_button_in_test_ui(
+            &ctx,
+            RawInput {
+                events: vec![Event::PointerMoved(pos2(260.0, 80.0))],
+                ..RawInput::default()
+            },
+            false,
+        );
+
+        assert!(
+            still_open,
+            "message button should remain alive while its popup is open even after row hover is lost"
+        );
+    }
+
+    #[test]
+    fn terminal_manager_foreground_saved_message_send_keeps_queue() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(2, test_terminal_entry_with_runtime(2, 7, runtime))],
+            Some(2),
+        );
+        let mut project = test_project(7, "Demo", "C:/demo", &[], &[]);
+        project.foreground_saved_messages = vec!["queued task".to_owned()];
+        app.projects.insert(7, project);
+
+        app.send_saved_message_to_terminal(&ctx, 2, "queued task");
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"queued task\r".to_vec());
+        assert_eq!(
+            app.projects
+                .get(&7)
+                .expect("project")
+                .foreground_saved_messages,
+            vec!["queued task".to_owned()],
+            "sending a foreground saved message must not remove it from the list"
         );
     }
 
@@ -54797,7 +55074,7 @@ mod tests {
 
     #[test]
     fn focused_source_control_search_blocks_terminal_capture() {
-        let mut app = test_app(vec![], None);
+        let app = test_app(vec![], None);
         let ctx = Context::default();
         ctx.memory_mut(|mem| mem.request_focus(super::AdeApp::source_control_search_input_id()));
         assert!(app.text_input_has_focus(&ctx));
@@ -54806,7 +55083,7 @@ mod tests {
 
     #[test]
     fn surrender_ui_text_focus_clears_source_control_search_focus() {
-        let mut app = test_app(vec![], None);
+        let app = test_app(vec![], None);
         let ctx = Context::default();
         ctx.memory_mut(|mem| mem.request_focus(super::AdeApp::source_control_search_input_id()));
         assert!(ctx.memory(|mem| mem.has_focus(super::AdeApp::source_control_search_input_id())));
@@ -62330,38 +62607,6 @@ mod tests {
             project_id: 7,
             terminal_id: 1,
         };
-        let request = |tool: &str, params: serde_json::Value| {
-            crate::browser_mcp_service::BrowserMcpIpcRequest {
-                request_id: "request".to_owned(),
-                terminal_id: Some(1),
-                project_id: Some(7),
-                session_id: None,
-                acp_chat_id: None,
-                tool: tool.to_owned(),
-                params,
-            }
-        };
-
-        let browser_scope = BrowserScopeKey::Terminal {
-            project_id: 7,
-            terminal_id: 1,
-        };
-        let request = |tool: &str, params: serde_json::Value| {
-            crate::browser_mcp_service::BrowserMcpIpcRequest {
-                request_id: "request".to_owned(),
-                terminal_id: Some(1),
-                project_id: Some(7),
-                session_id: None,
-                acp_chat_id: None,
-                tool: tool.to_owned(),
-                params,
-            }
-        };
-
-        let browser_scope = BrowserScopeKey::Terminal {
-            project_id: 7,
-            terminal_id: 1,
-        };
         let request =
             |params: serde_json::Value| crate::browser_mcp_service::BrowserMcpIpcRequest {
                 request_id: "request".to_owned(),
@@ -64045,7 +64290,6 @@ mod tests {
                 .show(ctx, |ui| {
                     app.draw_terminal_pane(ui, 1, pane_size);
                     // After drawing, inspect the terminal's last resize to infer line height
-                    let terminal = app.terminals.get(&1).unwrap();
                     let line_height = terminal_line_height(ui, &terminal_font_id(ui.style()));
                     let raw_h =
                         (pane_size.y - super::TERMINAL_HEADER_HEIGHT - super::TERMINAL_HEADER_GAP)
