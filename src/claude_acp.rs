@@ -10,6 +10,19 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+const MIMO_CLAUDE_ENV: [(&str, &str); 7] = [
+    (
+        "ANTHROPIC_BASE_URL",
+        "https://token-plan-sgp.xiaomimimo.com/anthropic",
+    ),
+    ("ANTHROPIC_MODEL", "mimo-v2.5-pro"),
+    ("ANTHROPIC_SMALL_FAST_MODEL", "mimo-v2.5-pro"),
+    ("ANTHROPIC_DEFAULT_SONNET_MODEL", "mimo-v2.5-pro"),
+    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "mimo-v2.5-pro"),
+    ("ANTHROPIC_DEFAULT_OPUS_MODEL", "mimo-v2.5-pro"),
+    ("CLAUDE_CODE_SUBAGENT_MODEL", "mimo-v2.5-pro"),
+];
+
 use serde_json::Value as JsonValue;
 
 use crate::opencode_acp::{AcpChatEvent, AcpChatSession};
@@ -64,6 +77,7 @@ pub fn send_claude_code_prompt(
     command.arg("--");
     command.arg(prompt_text);
     command.current_dir(project_path);
+    configure_mimo_claude_env(&mut command);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -148,6 +162,14 @@ pub fn send_claude_code_prompt(
     });
 
     Ok(())
+}
+
+fn configure_mimo_claude_env(command: &mut Command) {
+    command.env_remove("ANTHROPIC_AUTH_TOKEN");
+    command.env_remove("ANTHROPIC_API_KEY");
+    for (key, value) in MIMO_CLAUDE_ENV {
+        command.env(key, value);
+    }
 }
 
 /// Parse a single Claude Code stream-json message and emit AcpChatEvents.
@@ -295,6 +317,7 @@ mod tests {
     use super::*;
     use crate::opencode_acp::{AcpBackend, AcpChatStatus};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn parse_system_init_emits_connected_and_session_created() {
@@ -445,5 +468,34 @@ mod tests {
         assert_eq!(session.backend, AcpBackend::ClaudeCode);
         assert_eq!(session.status, AcpChatStatus::Idle);
         assert!(session.session_id.is_none());
+    }
+
+    #[test]
+    fn claude_command_env_forces_mimo_and_removes_auth_overrides() {
+        let mut command = Command::new("claude");
+        configure_mimo_claude_env(&mut command);
+
+        let envs: BTreeMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            envs.get("ANTHROPIC_BASE_URL")
+                .and_then(|value| value.as_deref()),
+            Some("https://token-plan-sgp.xiaomimimo.com/anthropic")
+        );
+        assert_eq!(
+            envs.get("ANTHROPIC_MODEL")
+                .and_then(|value| value.as_deref()),
+            Some("mimo-v2.5-pro")
+        );
+        assert_eq!(envs.get("ANTHROPIC_AUTH_TOKEN"), Some(&None));
+        assert_eq!(envs.get("ANTHROPIC_API_KEY"), Some(&None));
     }
 }
