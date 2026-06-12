@@ -3,6 +3,11 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { BrowserScopeKeyType } from '../../../shared/types';
+import {
+  isTerminalViewportAtBottom,
+  nextTerminalViewportScrollTop,
+  type TerminalViewportScrollSnapshot,
+} from '../lib/terminalViewport';
 import '@xterm/xterm/css/xterm.css';
 
 interface TerminalContextMenu {
@@ -12,6 +17,22 @@ interface TerminalContextMenu {
 }
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
+
+function captureTerminalViewportScroll(viewport: HTMLElement): TerminalViewportScrollSnapshot {
+  return {
+    scrollTop: viewport.scrollTop,
+    scrollHeight: viewport.scrollHeight,
+    clientHeight: viewport.clientHeight,
+    atBottom: isTerminalViewportAtBottom(viewport.scrollTop, viewport.scrollHeight, viewport.clientHeight),
+  };
+}
+
+function restoreTerminalViewportScroll(viewport: HTMLElement, snapshot: TerminalViewportScrollSnapshot) {
+  const nextScrollTop = nextTerminalViewportScrollTop(snapshot, viewport.scrollHeight, viewport.clientHeight);
+  if (Math.abs(viewport.scrollTop - nextScrollTop) > 1) {
+    viewport.scrollTop = nextScrollTop;
+  }
+}
 
 interface TerminalPaneProps {
   terminalId: number;
@@ -32,6 +53,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
   const [contextMenu, setContextMenu] = useState<TerminalContextMenu | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const dataUnsubRef = useRef<(() => void) | null>(null);
+  const lastPtySizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const isOpenCodeActiveRef = useRef(isOpenCodeActive);
   useEffect(() => {
     isOpenCodeActiveRef.current = isOpenCodeActive;
@@ -48,6 +70,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
 
   useEffect(() => {
     if (!containerRef.current) return;
+    lastPtySizeRef.current = null;
 
     const term = new Terminal({
       cursorBlink: true,
@@ -81,6 +104,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
     fit.fit();
 
     const { cols, rows } = term;
+    lastPtySizeRef.current = { cols, rows };
     api.invoke('pty:resize', terminalId, cols, rows);
 
     term.onData((data) => {
@@ -99,24 +123,41 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
       return true; // let xterm handle normally
     });
 
+    const viewport = containerRef.current.querySelector('.xterm-viewport') as HTMLElement | null;
+    let restoreScrollRaf: number | null = null;
+    const restoreAfterWrite = (snapshot: TerminalViewportScrollSnapshot) => {
+      if (!viewport) return;
+      restoreTerminalViewportScroll(viewport, snapshot);
+      if (restoreScrollRaf !== null) cancelAnimationFrame(restoreScrollRaf);
+      restoreScrollRaf = requestAnimationFrame(() => {
+        restoreScrollRaf = null;
+        if (viewport.isConnected) {
+          restoreTerminalViewportScroll(viewport, snapshot);
+        }
+      });
+    };
+
     const unsub = api.on('pty:data', (id: number, data: string) => {
       if (id === terminalId) {
-        term.write(data);
+        const scrollSnapshot = viewport ? captureTerminalViewportScroll(viewport) : null;
         // Track mouse reporting state (DECSET 1000/1002/1006) for wheel forwarding
         const mouseEnable = /\x1b\[\?100[026]h/.test(data);
         const mouseDisable = /\x1b\[\?100[026]l/.test(data);
         if (mouseEnable) mouseReportingEnabledRef.current = true;
         if (mouseDisable) mouseReportingEnabledRef.current = false;
-        // Track manual scroll detach: if viewport is not at bottom after data write, mark detached
-        if (isOpenCodeActiveRef.current && viewport) {
-          const scrollTop = viewport.scrollTop;
-          const scrollHeight = viewport.scrollHeight;
-          const clientHeight = viewport.clientHeight;
-          const atBottom = scrollTop + clientHeight >= scrollHeight - 2;
-          if (!atBottom) {
-            onScrollDetachedRef.current?.(true);
+
+        term.write(data, () => {
+          if (scrollSnapshot) {
+            restoreAfterWrite(scrollSnapshot);
           }
-        }
+          // Track manual scroll detach: if viewport is not at bottom after data write, mark detached
+          if (isOpenCodeActiveRef.current && viewport) {
+            const atBottom = isTerminalViewportAtBottom(viewport.scrollTop, viewport.scrollHeight, viewport.clientHeight);
+            if (!atBottom) {
+              onScrollDetachedRef.current?.(true);
+            }
+          }
+        });
       }
     });
     dataUnsubRef.current = unsub;
@@ -125,7 +166,6 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
     fitRef.current = fit;
 
     // Clamp horizontal scroll offset to 0 after each scroll event
-    const viewport = containerRef.current.querySelector('.xterm-viewport') as HTMLElement | null;
     const handleScroll = () => {
       if (viewport && viewport.scrollLeft !== 0) {
         viewport.scrollLeft = 0;
@@ -205,6 +245,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
     document.addEventListener('mouseup', handleMouseUp);
 
     return () => {
+      if (restoreScrollRaf !== null) cancelAnimationFrame(restoreScrollRaf);
       viewport?.removeEventListener('scroll', handleScroll);
       document.removeEventListener('mousedown', handleMouseDown);
       document.removeEventListener('mousemove', handleMouseMove);
@@ -212,6 +253,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
       if (scrollRaf) cancelAnimationFrame(scrollRaf);
       unsub();
       term.dispose();
+      lastPtySizeRef.current = null;
     };
   }, [terminalId]);
 
@@ -243,11 +285,20 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
     const parent = containerRef.current.parentElement;
     if (!parent) return;
 
+    let lastParentWidth = parent.clientWidth;
+    let lastParentHeight = parent.clientHeight;
     const ro = new ResizeObserver(() => {
       const fit = fitRef.current;
       const term = termRef.current;
       const container = containerRef.current;
       if (!fit || !term || !container) return;
+      const parentWidth = parent.clientWidth;
+      const parentHeight = parent.clientHeight;
+      if (parentWidth === lastParentWidth && parentHeight === lastParentHeight) return;
+      lastParentWidth = parentWidth;
+      lastParentHeight = parentHeight;
+      const viewport = container.querySelector('.xterm-viewport') as HTMLElement | null;
+      const scrollSnapshot = viewport ? captureTerminalViewportScroll(viewport) : null;
       // Reset height to 100% so fit.fit() sees the full parent size
       container.style.height = '100%';
       fit.fit();
@@ -258,8 +309,15 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
       container.style.height = `${exactHeight}px`;
       container.style.alignSelf = 'start';
       fit.fit();
+      if (scrollSnapshot && viewport) {
+        restoreTerminalViewportScroll(viewport, scrollSnapshot);
+      }
       const { cols, rows } = term;
-      api.invoke('pty:resize', terminalId, cols, rows);
+      const lastSize = lastPtySizeRef.current;
+      if (!lastSize || lastSize.cols !== cols || lastSize.rows !== rows) {
+        lastPtySizeRef.current = { cols, rows };
+        api.invoke('pty:resize', terminalId, cols, rows);
+      }
     });
 
     ro.observe(parent);

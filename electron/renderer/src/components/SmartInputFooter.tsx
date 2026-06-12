@@ -392,7 +392,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
                         setDragIndex(null);
                         setDropIndex(null);
                       }}
-                      style={{ color: '#666', cursor: 'grab' }}
+                      style={{ color: '#666' }}
                     >⋮⋮</span>
                     <span style={{ color: '#666' }}>{i + 1}.</span>
                     {modeControlsVisible && smartInputModeLabel(task.modeId) && (

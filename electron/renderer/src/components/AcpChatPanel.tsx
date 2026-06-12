@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import type { AcpChatSession, AcpChatMessage, ProjectRecord, AcpConfigOption, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
+import type { AcpChatSession, ProjectRecord, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
 import { activeBuildModel, defaultAppConfig, effectivePlanModel } from '../../../shared/types';
+import { fallbackTimelineFromMessages, normalizeAcpTimelineToolStatus } from '../../../shared/acpTimeline';
 import { appendMentionsToInput, pathToMention, removeMentionFromInput } from '../lib/acpParser';
 import {
   ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS,
@@ -25,6 +26,8 @@ import {
   slashCommandItemsForComposer,
   type AcpSlashCommandItem,
 } from '../lib/acpUi';
+import { AcpTimeline } from './AcpTimeline';
+import { AcpChangesPanel } from './AcpChangesPanel';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -64,6 +67,61 @@ interface QueuedPromptEditReturn {
   prompt: QueuedAcpPrompt;
 }
 
+function localTimelineId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function withTimelineMessageChunk(session: AcpChatSession, role: 'user' | 'assistant' | 'system', text: string): AcpChatSession {
+  const messages = [...session.messages];
+  const lastMessage = messages[messages.length - 1];
+  if (lastMessage && lastMessage.role === role) {
+    messages[messages.length - 1] = { ...lastMessage, text: lastMessage.text + text };
+  } else {
+    messages.push({ role, text, timestamp: Date.now() });
+  }
+
+  const timeline = [...(session.timeline && session.timeline.length > 0 ? session.timeline : fallbackTimelineFromMessages(session.messages))];
+  const lastTimeline = timeline[timeline.length - 1];
+  if (lastTimeline && lastTimeline.type === 'message' && lastTimeline.role === role) {
+    timeline[timeline.length - 1] = { ...lastTimeline, text: lastTimeline.text + text };
+  } else {
+    timeline.push({ id: localTimelineId(`${role}-message`), type: 'message', role, text, timestamp: Date.now() });
+  }
+  return { ...session, messages, timeline };
+}
+
+function withTimelineTool(session: AcpChatSession, event: AcpPanelEvent): AcpChatSession {
+  const toolCallId = event.toolCallId || localTimelineId('tool-call');
+  const timeline = [...(session.timeline && session.timeline.length > 0 ? session.timeline : fallbackTimelineFromMessages(session.messages))];
+  const existingIndex = timeline.findIndex((item) => item.type === 'tool' && item.toolCallId === toolCallId);
+  const now = Date.now();
+  const status = normalizeAcpTimelineToolStatus(event.status);
+  if (existingIndex >= 0) {
+    const current = timeline[existingIndex];
+    if (current.type === 'tool') {
+      timeline[existingIndex] = {
+        ...current,
+        title: event.title || current.title,
+        kind: event.kind || current.kind,
+        status,
+        updatedAt: now,
+      };
+    }
+  } else {
+    timeline.push({
+      id: localTimelineId('tool'),
+      type: 'tool',
+      toolCallId,
+      title: event.title || '',
+      kind: event.kind || '',
+      status,
+      startedAt: now,
+      updatedAt: now,
+    });
+  }
+  return { ...session, timeline };
+}
+
 export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, config, onClose, disabled = false, branchName }) => {
   const [session, setSession] = useState<AcpChatSession | null>(null);
   const [input, setInput] = useState('');
@@ -80,6 +138,9 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [queueExpanded, setQueueExpanded] = useState(true);
   const [dragSourceIndex, setDragSourceIndex] = useState<number | null>(null);
   const [dragTargetIndex, setDragTargetIndex] = useState<number | null>(null);
+  const [queueDragSource, setQueueDragSource] = useState<number | null>(null);
+  const [queueDragTarget, setQueueDragTarget] = useState<number | null>(null);
+  const [changesRefreshKey, setChangesRefreshKey] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modeDropdownRef = useRef<HTMLDivElement>(null);
@@ -108,10 +169,10 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const handleDrop = useCallback((targetIndex: number) => {
     setSession(prev => {
       if (!prev || dragSourceIndex === null || dragSourceIndex === targetIndex) return prev;
-      const msgs = [...prev.messages];
-      const [moved] = msgs.splice(dragSourceIndex, 1);
-      msgs.splice(targetIndex, 0, moved);
-      return { ...prev, messages: msgs };
+      const timeline = [...(prev.timeline && prev.timeline.length > 0 ? prev.timeline : fallbackTimelineFromMessages(prev.messages))];
+      const [moved] = timeline.splice(dragSourceIndex, 1);
+      timeline.splice(targetIndex, 0, moved);
+      return { ...prev, timeline };
     });
     setDragSourceIndex(null);
     setDragTargetIndex(null);
@@ -120,6 +181,28 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const handleDragEnd = useCallback(() => {
     setDragSourceIndex(null);
     setDragTargetIndex(null);
+  }, []);
+
+  const handleQueueDragStart = useCallback((index: number) => {
+    setQueueDragSource(index);
+  }, []);
+
+  const handleQueueDragOver = useCallback((_e: React.DragEvent, index: number) => {
+    setQueueDragTarget(index);
+  }, []);
+
+  const handleQueueDrop = useCallback(async (targetIndex: number) => {
+    if (queueDragSource !== null && queueDragSource !== targetIndex) {
+      await api.invoke('acp:queueMove', { chatId, fromIndex: queueDragSource, toIndex: targetIndex });
+      await refreshSession();
+    }
+    setQueueDragSource(null);
+    setQueueDragTarget(null);
+  }, [chatId, queueDragSource, refreshSession]);
+
+  const handleQueueDragEnd = useCallback(() => {
+    setQueueDragSource(null);
+    setQueueDragTarget(null);
   }, []);
 
   useEffect(() => {
@@ -132,15 +215,8 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       if (event.type === 'messageChunk') {
         setSession((prev) => {
           if (!prev) return prev;
-          const messages = [...prev.messages];
           const role = (event.role || 'assistant') as 'user' | 'assistant' | 'system';
-          const lastMsg = messages[messages.length - 1];
-          if (lastMsg && lastMsg.role === role) {
-            messages[messages.length - 1] = { ...lastMsg, text: lastMsg.text + (event.text || '') };
-          } else {
-            messages.push({ role, text: event.text || '', timestamp: Date.now() });
-          }
-          return { ...prev, messages };
+          return withTimelineMessageChunk(prev, role, event.text || '');
         });
         return;
       }
@@ -148,11 +224,18 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       if (event.type === 'toolCall') {
         setSession((prev) => {
           if (!prev) return prev;
-          const messages = [...prev.messages];
-          messages.push({ role: 'system', text: `${event.title || ''} (${event.kind || ''})`, timestamp: Date.now() });
-          return { ...prev, messages };
+          return withTimelineTool(prev, event);
         });
+        setChangesRefreshKey((value) => value + 1);
         return;
+      }
+
+      if (event.type === 'toolCallUpdate') {
+        setChangesRefreshKey((value) => value + 1);
+      }
+
+      if (event.type === 'promptResponse' || event.type === 'cancelled' || event.type === 'permissionResponse' || event.type === 'questionResponse') {
+        setChangesRefreshKey((value) => value + 1);
       }
 
       refreshSession();
@@ -210,7 +293,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [session?.messages]);
+  }, [session?.messages, session?.timeline]);
 
   useEffect(() => {
     clearPendingInteraction();
@@ -378,6 +461,9 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const queueHeaderLabel = acpQueuedPromptHeaderLabel(queuedPrompts.length, queuedPromptEditReturn?.index);
   const queueVisibleRows = acpQueuedPromptVisibleRowCount(queuedPrompts.length, queueExpanded);
   const queueRowsMaxHeight = queueVisibleRows * 35;
+  const timelineItems = session?.timeline && session.timeline.length > 0
+    ? session.timeline
+    : fallbackTimelineFromMessages(session?.messages);
 
   const submitPendingInteraction = async () => {
     if (!pendingQuestion) return;
@@ -509,6 +595,8 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         )}
       </div>
 
+      <div className="acp-workspace">
+        <div className="acp-chat-column">
       {/* Main content area */}
       <div style={{ flex: 1, overflow: 'auto', padding: '8px 12px', display: 'flex', flexDirection: 'column' }}>
         {isWelcome ? (
@@ -519,17 +607,15 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
           </div>
         ) : (
           <div onDragEnd={handleDragEnd}>
-            {session?.messages.map((msg, i) => (
-              <MessageBubble
-                key={i}
-                message={msg}
-                index={i}
-                onDragStart={handleDragStart}
-                onDragOver={handleDragOver}
-                onDrop={handleDrop}
-                isDragTarget={dragTargetIndex === i && dragSourceIndex !== i}
-              />
-            ))}
+            <AcpTimeline
+              items={timelineItems}
+              dragSourceIndex={dragSourceIndex}
+              dragTargetIndex={dragTargetIndex}
+              onDragStart={handleDragStart}
+              onDragOver={handleDragOver}
+              onDrop={handleDrop}
+              onDragEnd={handleDragEnd}
+            />
           </div>
         )}
         <div ref={messagesEndRef} />
@@ -572,6 +658,11 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
                   onCopy={copyQueuedPrompt}
                   onEdit={editQueuedPrompt}
                   onDelete={deleteQueuedPrompt}
+                  isDragTarget={queueDragTarget === i && queueDragSource !== i}
+                  onDragStart={handleQueueDragStart}
+                  onDragOver={handleQueueDragOver}
+                  onDrop={handleQueueDrop}
+                  onDragEnd={handleQueueDragEnd}
                 />
               ))}
             </div>
@@ -755,7 +846,8 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               background: 'transparent',
               border: 'none',
               color: '#ccc',
-              fontSize: 13,
+              fontSize: 12,
+              fontWeight: 600,
               resize: 'none',
               lineHeight: '20px',
               minHeight: 20,
@@ -908,64 +1000,8 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         </span>
         <span>{statusText}</span>
       </div>
-    </div>
-  );
-};
-
-const MessageBubble: React.FC<{
-  message: AcpChatMessage;
-  index: number;
-  onDragStart: (index: number) => void;
-  onDragOver: (e: React.DragEvent, index: number) => void;
-  onDrop: (index: number) => void;
-  isDragTarget: boolean;
-}> = ({ message, index, onDragStart, onDragOver, onDrop, isDragTarget }) => {
-  const isUser = message.role === 'user';
-  return (
-    <div
-      style={{
-        display: 'flex',
-        justifyContent: isUser ? 'flex-end' : 'flex-start',
-        marginBottom: 8,
-        borderTop: isDragTarget ? '2px solid #4a9eff' : '2px solid transparent',
-        transition: 'border-color 0.15s',
-      }}
-      onDragOver={(e) => { e.preventDefault(); onDragOver(e, index); }}
-      onDrop={() => onDrop(index)}
-    >
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 4, flexDirection: isUser ? 'row-reverse' : 'row' }}>
-        <div
-          draggable
-          onDragStart={() => onDragStart(index)}
-          style={{
-            cursor: 'grab',
-            color: '#555',
-            fontSize: 12,
-            padding: '6px 2px',
-            userSelect: 'none',
-            lineHeight: 1,
-            opacity: 0.6,
-            flexShrink: 0,
-          }}
-          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; (e.currentTarget as HTMLElement).style.color = '#999'; }}
-          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6'; (e.currentTarget as HTMLElement).style.color = '#555'; }}
-          title="Drag to reorder"
-        >
-          ⋮⋮
         </div>
-        <div style={{
-          maxWidth: '80%',
-          padding: '8px 12px',
-          borderRadius: 12,
-          background: isUser ? '#1f3a4c' : '#1a1a1a',
-          color: '#ccc',
-          fontSize: 13,
-          fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
-          whiteSpace: 'pre-wrap',
-          wordBreak: 'break-word',
-        }}>
-          {message.text}
-        </div>
+        <AcpChangesPanel repoPath={project.path} refreshKey={changesRefreshKey} />
       </div>
     </div>
   );
@@ -978,14 +1014,34 @@ const QueuedPromptRow: React.FC<{
   onCopy: (prompt: QueuedAcpPrompt) => void;
   onEdit: (index: number, prompt: QueuedAcpPrompt) => void;
   onDelete: (index: number) => void;
-}> = ({ index, prompt, onRunNext, onCopy, onEdit, onDelete }) => {
+  isDragTarget?: boolean;
+  onDragStart?: (index: number) => void;
+  onDragOver?: (e: React.DragEvent, index: number) => void;
+  onDrop?: (index: number) => void;
+  onDragEnd?: () => void;
+}> = ({ index, prompt, onRunNext, onCopy, onEdit, onDelete, isDragTarget, onDragStart, onDragOver, onDrop, onDragEnd }) => {
   const modeLabel = acpModeUiLabel(prompt.modeId);
   const indexLabel = acpQueuedPromptIndexLabel(index);
   const attachmentLabel = acpQueuedPromptAttachmentLabel(prompt.attachments.length);
   const preview = queuedPromptPreview(prompt);
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minHeight: 32, padding: '4px 8px', background: '#1a1a1a', borderRadius: 6, marginBottom: 3, fontSize: 12, color: '#888' }}>
+    <div
+      style={{ display: 'flex', alignItems: 'center', gap: 6, minHeight: 32, padding: '4px 8px', background: '#1a1a1a', borderRadius: 6, marginBottom: 3, fontSize: 12, color: '#888', borderTop: isDragTarget ? '2px solid #4a9eff' : '2px solid transparent', transition: 'border-color 0.15s' }}
+      onDragOver={(e) => { e.preventDefault(); onDragOver?.(e, index); }}
+      onDrop={() => onDrop?.(index)}
+    >
       {indexLabel && <span style={{ color: '#666', fontWeight: 600, flexShrink: 0 }}>{indexLabel}</span>}
+      <span
+        draggable
+        onDragStart={() => onDragStart?.(index)}
+        onDragEnd={() => onDragEnd?.()}
+        style={{ cursor: 'grab', color: '#555', fontSize: 12, userSelect: 'none', lineHeight: 1, opacity: 0.6, flexShrink: 0 }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; (e.currentTarget as HTMLElement).style.color = '#999'; }}
+        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6'; (e.currentTarget as HTMLElement).style.color = '#555'; }}
+        title="Drag to reorder"
+      >
+        ⋮⋮
+      </span>
       {modeLabel && (
         <span style={{ fontSize: 10, color: '#dca046', flexShrink: 0 }}>{modeLabel}</span>
       )}
@@ -1000,12 +1056,25 @@ const QueuedPromptRow: React.FC<{
         <span style={{ fontSize: 10, color: '#666', flexShrink: 0 }}>{attachmentLabel}</span>
       )}
       <button
+        onClick={() => onEdit(index, prompt)}
+        title="Edit"
+        style={queuedPromptActionStyle}
+      >
+        ✎
+      </button>
+      <button
+        onClick={() => onDelete(index)}
+        title="Delete"
+        style={queuedPromptActionStyle}
+      >
+        ✕
+      </button>
+      <button
         onClick={() => onRunNext(index)}
         title="Send now"
-        style={{ ...queuedPromptActionStyle, width: 'auto', padding: '0 6px', gap: 3, color: '#8bc34a' }}
+        style={{ ...queuedPromptActionStyle, color: '#ccc' }}
       >
-        <span style={{ fontSize: 11 }}>↑</span>
-        <span style={{ fontSize: 10 }}>Send Now</span>
+        ↑
       </button>
     </div>
   );

@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
-import { getGitDiffSummary } from '../../../main/worktree';
+import { getGitDiffSummary, getGitFileDiff } from '../../../main/worktree';
 import {
   countTextLineBytes,
   gitDiffSummaryLabel,
@@ -46,6 +46,52 @@ describe('gitDiffSummary', () => {
         addedLines: 3,
         removedLines: 0,
       });
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('returns a read-only patch for modified tracked files', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'mergen-file-diff-'));
+    const git = (args: string[]) => execFileSync('git', args, { cwd: repoPath });
+
+    try {
+      git(['init']);
+      fs.writeFileSync(path.join(repoPath, 'a.txt'), 'one\ntwo\n');
+      git(['add', 'a.txt']);
+      git(['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--quiet', '-m', 'init']);
+      fs.writeFileSync(path.join(repoPath, 'a.txt'), 'one\nchanged\nthree\n');
+
+      const diff = await getGitFileDiff(repoPath, 'a.txt');
+
+      expect(diff.status).toBe('ready');
+      expect(diff.binary).toBe(false);
+      expect(diff.addedLines).toBe(2);
+      expect(diff.removedLines).toBe(1);
+      expect(diff.patch).toContain('+++ b/a.txt');
+      expect(diff.patch).toContain('+changed');
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('returns a synthetic text patch for untracked files', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'mergen-file-diff-untracked-'));
+    const git = (args: string[]) => execFileSync('git', args, { cwd: repoPath });
+
+    try {
+      git(['init']);
+      git(['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '--quiet', '-m', 'init']);
+      fs.writeFileSync(path.join(repoPath, 'new.txt'), 'alpha\nbeta\n');
+
+      const diff = await getGitFileDiff(repoPath, path.join(repoPath, 'new.txt'));
+
+      expect(diff.status).toBe('ready');
+      expect(diff.binary).toBe(false);
+      expect(diff.addedLines).toBe(2);
+      expect(diff.removedLines).toBe(0);
+      expect(diff.patch).toContain('new file mode 100644');
+      expect(diff.patch).toContain('+alpha');
     } finally {
       fs.rmSync(repoPath, { recursive: true, force: true });
     }

@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import type { GitWorktreeInfo } from '../shared/types';
 import type { SourceControlStatus } from '../shared/types';
+import type { GitFileDiff } from '../shared/types';
 import type { GitDiffSummary } from '../shared/gitDiffSummary';
 import { countTextLineBytes, parseGitNumstatTotals, parseGitPathList } from '../shared/gitDiffSummary';
 import { parseBranchHeader, parseSourceControlStatusLine } from '../shared/sourceControl';
@@ -248,6 +249,61 @@ export async function getGitDiffSummary(repoPath: string): Promise<GitDiffSummar
   }
 }
 
+export async function getGitFileDiff(repoPath: string, filePath: string): Promise<GitFileDiff> {
+  const relativePath = repoRelativePath(repoPath, filePath);
+  if (!relativePath) {
+    return {
+      status: 'error',
+      filePath,
+      patch: '',
+      addedLines: 0,
+      removedLines: 0,
+      binary: false,
+      error: 'File is outside the repository',
+    };
+  }
+
+  try {
+    if (await isGitUntracked(repoPath, relativePath)) {
+      return untrackedFileDiff(repoPath, relativePath);
+    }
+
+    const base = await resolveGitDiffBase(repoPath);
+    const output = await runGitCommand(repoPath, ['diff', '--no-ext-diff', base, '--', relativePath]);
+    if (output.code !== 0) {
+      return {
+        status: 'error',
+        filePath: relativePath,
+        patch: '',
+        addedLines: 0,
+        removedLines: 0,
+        binary: false,
+        error: output.stderr.trim() || 'git diff failed',
+      };
+    }
+
+    const counts = countPatchChangedLines(output.stdout);
+    return {
+      status: 'ready',
+      filePath: relativePath,
+      patch: output.stdout,
+      addedLines: counts.addedLines,
+      removedLines: counts.removedLines,
+      binary: isBinaryPatch(output.stdout),
+    };
+  } catch (error) {
+    return {
+      status: 'error',
+      filePath: relativePath,
+      patch: '',
+      addedLines: 0,
+      removedLines: 0,
+      binary: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 async function resolveGitDiffBase(repoPath: string): Promise<string> {
   const head = await runGitCommand(repoPath, ['rev-parse', '--verify', 'HEAD']);
   if (head.code === 0) return 'HEAD';
@@ -286,6 +342,86 @@ function countTextFileLines(filePath: string): number | undefined {
   } catch {
     return undefined;
   }
+}
+
+function repoRelativePath(repoPath: string, filePath: string): string | undefined {
+  const absoluteRepo = path.resolve(repoPath);
+  const absoluteFile = path.isAbsolute(filePath)
+    ? path.resolve(filePath)
+    : path.resolve(absoluteRepo, filePath);
+  const relative = path.relative(absoluteRepo, absoluteFile);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return undefined;
+  return relative.replace(/\\/g, '/');
+}
+
+async function isGitUntracked(repoPath: string, relativePath: string): Promise<boolean> {
+  const output = await runGitCommand(repoPath, ['ls-files', '--others', '--exclude-standard', '--', relativePath]);
+  return output.code === 0 && output.stdout.split(/\r?\n/).some((line) => line.trim() === relativePath);
+}
+
+function untrackedFileDiff(repoPath: string, relativePath: string): GitFileDiff {
+  const absolutePath = path.join(repoPath, relativePath);
+  let bytes: Buffer;
+  try {
+    bytes = fs.readFileSync(absolutePath);
+  } catch (error) {
+    return {
+      status: 'error',
+      filePath: relativePath,
+      patch: '',
+      addedLines: 0,
+      removedLines: 0,
+      binary: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  if (countTextLineBytes(bytes) === undefined) {
+    return {
+      status: 'ready',
+      filePath: relativePath,
+      patch: `diff --git a/${relativePath} b/${relativePath}\nnew file mode 100644\nBinary files /dev/null and b/${relativePath} differ\n`,
+      addedLines: 0,
+      removedLines: 0,
+      binary: true,
+    };
+  }
+
+  const text = bytes.toString('utf-8');
+  const lines = text.length === 0 ? [] : text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  if (lines[lines.length - 1] === '') lines.pop();
+  const patchLines = [
+    `diff --git a/${relativePath} b/${relativePath}`,
+    'new file mode 100644',
+    '--- /dev/null',
+    `+++ b/${relativePath}`,
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...lines.map((line) => `+${line}`),
+  ];
+  const patch = `${patchLines.join('\n')}\n`;
+  return {
+    status: 'ready',
+    filePath: relativePath,
+    patch,
+    addedLines: lines.length,
+    removedLines: 0,
+    binary: false,
+  };
+}
+
+function countPatchChangedLines(patch: string): { addedLines: number; removedLines: number } {
+  let addedLines = 0;
+  let removedLines = 0;
+  for (const line of patch.split(/\r?\n/)) {
+    if (line.startsWith('+++') || line.startsWith('---')) continue;
+    if (line.startsWith('+')) addedLines += 1;
+    if (line.startsWith('-')) removedLines += 1;
+  }
+  return { addedLines, removedLines };
+}
+
+function isBinaryPatch(patch: string): boolean {
+  return patch.includes('GIT binary patch') || /Binary files .* differ/.test(patch);
 }
 
 function runGitCommand(

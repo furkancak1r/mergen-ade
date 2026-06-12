@@ -4,8 +4,8 @@ import fs from 'fs';
 import path from 'path';
 import { loadConfig, saveConfig, loadHistory, saveHistory, repairMojibakePath } from './config';
 import { createTerminal, writeTerminal, resizeTerminal, killTerminal, getTerminalState } from './pty';
-import { discoverWorktrees, createWorktree, removeWorktree, getGitStatus, getGitDiffSummary } from './worktree';
-import { spawnAcpChat, sendAcpPrompt, cancelAcpPrompt, setAcpConfigOption, sendAcpPermissionResponse, sendAcpQuestionResponse, getAcpSession, runAcpQueuedPromptNext, deleteAcpQueuedPrompt, restoreAcpQueuedPrompt, killAcpChat, warmAcpStandby, getAcpStandby, clearAcpStandby, promoteAcpStandby, clearAllAcpStandby } from './acpService';
+import { discoverWorktrees, createWorktree, removeWorktree, getGitStatus, getGitDiffSummary, getGitFileDiff } from './worktree';
+import { spawnAcpChat, sendAcpPrompt, cancelAcpPrompt, setAcpConfigOption, sendAcpPermissionResponse, sendAcpQuestionResponse, getAcpSession, runAcpQueuedPromptNext, deleteAcpQueuedPrompt, moveAcpQueuedPrompt, restoreAcpQueuedPrompt, killAcpChat, warmAcpStandby, getAcpStandby, clearAcpStandby, promoteAcpStandby, clearAllAcpStandby } from './acpService';
 import { submitAnswer } from './hookService';
 import {
   createBrowserView,
@@ -181,6 +181,9 @@ export function registerIpcHandlers() {
   ipcMain.handle('acp:queueDelete', async (_event, opts: { chatId: string; index: number }) => {
     return deleteAcpQueuedPrompt(opts.chatId, opts.index);
   });
+  ipcMain.handle('acp:queueMove', async (_event, opts: { chatId: string; fromIndex: number; toIndex: number }) => {
+    return moveAcpQueuedPrompt(opts.chatId, opts.fromIndex, opts.toIndex);
+  });
   ipcMain.handle('acp:queueRestore', async (_event, opts: { chatId: string; index: number; prompt: import('../shared/types').QueuedAcpPrompt }) => {
     return restoreAcpQueuedPrompt(opts.chatId, opts.index, opts.prompt);
   });
@@ -220,6 +223,9 @@ export function registerIpcHandlers() {
   // Git / Worktree
   ipcMain.handle('git:diffSummary', async (_event, repoPath: string) => {
     return getGitDiffSummary(repoPath);
+  });
+  ipcMain.handle('git:fileDiff', async (_event, opts: { repoPath: string; filePath: string }) => {
+    return getGitFileDiff(opts.repoPath, opts.filePath);
   });
   ipcMain.handle('git:status', async (_event, repoPath: string, runFetch?: boolean) => {
     return getGitStatus(repoPath, Boolean(runFetch));

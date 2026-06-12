@@ -101,6 +101,17 @@ body {
   align-items: center;
   padding-top: 8px;
   gap: 4px;
+  overflow: visible;
+  position: relative;
+  z-index: 20;
+}
+
+.activity-rail [data-tooltip]::after {
+  bottom: auto;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  max-width: calc(100vw - 64px);
 }
 
 .rail-btn {
@@ -980,4 +991,484 @@ body {
 .terminal-manager-context-menu button:hover {
   background: #2d2d2d;
   color: #f4f4f4;
+}
+
+.acp-workspace {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.acp-chat-column {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.acp-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.acp-timeline-row {
+  align-items: flex-start;
+  border-top: 2px solid transparent;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  transition: border-color 0.15s;
+}
+
+.acp-timeline-row.is-drag-target {
+  border-top-color: #4a9eff;
+}
+
+.acp-timeline-drag {
+  color: #555;
+  cursor: grab;
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 22px;
+  opacity: 0;
+  user-select: none;
+}
+
+.acp-timeline-row:hover .acp-timeline-drag {
+  opacity: 0.8;
+}
+
+.acp-message {
+  color: #d6d6d6;
+  flex: 1;
+  font-size: 13px;
+  line-height: 1.55;
+  max-width: min(820px, 100%);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.acp-message--user {
+  background: #18332e;
+  border: 1px solid #255248;
+  border-radius: 8px;
+  color: #f0f5f2;
+  flex: 0 1 auto;
+  margin-left: auto;
+  max-width: min(720px, 82%);
+  padding: 8px 12px;
+}
+
+.acp-message--assistant {
+  padding: 2px 0 4px;
+}
+
+.acp-message--system {
+  background: #171717;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  color: #aaa;
+  padding: 7px 10px;
+}
+
+.acp-message h1,
+.acp-message h2,
+.acp-message h3 {
+  color: #f0f0f0;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1.2;
+  margin: 14px 0 8px;
+}
+
+.acp-message h1 {
+  font-size: 18px;
+}
+
+.acp-message h2 {
+  font-size: 16px;
+}
+
+.acp-message h3 {
+  font-size: 14px;
+}
+
+.acp-message p {
+  margin: 0 0 9px;
+}
+
+.acp-message p:last-child {
+  margin-bottom: 0;
+}
+
+.acp-message strong {
+  color: #eeeeee;
+  font-weight: 700;
+}
+
+.acp-message ul,
+.acp-message ol {
+  margin: 7px 0 10px 22px;
+}
+
+.acp-message li {
+  margin: 4px 0;
+  padding-left: 2px;
+}
+
+.acp-message a {
+  color: #79b8ff;
+  text-decoration: none;
+}
+
+.acp-message a:hover {
+  text-decoration: underline;
+}
+
+.acp-md-inline-code {
+  background: #242424;
+  border: 1px solid #303030;
+  border-radius: 4px;
+  color: #9fd0ff;
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 12px;
+  padding: 1px 5px;
+  white-space: break-spaces;
+}
+
+.acp-message pre {
+  background: #111;
+  border: 1px solid #2d2d2d;
+  border-radius: 6px;
+  color: #d8d8d8;
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 12px;
+  margin: 8px 0;
+  max-width: 100%;
+  overflow: auto;
+  padding: 10px;
+}
+
+.acp-message blockquote {
+  border-left: 3px solid #3f5f5b;
+  color: #b8c2bf;
+  margin: 8px 0;
+  padding: 2px 0 2px 10px;
+}
+
+.acp-event-card {
+  background: #151515;
+  border: 1px solid #2b2b2b;
+  border-radius: 8px;
+  color: #cfcfcf;
+  flex: 1;
+  max-width: min(760px, 100%);
+  min-width: 0;
+  padding: 8px 10px;
+}
+
+.acp-event-card-header {
+  align-items: center;
+  color: #888;
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  min-width: 0;
+}
+
+.acp-event-card-kind {
+  color: #b7c7c3;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.acp-event-card-status,
+.acp-event-card-duration,
+.acp-event-card-meta {
+  color: #777;
+}
+
+.acp-event-card-title {
+  color: #eeeeee;
+  font-size: 13px;
+  font-weight: 700;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.acp-event-card-body {
+  color: #b8b8b8;
+  font-size: 12px;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+
+.acp-event-card-pre {
+  background: #0f0f0f;
+  border: 1px solid #282828;
+  border-radius: 6px;
+  color: #cfcfcf;
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 11px;
+  margin-top: 8px;
+  max-height: 240px;
+  overflow: auto;
+  padding: 8px;
+  white-space: pre-wrap;
+}
+
+.acp-tool-card--running .acp-tool-status-dot,
+.acp-tool-card--pending .acp-tool-status-dot {
+  animation: acp-terminal-manager-pulse 1.2s ease-in-out infinite;
+}
+
+.acp-tool-status-dot {
+  background: #88d18a;
+  border-radius: 999px;
+  display: inline-block;
+  flex: 0 0 auto;
+  height: 7px;
+  width: 7px;
+}
+
+.acp-tool-card--failed .acp-tool-status-dot {
+  background: #d46f6f;
+}
+
+.acp-event-card--error .acp-event-card-kind {
+  color: #d46f6f;
+}
+
+.acp-event-card--warning .acp-event-card-kind {
+  color: #d2a74f;
+}
+
+.acp-event-card--stderr .acp-event-card-kind {
+  color: #9aa8b5;
+}
+
+.acp-event-card--cancelled .acp-event-card-kind {
+  color: #d09867;
+}
+
+.acp-event-card--permission {
+  border-color: #4d4228;
+}
+
+.acp-permission-status-answered {
+  border-color: #2d5038;
+}
+
+.acp-permission-status-rejected {
+  border-color: #5a3030;
+}
+
+.acp-option-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.acp-option-chip {
+  background: #222;
+  border: 1px solid #333;
+  border-radius: 4px;
+  color: #bcbcbc;
+  font-size: 11px;
+  padding: 2px 6px;
+}
+
+.acp-card-link-button,
+.acp-icon-button {
+  background: transparent;
+  border: none;
+  color: #9fb8c8;
+  cursor: pointer;
+  font-size: 11px;
+  margin-top: 6px;
+  padding: 0;
+}
+
+.acp-card-link-button:hover,
+.acp-icon-button:hover {
+  color: #f4f4f4;
+}
+
+.acp-changes-panel {
+  background: #101010;
+  border-left: 1px solid #222;
+  display: flex;
+  flex: 0 0 340px;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 280px;
+}
+
+.acp-changes-header {
+  align-items: center;
+  border-bottom: 1px solid #222;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  padding: 10px 12px;
+}
+
+.acp-changes-title {
+  color: #eeeeee;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.acp-changes-branch {
+  color: #777;
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.acp-changes-files {
+  border-bottom: 1px solid #222;
+  flex: 0 0 auto;
+  max-height: 190px;
+  overflow: auto;
+  padding: 6px;
+}
+
+.acp-changes-empty {
+  color: #888;
+  font-size: 12px;
+  padding: 10px;
+}
+
+.acp-change-file {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: #c8c8c8;
+  cursor: pointer;
+  display: flex;
+  gap: 6px;
+  min-height: 28px;
+  padding: 4px 6px;
+  text-align: left;
+  width: 100%;
+}
+
+.acp-change-file:hover,
+.acp-change-file.is-selected {
+  background: #1b1b1b;
+}
+
+.acp-change-state {
+  color: #d0a35f;
+  flex: 0 0 16px;
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.acp-change-state.is-staged {
+  color: #78be91;
+}
+
+.acp-change-path {
+  flex: 1;
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 11px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acp-change-status {
+  color: #777;
+  flex: 0 0 auto;
+  font-size: 10px;
+}
+
+.acp-diff-header {
+  align-items: center;
+  border-bottom: 1px solid #222;
+  color: #b8b8b8;
+  display: flex;
+  font-size: 11px;
+  gap: 8px;
+  justify-content: space-between;
+  min-height: 30px;
+  overflow: hidden;
+  padding: 0 10px;
+}
+
+.acp-diff-header span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acp-diff-totals {
+  color: #8dbf9c;
+  flex: 0 0 auto;
+}
+
+.acp-diff-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.acp-unified-diff {
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 11px;
+  line-height: 17px;
+  margin: 0;
+  min-width: max-content;
+  padding: 6px 0;
+}
+
+.acp-diff-line {
+  display: flex;
+  min-height: 17px;
+  white-space: pre;
+}
+
+.acp-diff-line-no {
+  color: #555;
+  flex: 0 0 42px;
+  padding-right: 8px;
+  text-align: right;
+  user-select: none;
+}
+
+.acp-diff-line-text {
+  padding-right: 12px;
+}
+
+.acp-diff-line.is-hunk {
+  background: #182536;
+  color: #93b7e0;
+}
+
+.acp-diff-line.is-file {
+  color: #b9c4d0;
+}
+
+.acp-diff-line.is-added {
+  background: #12251a;
+  color: #a8d8b0;
+}
+
+.acp-diff-line.is-removed {
+  background: #2a1515;
+  color: #e2aaa8;
+}
+
+@media (max-width: 980px) {
+  .acp-changes-panel {
+    display: none;
+  }
 }

@@ -730,14 +730,14 @@ function App() {
         projectId,
         kind,
       });
-      setActiveTerminalId(id);
+      activateTerminal(id);
       return id;
     } catch (err) {
       console.error('Terminal spawn failed:', err);
       alert('Terminal spawn failed: ' + (err instanceof Error ? err.message : String(err)));
       return 0;
     }
-  }, [config, pty]);
+  }, [config, pty, activateTerminal]);
 
   const killTerminal = useCallback((id: number) => {
     const t = terminals.find((x) => x.id === id);

@@ -3,8 +3,19 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { BrowserWindow } from 'electron';
-import type { AcpChatSession, AcpConfigOption, AcpAvailableCommand, AcpChatMessage, OpenCodeModelConfig, QueuedAcpPrompt } from '../shared/types';
+import type {
+  AcpChatSession,
+  AcpConfigOption,
+  AcpAvailableCommand,
+  AcpChatMessage,
+  AcpTimelineItem,
+  AcpTimelineNoticeKind,
+  OpenCodeModelConfig,
+  OpenCodeQuestionOption,
+  QueuedAcpPrompt,
+} from '../shared/types';
 import { activeBuildModel, effectivePlanModel, effectivePlanEffort, mergeAcpKnownModels } from '../shared/types';
+import { normalizeAcpTimelineToolStatus } from '../shared/acpTimeline';
 import {
   acpUnknownResponseWarningText,
   buildAcpCancelNotification,
@@ -59,6 +70,7 @@ interface AcpSession {
   mcpServers: string[];
   status: AcpChatSession['status'];
   title: string;
+  timeline: AcpTimelineItem[];
   messages: AcpChatMessage[];
   promptInput: string;
   attachments: string[];
@@ -74,6 +86,7 @@ interface AcpSession {
   pendingInteractions: Map<string, AcpPendingInteraction>;
   nextInteractionId: number;
   tool?: 'opencode' | 'claude_acp';
+  nextTimelineId: number;
 }
 
 const sessions = new Map<string, AcpSession>();
@@ -112,10 +125,151 @@ function appendAcpSystemMessage(session: AcpSession, text: string): void {
   session.messages.push({ role: 'system', text, timestamp: Date.now() });
 }
 
+function createTimelineId(session: AcpSession, prefix: string): string {
+  return `${prefix}-${Date.now()}-${session.nextTimelineId++}`;
+}
+
+function appendAcpTimelineMessage(
+  session: AcpSession,
+  role: AcpChatMessage['role'],
+  text: string,
+  timestamp = Date.now(),
+): void {
+  const msg: AcpChatMessage = { role, text, timestamp };
+  session.messages.push(msg);
+  session.timeline.push({
+    id: createTimelineId(session, `${role}-message`),
+    type: 'message',
+    role,
+    text,
+    timestamp,
+  });
+}
+
+function appendAcpTimelineMessageChunk(
+  session: AcpSession,
+  role: AcpChatMessage['role'],
+  text: string,
+  timestamp = Date.now(),
+): void {
+  const lastMsg = session.messages[session.messages.length - 1];
+  if (lastMsg && lastMsg.role === role) {
+    lastMsg.text += text;
+  } else {
+    session.messages.push({ role, text, timestamp });
+  }
+
+  const lastTimeline = session.timeline[session.timeline.length - 1];
+  if (lastTimeline && lastTimeline.type === 'message' && lastTimeline.role === role) {
+    lastTimeline.text += text;
+  } else {
+    session.timeline.push({
+      id: createTimelineId(session, `${role}-message`),
+      type: 'message',
+      role,
+      text,
+      timestamp,
+    });
+  }
+}
+
+function appendAcpTimelineNotice(
+  session: AcpSession,
+  kind: AcpTimelineNoticeKind,
+  text: string,
+  timestamp = Date.now(),
+): void {
+  session.timeline.push({
+    id: createTimelineId(session, kind),
+    type: 'notice',
+    kind,
+    text,
+    timestamp,
+  });
+}
+
+function upsertAcpTimelineTool(
+  session: AcpSession,
+  options: { toolCallId: string; title: string; kind: string; status: unknown; raw?: unknown },
+): void {
+  const now = Date.now();
+  const status = normalizeAcpTimelineToolStatus(options.status);
+  const existing = session.timeline.find((item) => (
+    item.type === 'tool'
+    && item.toolCallId.length > 0
+    && item.toolCallId === options.toolCallId
+  ));
+  if (existing?.type === 'tool') {
+    existing.title = options.title || existing.title;
+    existing.kind = options.kind || existing.kind;
+    existing.status = status;
+    existing.updatedAt = now;
+    existing.raw = options.raw ?? existing.raw;
+    return;
+  }
+
+  session.timeline.push({
+    id: createTimelineId(session, 'tool'),
+    type: 'tool',
+    toolCallId: options.toolCallId,
+    title: options.title,
+    kind: options.kind,
+    status,
+    startedAt: now,
+    updatedAt: now,
+    raw: options.raw,
+  });
+}
+
+function updateAcpTimelineToolStatus(session: AcpSession, toolCallId: string, status: unknown): void {
+  const now = Date.now();
+  const normalized = normalizeAcpTimelineToolStatus(status);
+  const existing = session.timeline.find((item) => item.type === 'tool' && item.toolCallId === toolCallId);
+  if (existing?.type === 'tool') {
+    existing.status = normalized;
+    existing.updatedAt = now;
+  }
+}
+
+function appendAcpTimelinePermission(
+  session: AcpSession,
+  options: {
+    interactionKind: 'permission' | 'question';
+    requestId: string;
+    header: string;
+    question: string;
+    options: OpenCodeQuestionOption[];
+  },
+): void {
+  session.timeline.push({
+    id: createTimelineId(session, options.interactionKind),
+    type: 'permission',
+    interactionKind: options.interactionKind,
+    requestId: options.requestId,
+    header: options.header,
+    question: options.question,
+    options: options.options,
+    status: 'pending',
+    timestamp: Date.now(),
+  });
+}
+
+function resolveAcpTimelinePermission(session: AcpSession, requestId: string, rejected: boolean): void {
+  const item = session.timeline.find((candidate) => (
+    candidate.type === 'permission'
+    && candidate.requestId === requestId
+    && candidate.status === 'pending'
+  ));
+  if (item?.type === 'permission') {
+    item.status = rejected ? 'rejected' : 'answered';
+  }
+}
+
 function broadcastAcpWarning(session: AcpSession, text: string): void {
   const clean = stripAnsi(text).trim();
   if (!clean) return;
   appendAcpSystemMessage(session, `ACP warning: ${clean}`);
+  appendAcpTimelineNotice(session, 'warning', clean);
   broadcast('acp:event', session.chatId, { type: 'warning', text: clean });
 }
 
@@ -170,6 +324,7 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
     mcpServers: opts.mcpServers,
     status: 'starting',
     title: isClaudeCode ? 'Claude Code ACP' : 'OpenCode ACP',
+    timeline: [],
     messages: [],
     promptInput: '',
     attachments: [],
@@ -179,6 +334,7 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
     pendingInteractions: new Map(),
     nextInteractionId: 1,
     tool: isClaudeCode ? 'claude_acp' : 'opencode',
+    nextTimelineId: 1,
   };
 
   sessions.set(chatId, session);
@@ -267,12 +423,14 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
       const prefix = staleResponseWarning ? 'ACP warning' : 'ACP stderr';
       const message = staleResponseWarning ? acpUnknownResponseWarningText(text) : text;
       appendAcpSystemMessage(session, `${prefix}: ${message}`);
+      appendAcpTimelineNotice(session, staleResponseWarning ? 'warning' : 'stderr', message);
       broadcast('acp:event', chatId, { type: staleResponseWarning ? 'warning' : 'stderr', text: message });
     });
 
     proc.on('exit', (code) => {
       session.status = 'error';
       clearPendingInteractions(session);
+      appendAcpTimelineNotice(session, 'error', `ACP process exited with code ${code ?? 'unknown'}`);
       broadcast('acp:event', chatId, { type: 'exit', code });
     });
 
@@ -281,6 +439,7 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
       clearPendingInteractions(session);
       const text = err.message;
       appendAcpSystemMessage(session, `ACP spawn error: ${text}`);
+      appendAcpTimelineNotice(session, 'error', `ACP spawn error: ${text}`);
       broadcast('acp:event', chatId, { type: 'error', text: `ACP spawn error: ${text}` });
     });
 
@@ -301,6 +460,7 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
     clearPendingInteractions(session);
     const text = err instanceof Error ? err.message : String(err);
     appendAcpSystemMessage(session, `ACP spawn error: ${text}`);
+    appendAcpTimelineNotice(session, 'error', `ACP spawn error: ${text}`);
     broadcast('acp:event', chatId, { type: 'error', text: `ACP spawn error: ${text}` });
   }
 
@@ -328,17 +488,20 @@ function handleAcpLine(session: AcpSession, line: string): void {
       if (isAcpUnknownResponseWarning(text)) {
         const message = acpUnknownResponseWarningText(text);
         appendAcpSystemMessage(session, `ACP warning: ${message}`);
+        appendAcpTimelineNotice(session, 'warning', message);
         broadcast('acp:event', session.chatId, { type: 'warning', text: message });
         return;
       }
       if (!isAcpErrorFatalForSession(text, Boolean(session.sessionId), session.status)) {
         appendAcpSystemMessage(session, `ACP warning: ${text}`);
+        appendAcpTimelineNotice(session, 'warning', text);
         broadcast('acp:event', session.chatId, { type: 'warning', text });
         return;
       }
       session.status = 'error';
       clearPendingInteractions(session);
       appendAcpSystemMessage(session, `ACP error: ${text}`);
+      appendAcpTimelineNotice(session, 'error', `ACP error: ${text}`);
       broadcast('acp:event', session.chatId, { type: 'error', text: `ACP error: ${text}` });
       return;
     }
@@ -421,6 +584,13 @@ function handleAcpLine(session: AcpSession, line: string): void {
             rpcId: id,
             optionIds: new Set(options.map((option) => option.id).filter((optionId) => optionId.length > 0)),
           });
+          appendAcpTimelinePermission(session, {
+            interactionKind: 'permission',
+            requestId: token,
+            header: 'Permission Required',
+            question: (params.message as string) || '',
+            options,
+          });
           session.status = 'permission';
           updateAcpStandbyStatus(session.chatId, 'permission');
           broadcast('acp:event', session.chatId, {
@@ -460,6 +630,13 @@ function handleAcpLine(session: AcpSession, line: string): void {
           questionCount: Math.max(questions.length, 1),
         });
         const first = questions[0] || { header: 'Question', question: '', options: [] };
+        appendAcpTimelinePermission(session, {
+          interactionKind: 'question',
+          requestId: token,
+          header: first.header,
+          question: first.question,
+          options: first.options,
+        });
         session.status = 'permission';
         updateAcpStandbyStatus(session.chatId, 'permission');
         broadcast('acp:event', session.chatId, {
@@ -492,24 +669,14 @@ function handleAcpLine(session: AcpSession, line: string): void {
         case 'agent_message_chunk': {
           const content = (update.content as Record<string, unknown>) || {};
           const text = (content.text as string) || '';
-          const lastMsg = session.messages[session.messages.length - 1];
-          if (lastMsg && lastMsg.role === 'assistant') {
-            lastMsg.text += text;
-          } else {
-            session.messages.push({ role: 'assistant', text, timestamp: Date.now() });
-          }
+          appendAcpTimelineMessageChunk(session, 'assistant', text);
           broadcast('acp:event', session.chatId, { type: 'messageChunk', text, role: 'assistant' });
           return;
         }
         case 'user_message_chunk': {
           const content = (update.content as Record<string, unknown>) || {};
           const text = (content.text as string) || '';
-          const lastMsg = session.messages[session.messages.length - 1];
-          if (lastMsg && lastMsg.role === 'user') {
-            lastMsg.text += text;
-          } else {
-            session.messages.push({ role: 'user', text, timestamp: Date.now() });
-          }
+          appendAcpTimelineMessageChunk(session, 'user', text);
           broadcast('acp:event', session.chatId, { type: 'messageChunk', text, role: 'user' });
           return;
         }
@@ -519,12 +686,14 @@ function handleAcpLine(session: AcpSession, line: string): void {
           const kind = (update.kind as string) || '';
           const status = (update.status as string) || 'pending';
           session.messages.push({ role: 'system', text: `${title} (${kind})`, timestamp: Date.now() });
+          upsertAcpTimelineTool(session, { toolCallId, title, kind, status, raw: update });
           broadcast('acp:event', session.chatId, { type: 'toolCall', toolCallId, title, kind, status });
           return;
         }
         case 'tool_call_update': {
           const toolCallId = (update.toolCallId as string) || '';
           const status = (update.status as string) || '';
+          updateAcpTimelineToolStatus(session, toolCallId, status);
           broadcast('acp:event', session.chatId, { type: 'toolCallUpdate', toolCallId, status });
           return;
         }
@@ -611,9 +780,8 @@ function flushNextQueuedPrompt(session: AcpSession): void {
 
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
-  const msg: AcpChatMessage = { role: 'user', text: fullText, timestamp: Date.now() };
   updateAcpChatTitleFromPrompt(session, fullText);
-  session.messages.push(msg);
+  appendAcpTimelineMessage(session, 'user', fullText);
   sendRpc(session, 'session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: fullText }] });
   broadcast('acp:event', session.chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
 }
@@ -630,9 +798,8 @@ function sendClaudeCodePrompt(session: AcpSession, promptText: string, attachmen
   }
 
   session.status = 'running';
-  const msg: AcpChatMessage = { role: 'user', text: fullText, timestamp: Date.now() };
   updateAcpChatTitleFromPrompt(session, fullText);
-  session.messages.push(msg);
+  appendAcpTimelineMessage(session, 'user', fullText);
   broadcast('acp:event', session.chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
 
   const args = ['--print', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions'];
@@ -684,6 +851,7 @@ function sendClaudeCodePrompt(session: AcpSession, promptText: string, attachmen
       const text = stripAnsi(data.toString()).trim();
       if (!text) return;
       session.partialStderr = (session.partialStderr || '') + text + '\n';
+      appendAcpTimelineNotice(session, 'stderr', text);
       broadcast('acp:event', session.chatId, { type: 'stderr', text });
     });
 
@@ -701,12 +869,14 @@ function sendClaudeCodePrompt(session: AcpSession, promptText: string, attachmen
       clearPendingInteractions(session);
       const text = err.message;
       appendAcpSystemMessage(session, `Claude Code error: ${text}`);
+      appendAcpTimelineNotice(session, 'error', `Claude Code error: ${text}`);
       broadcast('acp:event', session.chatId, { type: 'error', text: `Claude Code error: ${text}` });
     });
   } catch (err) {
     session.status = 'error';
     const text = err instanceof Error ? err.message : String(err);
     appendAcpSystemMessage(session, `Claude Code spawn error: ${text}`);
+    appendAcpTimelineNotice(session, 'error', `Claude Code spawn error: ${text}`);
     broadcast('acp:event', session.chatId, { type: 'error', text: `Claude Code spawn error: ${text}` });
   }
 }
@@ -727,12 +897,7 @@ function handleClaudeCodeLine(session: AcpSession, line: string): void {
       if (Array.isArray(content)) {
         for (const block of content) {
           if (block.type === 'text' && typeof block.text === 'string') {
-            const lastMsg = session.messages[session.messages.length - 1];
-            if (lastMsg && lastMsg.role === 'assistant') {
-              lastMsg.text += block.text;
-            } else {
-              session.messages.push({ role: 'assistant', text: block.text, timestamp: Date.now() });
-            }
+            appendAcpTimelineMessageChunk(session, 'assistant', block.text);
             broadcast('acp:event', session.chatId, { type: 'messageChunk', text: block.text, role: 'assistant' });
           }
         }
@@ -782,6 +947,17 @@ export function deleteAcpQueuedPrompt(chatId: string, index: number): boolean {
   if (!session || !isValidQueueIndex(session, index)) return false;
 
   session.queuedPrompts.splice(index, 1);
+  broadcastQueueUpdated(session);
+  return true;
+}
+
+export function moveAcpQueuedPrompt(chatId: string, fromIndex: number, toIndex: number): boolean {
+  const session = sessions.get(chatId);
+  if (!session || !isValidQueueIndex(session, fromIndex) || !isValidQueueIndex(session, toIndex)) return false;
+  if (fromIndex === toIndex) return true;
+
+  const [moved] = session.queuedPrompts.splice(fromIndex, 1);
+  session.queuedPrompts.splice(toIndex, 0, moved);
   broadcastQueueUpdated(session);
   return true;
 }
@@ -837,9 +1013,8 @@ export function sendAcpPrompt(chatId: string, promptText: string, attachments: s
 
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
-  const msg: AcpChatMessage = { role: 'user', text: fullText, timestamp: Date.now() };
   updateAcpChatTitleFromPrompt(session, fullText);
-  session.messages.push(msg);
+  appendAcpTimelineMessage(session, 'user', fullText);
   sendRpc(session, 'session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: fullText }] });
   broadcast('acp:event', chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
 }
@@ -862,6 +1037,7 @@ export function cancelAcpPrompt(chatId: string): void {
     }
     session.status = 'idle';
     clearPendingInteractions(session);
+    appendAcpTimelineNotice(session, 'cancelled', 'Claude Code turn cancelled.');
     broadcast('acp:event', chatId, { type: 'cancelled', queuedPrompts: session.queuedPrompts.length });
     return;
   }
@@ -873,6 +1049,7 @@ export function cancelAcpPrompt(chatId: string): void {
   }
   session.status = 'idle';
   updateAcpStandbyStatus(session.chatId, 'idle');
+  appendAcpTimelineNotice(session, 'cancelled', 'ACP turn cancelled.');
   broadcast('acp:event', chatId, { type: 'cancelled', queuedPrompts: session.queuedPrompts.length });
 }
 
@@ -917,6 +1094,7 @@ export function sendAcpPermissionResponse(chatId: string, requestId: string, ans
   }
 
   session.pendingInteractions.delete(requestId);
+  resolveAcpTimelinePermission(session, requestId, rejected);
   sendRawRpc(session, buildAcpPermissionResponse(interaction.rpcId, optionId, rejected));
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
@@ -941,6 +1119,7 @@ export function sendAcpQuestionResponse(chatId: string, requestId: string, answe
   }
 
   session.pendingInteractions.delete(requestId);
+  resolveAcpTimelinePermission(session, requestId, rejected);
   sendRawRpc(session, buildAcpQuestionResponse(interaction.rpcId, normalizedAnswers, rejected));
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
@@ -955,6 +1134,7 @@ export function getAcpSession(chatId: string): AcpChatSession | undefined {
     sessionId: session.sessionId,
     status: session.status,
     title: session.title,
+    timeline: session.timeline,
     messages: session.messages,
     promptInput: session.promptInput,
     attachments: session.attachments,

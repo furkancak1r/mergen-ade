@@ -8,9 +8,9 @@ import {
   OPENCODE_ACP_OPEN_BUTTON_LABEL,
   acpLabelForTool,
   acpStatusText,
-  acpTerminalManagerBadgeVisual,
   acpTerminalManagerRowLabel,
   type AcpTerminalManagerAttentionReason,
+  type AcpTerminalManagerBadgeVisual,
 } from '../lib/acpUi';
 import { effectiveLauncherCommand } from '../lib/launcher';
 import { effectiveAiStatusForDisplay } from '../lib/smartInput';
@@ -52,6 +52,10 @@ const TERMINAL_HISTORY_POPUP_MAX_VISIBLE_ENTRIES = 5;
 const TERMINAL_HISTORY_POPUP_CHROME_HEIGHT_ESTIMATE = 56;
 const TERMINAL_HISTORY_POPUP_ROW_GAP = 4;
 const TERMINAL_MANAGER_DIFF_REFRESH_INTERVAL_MS = 30_000;
+const TERMINAL_AI_BADGE_RUNNING_BORDER = 'rgba(100, 200, 100, 0.25)';
+const TERMINAL_AI_BADGE_RUNNING = '#64c864';
+const TERMINAL_AI_BADGE_ATTENTION = '#e8a838';
+const TERMINAL_AI_BADGE_INACTIVE = '#666';
 
 type TerminalManagerPathContextKind = 'project' | 'worktree';
 
@@ -306,6 +310,19 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
     document.addEventListener('click', handleClick);
     return () => document.removeEventListener('click', handleClick);
   }, [showSavedMessages]);
+
+  // Close launcher menu when clicking outside
+  useEffect(() => {
+    if (showLauncherMenu === null) return;
+    const handleClick = (e: MouseEvent) => {
+      const launcherPopup = document.querySelector('[data-launcher-popup]');
+      if (launcherPopup && !launcherPopup.contains(e.target as Node)) {
+        setShowLauncherMenu(null);
+      }
+    };
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, [showLauncherMenu]);
 
   useEffect(() => {
     if (!pathContextMenu) return undefined;
@@ -626,7 +643,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   const activeAcpSession = activeAcpSessionByProject ? Array.from(activeAcpSessionByProject.entries()).find(([k]) => k.startsWith(acpKeyPrefix))?.[1] : undefined;
   const activeAcpStatus = hasActiveAcpChat ? (activeAcpSession?.status ?? 'starting') : undefined;
   const activeAcpAttention = activeAcpAttentionByProject ? Array.from(activeAcpAttentionByProject.entries()).find(([k]) => k.startsWith(acpKeyPrefix))?.[1] : undefined;
-  const activeAcpBadge = acpTerminalManagerBadgeVisual(activeAcpStatus, activeAcpAttention);
+  const activeAcpBadge = acpTerminalManagerRowBadgeVisual(activeAcpStatus, activeAcpAttention);
   const activeAcpRow = activeAcpProjectId === project.id;
   const activeAcpRowChrome = terminalManagerRowChrome(activeAcpRow, hoveredAcpRow);
   const showOpenCodeAcpButton = shouldShowOpenCodeAcpButton(filter, hasActiveAcpChat);
@@ -675,7 +692,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             pointerEvents: 'none',
           }} />
         )}
-        <span style={{ fontSize: 10, color: TEXT_MUTED, width: 12, zIndex: 1 }}>{expanded ? '▼' : '▶'}</span>
+        <ProjectFolderIcon expanded={expanded} color={headerTextColor} />
         <span style={{
           fontSize: 12,
           fontWeight: 600,
@@ -769,7 +786,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
         <div>
           {/* Launcher popup - positioned to the right of the panel */}
           {showLauncherMenu === project.id && (
-            <div style={{
+            <div data-launcher-popup style={{
               position: 'fixed',
               zIndex: 20,
               top: launcherMenuButtonRect ? launcherMenuButtonRect.top : 100,
@@ -905,7 +922,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                gap: 4,
                 height: CONTROL_ROW_HEIGHT,
                 padding: isWorktree ? '0 8px 0 36px' : '0 8px 0 24px',
                 cursor: 'pointer',
@@ -927,24 +943,11 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   pointerEvents: 'none',
                 }} />
               )}
-              {activeAcpBadge && (
-                <span
-                  className="acp-terminal-manager-badge-slot"
-                  data-tooltip={`${acpLabelForTool(activeAcpSession?.tool)}: ${acpStatusText(activeAcpStatus)}`}
-                >
-                  <span
-                    className={`acp-terminal-manager-badge acp-terminal-manager-badge--${activeAcpBadge.kind}`}
-                    style={
-                      activeAcpBadge.kind === 'spinner'
-                        ? {
-                            borderColor: 'rgba(170, 170, 170, 0.28)',
-                            borderTopColor: activeAcpBadge.color,
-                          }
-                        : { background: activeAcpBadge.color }
-                    }
-                  />
-                </span>
-              )}
+              <span
+                className={`terminal-ai-badge terminal-ai-badge--${activeAcpBadge.kind}`}
+                style={terminalManagerBadgeStyle(activeAcpBadge)}
+                data-tooltip={`${acpLabelForTool(activeAcpSession?.tool)}: ${acpStatusText(activeAcpStatus)}`}
+              />
               <span style={{
                 fontSize: 11,
                 color: activeAcpStatus === 'error' ? BTN_RED : activeAcpRowChrome.titleColor,
@@ -952,30 +955,39 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
+                marginLeft: 6,
                 zIndex: 1,
               }}>
                 {acpTerminalManagerRowLabel(activeAcpSession)}
               </span>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onRemoveAcpChat?.(project.id);
-                }}
-                style={{
-                  padding: '1px 4px',
-                  fontSize: 10,
-                  background: 'transparent',
-                  border: '1px solid #444',
-                  color: TEXT_MUTED,
-                  borderRadius: 3,
-                  cursor: 'pointer',
-                  flexShrink: 0,
-                  zIndex: 1,
-                }}
-                data-tooltip={`Close ${acpLabelForTool(activeAcpSession?.tool)}`}
-              >
-                ✕
-              </button>
+              <div style={{ display: 'flex', gap: 2, zIndex: 1, minWidth: CONTROL_ROW_HEIGHT }}>
+                <div style={{ display: 'flex', gap: 2, visibility: (hoveredAcpRow || activeAcpRow) ? 'visible' : 'hidden' }}>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onRemoveAcpChat?.(project.id);
+                    }}
+                    style={{
+                      padding: '1px 4px',
+                      fontSize: 10,
+                      background: 'transparent',
+                      border: '1px solid #444',
+                      color: BTN_RED,
+                      borderRadius: 3,
+                      cursor: 'pointer',
+                      flexShrink: 0,
+                      width: CONTROL_ROW_HEIGHT,
+                      height: CONTROL_ROW_HEIGHT - 4,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                    data-tooltip={`Close ${acpLabelForTool(activeAcpSession?.tool)}`}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
             </div>
           )}
           {/* OpenCode ACP button removed */}
@@ -1019,10 +1031,10 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   className={`terminal-ai-badge terminal-ai-badge--${displayAiStatus === 'running' ? 'spinner' : displayAiStatus === 'attention' ? 'pulse' : 'solid'}`}
                   style={
                     displayAiStatus === 'running'
-                      ? { borderColor: 'rgba(100, 200, 100, 0.25)', borderTopColor: '#64c864' }
+                      ? { borderColor: TERMINAL_AI_BADGE_RUNNING_BORDER, borderTopColor: TERMINAL_AI_BADGE_RUNNING }
                       : displayAiStatus === 'attention'
-                        ? { background: '#e8a838' }
-                        : { background: '#666' }
+                        ? { background: TERMINAL_AI_BADGE_ATTENTION }
+                        : { background: TERMINAL_AI_BADGE_INACTIVE }
                   }
                 />
                 <span style={{
@@ -1170,7 +1182,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
               </div>
             );
           })}
-          {terminals.length === 0 && (
+          {terminals.length === 0 && !hasActiveAcpChat && (
             <div style={{ padding: '2px 8px 2px 24px', fontSize: 11, color: withAlpha(TEXT_MUTED, 120) }}>No terminals</div>
           )}
         </div>
@@ -1276,10 +1288,66 @@ const IconButton: React.FC<IconButtonProps> = ({ icon, tooltip, onClick }) => {
   );
 };
 
+const ProjectFolderIcon: React.FC<{ expanded: boolean; color: string }> = ({ expanded, color }) => (
+  <svg
+    aria-hidden="true"
+    focusable="false"
+    viewBox="0 0 16 16"
+    style={{
+      width: 13,
+      height: 13,
+      flex: '0 0 13px',
+      color,
+      zIndex: 1,
+    }}
+  >
+    {expanded ? (
+      <path
+        d="M1.5 5.5h4.2l1.1 1.2h7.5l-1.3 6.1H2.8L1.5 5.5Zm.8-2.3h4.1l1.1 1.2h6.2v1.1H6.4L5.3 4.3h-3v.9h-1V4c0-.4.4-.8 1-.8Z"
+        fill="currentColor"
+      />
+    ) : (
+      <path
+        d="M2.2 3.4h4.2l1.1 1.2h6.3c.5 0 .9.4.9.9v6.2c0 .5-.4.9-.9.9H2.2c-.5 0-.9-.4-.9-.9V4.3c0-.5.4-.9.9-.9Zm-.1 2.1v6.1h11.8V5.5H6.9L5.8 4.3H2.2c-.1 0-.1 0-.1.1v1.1Z"
+        fill="currentColor"
+      />
+    )}
+  </svg>
+);
+
 interface RowChrome {
   fill: string;
   stroke: string;
   titleColor: string;
+}
+
+function acpTerminalManagerRowBadgeVisual(
+  status: AcpChatSession['status'] | undefined,
+  attentionReason?: AcpTerminalManagerAttentionReason,
+): AcpTerminalManagerBadgeVisual {
+  switch (status) {
+    case 'starting':
+    case 'connected':
+    case 'session_created':
+    case 'running':
+      return { kind: 'spinner', color: TERMINAL_AI_BADGE_RUNNING };
+    case 'permission':
+      return { kind: 'pulse', color: TERMINAL_AI_BADGE_ATTENTION };
+    case 'idle':
+      return attentionReason === 'turn_complete'
+        ? { kind: 'pulse', color: TERMINAL_AI_BADGE_ATTENTION }
+        : { kind: 'solid', color: TERMINAL_AI_BADGE_INACTIVE };
+    case 'error':
+      return { kind: 'solid', color: BTN_RED };
+    default:
+      return { kind: 'solid', color: TERMINAL_AI_BADGE_INACTIVE };
+  }
+}
+
+function terminalManagerBadgeStyle(badge: AcpTerminalManagerBadgeVisual): React.CSSProperties {
+  return badge.kind === 'spinner'
+    ? { borderColor: TERMINAL_AI_BADGE_RUNNING_BORDER, borderTopColor: badge.color }
+    : { background: badge.color };
 }
 
 function terminalManagerRowChrome(isActive: boolean, isHovered: boolean): RowChrome {

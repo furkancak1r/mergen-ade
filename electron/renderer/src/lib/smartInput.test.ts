@@ -159,6 +159,8 @@ describe('smartInput', () => {
       expect(shouldShowSmartInputFooter('foreground', 'claude', 'inactive', false)).toBe(false);
       expect(shouldShowSmartInputFooter('foreground', 'opencode', 'attention', false)).toBe(false);
       expect(shouldShowSmartInputFooter('foreground', 'codex', 'attention', false)).toBe(false);
+      expect(shouldShowSmartInputFooter('foreground', 'codex', 'running', true)).toBe(false);
+      expect(shouldShowSmartInputFooter('foreground', 'droid', 'running', true)).toBe(false);
     });
   });
 

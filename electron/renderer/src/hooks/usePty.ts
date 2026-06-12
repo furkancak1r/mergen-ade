@@ -56,6 +56,22 @@ export interface TerminalInstance {
   recentOutputBuffer: string;
 }
 
+function clearOpenCodeSessionState(t: TerminalInstance) {
+  t.opencodeSessionActive = false;
+  t.opencodeTransportStatus = undefined;
+  t.opencodeAttentionReason = undefined;
+  t.opencodePendingQuestion = undefined;
+  t.opencodeQuestionFocusIndex = 0;
+  t.opencodeQuestionSelectedOptions = [];
+  t.opencodeQuestionCustomText = '';
+  t.opencodeManualScrollDetached = false;
+  t.opencodeLeadingBlankRows = 0;
+  t.opencodeThoughtLoopBlocked = false;
+  t.opencodeLoopLimitEmitted = false;
+  t.opencodeThinkingGuard = undefined;
+  t.opencodeLastHookEventSince = undefined;
+}
+
 export function usePty() {
   const terminalsRef = useRef<Map<number, TerminalInstance>>(new Map());
   const listenersRef = useRef<Set<() => void>>(new Set());
@@ -361,16 +377,8 @@ export function usePty() {
           t.opencodeThoughtLoopBlocked = true;
         }
       }
-      if (event.tool === 'codex') {
-        const isWorking = event.status === 'running' || event.status === 'attention';
-        if (isWorking) t.opencodeSessionActive = true;
-        if (event.status === 'attention' && event.attentionKind === 'user_input_requested') {
-          t.opencodeTransportStatus = 'Question';
-        }
-      }
-      if (event.tool === 'droid') {
-        const isWorking = event.status === 'running' || event.status === 'attention';
-        if (isWorking) t.opencodeSessionActive = true;
+      if (event.tool === 'codex' || event.tool === 'droid') {
+        clearOpenCodeSessionState(t);
       }
       if (event.tool === 'claude') {
         t.claudeLaunchPending = false;
