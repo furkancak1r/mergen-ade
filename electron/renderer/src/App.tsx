@@ -89,8 +89,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [terminalManagerOverlayOpen, setTerminalManagerOverlayOpen] = useState(false);
   const [branchNameByProject, setBranchNameByProject] = useState<Map<number, string>>(new Map());
-  const [createWorktreeRequest, setCreateWorktreeRequest] = useState<{ projectId: number; requestId: number } | null>(null);
-  const createWorktreeRequestSeqRef = useRef(0);
+
 
   const [activeBrowserScope, setActiveBrowserScope] = useState<BrowserScopeKey | null>(null);
   const [browserPanelVisibleScopeByProject, setBrowserPanelVisibleScopeByProject] = useState<Map<number, BrowserScopeKey>>(new Map());
@@ -1366,13 +1365,6 @@ function App() {
             onActivateAcpChat={restoreActiveAcpForProject}
             onRemoveAcpChat={removeAcpChatForProject}
             onOpenAcpChat={openAcpChat}
-            onCreateWorktree={(projectId) => {
-              createWorktreeRequestSeqRef.current += 1;
-              setSelectedProjectId(projectId);
-              setActiveTab(LeftSidebarTabEnum.SourceControl);
-              setConfig((prev) => prev ? withLeftSidebarTabOpen(prev, LeftSidebarTabEnum.SourceControl) : prev);
-              setCreateWorktreeRequest({ projectId, requestId: createWorktreeRequestSeqRef.current });
-            }}
             onOverlayOpenChange={setTerminalManagerOverlayOpen}
             onUpdateFilter={(terminalManagerFilter: TerminalManagerFilter) => {
               setConfig((prev) => prev ? withTerminalManagerFilter(prev, terminalManagerFilter) : prev);
@@ -1444,7 +1436,6 @@ function App() {
                 return next;
               });
             }}
-            autoOpenCreateRequestId={createWorktreeRequest?.projectId === selectedProject.id ? createWorktreeRequest.requestId : undefined}
           />
         )}
         {activeTab === LeftSidebarTabEnum.InputHistory && config && (

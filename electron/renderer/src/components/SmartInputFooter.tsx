@@ -569,6 +569,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
                 padding: '6px 8px',
                 color: '#ccc',
                 fontSize: 12,
+                fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
                 resize: 'none',
                 minHeight: 32,
                 maxHeight: 160,

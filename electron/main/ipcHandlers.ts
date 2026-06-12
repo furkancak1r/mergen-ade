@@ -157,8 +157,8 @@ export function registerIpcHandlers() {
   ipcMain.handle('acp:spawn', async (_event, opts: { projectId: number; cwd: string; mcpServers: string[]; tool?: string }) => {
     return spawnAcpChat(opts);
   });
-  ipcMain.handle('acp:send', async (_event, opts: { chatId: string; promptText: string; attachments: string[]; modeId?: string }) => {
-    sendAcpPrompt(opts.chatId, opts.promptText, opts.attachments, opts.modeId);
+  ipcMain.handle('acp:send', async (_event, opts: { chatId: string; promptText: string; attachments: string[]; modeId?: string; returnIndex?: number }) => {
+    sendAcpPrompt(opts.chatId, opts.promptText, opts.attachments, opts.modeId, opts.returnIndex);
   });
   ipcMain.handle('acp:cancel', async (_event, chatId: string) => {
     cancelAcpPrompt(chatId);

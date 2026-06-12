@@ -117,6 +117,7 @@ export function installCodexCli(): void {
     const proc = spawn('npm', ['install', '-g', '@openai/codex'], {
       stdio: 'inherit',
       windowsHide: true,
+      shell: process.platform === 'win32',
     });
     proc.on('exit', (code) => {
       if (code === 0) {

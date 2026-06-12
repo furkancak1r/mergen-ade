@@ -18,10 +18,9 @@ interface SourceControlProps {
   registeredWorktreePaths?: string[];
   onOrphanWorktrees?: (paths: string[]) => void;
   onBranchChange?: (branch: string) => void;
-  autoOpenCreateRequestId?: number;
 }
 
-export const SourceControl: React.FC<SourceControlProps> = ({ project, projects, selectedProjectId, onSelectProject, onAddWorktree, onRemoveWorktree, onDeleteGitWorktree, hasLiveTerminals, registeredWorktreePaths, onOrphanWorktrees, onBranchChange, autoOpenCreateRequestId }) => {
+export const SourceControl: React.FC<SourceControlProps> = ({ project, projects, selectedProjectId, onSelectProject, onAddWorktree, onRemoveWorktree, onDeleteGitWorktree, hasLiveTerminals, registeredWorktreePaths, onOrphanWorktrees, onBranchChange }) => {
   const [snapshot, setSnapshot] = useState<SourceControlSnapshot>({ loading: true, files: [], worktrees: [] });
   const [query, setQuery] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -33,7 +32,6 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
   const [worktreeContextMenu, setWorktreeContextMenu] = useState<{ x: number; y: number; branchName: string } | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const feedbackTimerRef = useRef<number | null>(null);
-  const lastAutoOpenCreateRequestRef = useRef<number | undefined>(undefined);
 
   const showFeedback = useCallback((message: string) => {
     setFeedback(message);
@@ -157,14 +155,6 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
   const createButton = sourceControlToolbarButtonMeta('createWorktree');
   const openFileFolderAction = sourceControlFileMenuActionMeta('openInFolder');
   const copyRelativePathAction = sourceControlFileMenuActionMeta('copyRelativePath');
-
-  useEffect(() => {
-    if (autoOpenCreateRequestId === undefined) return;
-    if (lastAutoOpenCreateRequestRef.current === autoOpenCreateRequestId) return;
-    if (snapshot.loading) return;
-    lastAutoOpenCreateRequestRef.current = autoOpenCreateRequestId;
-    openCreateWorktreeModal();
-  }, [autoOpenCreateRequestId, snapshot.loading, openCreateWorktreeModal]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', position: 'relative' }}>

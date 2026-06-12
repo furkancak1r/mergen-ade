@@ -93,7 +93,6 @@ interface TerminalManagerProps {
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number, tool?: string) => void;
-  onCreateWorktree?: (projectId: number) => void;
   onOverlayOpenChange?: (open: boolean) => void;
   onUpdateFilter?: (filter: TerminalManagerFilter) => void;
   onToggleHideInactiveProjects?: () => void;
@@ -116,7 +115,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onActivateAcpChat,
   onRemoveAcpChat,
   onOpenAcpChat,
-  onCreateWorktree,
   onOverlayOpenChange,
   onUpdateFilter,
   onToggleHideInactiveProjects,
@@ -439,7 +437,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 onActivateAcpChat={onActivateAcpChat}
                 onRemoveAcpChat={onRemoveAcpChat}
                 onOpenAcpChat={onOpenAcpChat}
-                onCreateWorktree={onCreateWorktree}
                 onPathContextMenu={openPathContextMenu}
                 historyPopupTerminalId={historyPopupTerminalId}
                 setHistoryPopupTerminalId={(id) => {
@@ -482,7 +479,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                     onActivateAcpChat={onActivateAcpChat}
                     onRemoveAcpChat={onRemoveAcpChat}
                     onOpenAcpChat={onOpenAcpChat}
-                    onCreateWorktree={onCreateWorktree}
                     onPathContextMenu={openPathContextMenu}
                     historyPopupTerminalId={historyPopupTerminalId}
                     setHistoryPopupTerminalId={(id) => {
@@ -573,7 +569,6 @@ interface ProjectGroupProps {
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number, tool?: string) => void;
-  onCreateWorktree?: (projectId: number) => void;
   onPathContextMenu?: (event: React.MouseEvent, project: ProjectRecord, kind: TerminalManagerPathContextKind) => void;
   historyPopupTerminalId: number | null;
   setHistoryPopupTerminalId: (id: number | null) => void;
@@ -611,7 +606,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   onActivateAcpChat,
   onRemoveAcpChat,
   onOpenAcpChat,
-  onCreateWorktree,
   onPathContextMenu,
   historyPopupTerminalId,
   setHistoryPopupTerminalId,
@@ -621,6 +615,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   const [hoveredRow, setHoveredRow] = useState<number | null>(null);
   const [hoveredProject, setHoveredProject] = useState(false);
   const [hoveredAcpRow, setHoveredAcpRow] = useState(false);
+  const [launcherMenuButtonRect, setLauncherMenuButtonRect] = useState<DOMRect | null>(null);
   const effectiveSavedMessages = isWorktree && rootProject ? rootProject.savedMessages : project.savedMessages;
   const hasSavedMessages = effectiveSavedMessages.length > 0;
   const hasLiveTerminals = terminals.length > 0;
@@ -694,7 +689,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
         }}>
           {project.name}
         </span>
-        {hoveredProject && showReadyDiff ? (
+        {filter === TerminalManagerFilterEnum.Foreground && hoveredProject && showReadyDiff ? (
           <span
             data-tooltip={diffTooltip}
             style={{
@@ -712,7 +707,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             <span style={{ color: '#64c38c' }}>+{diffSummary!.addedLines}</span>
             <span style={{ color: '#d47a7a' }}>-{diffSummary!.removedLines}</span>
           </span>
-        ) : hoveredProject && diffLabel ? (
+        ) : filter === TerminalManagerFilterEnum.Foreground && hoveredProject && diffLabel ? (
           <span
             data-tooltip={diffTooltip}
             style={{
@@ -730,7 +725,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
         {isWorktree && (
           <span style={{ fontSize: 10, color: withAlpha(ACCENT, 200), zIndex: 1, marginLeft: 4 }}>🌿</span>
         )}
-        <span style={{ fontSize: 10, color: withAlpha(TEXT_MUTED, 120), zIndex: 1, marginLeft: 4 }}>{terminals.length}</span>
 
         {/* Action buttons on hover for project header */}
         {hoveredProject && (
@@ -745,15 +739,11 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                     if (!expanded) {
                       onToggle();
                     }
-                    setShowLauncherMenu(showLauncherMenu === project.id ? null : project.id);
-                  }}
-                />
-                <IconButton
-                  icon="📁+"
-                  tooltip="Create Worktree"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCreateWorktree?.(project.id);
+                    const isOpening = showLauncherMenu !== project.id;
+                    setShowLauncherMenu(isOpening ? project.id : null);
+                    if (isOpening) {
+                      setLauncherMenuButtonRect(e.currentTarget.getBoundingClientRect());
+                    }
                   }}
                 />
               </>
@@ -777,11 +767,13 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
 
       {expanded && (
         <div>
-          {/* Launcher popup - positioned near header */}
+          {/* Launcher popup - positioned to the right of the panel */}
           {showLauncherMenu === project.id && (
             <div style={{
               position: 'fixed',
               zIndex: 20,
+              top: launcherMenuButtonRect ? launcherMenuButtonRect.top : 100,
+              left: Math.max(8, panelRight + 8),
               background: SURFACE_BG,
               border: `1px solid ${BORDER_COLOR}`,
               borderRadius: 4,
@@ -862,12 +854,16 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             return (
               <div data-saved-popup style={{
                 position: 'fixed',
+                top: 100,
+                left: Math.max(8, panelRight + 8),
                 zIndex: 20,
                 background: SURFACE_BG,
                 border: `1px solid ${BORDER_COLOR}`,
                 borderRadius: 4,
                 padding: '4px 0',
                 width: 200,
+                maxHeight: 300,
+                overflowY: 'auto',
                 boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
               }}>
                 {msgs.length === 0 && (
@@ -1051,7 +1047,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                     w += CONTROL_ROW_HEIGHT; count += 1; // kill
                     if (t.kind === 'background') {
                       w += CONTROL_ROW_HEIGHT; count += 1; // rerun
-                      if (effectiveSavedMessages.length > 0) { w += TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH; count += 1; }
+                      w += TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH; count += 1; // saved messages
                     } else {
                       if (t.recentInputs.length > 0) { w += CONTROL_ROW_HEIGHT; count += 1; }
                       w += TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH; count += 1; // tasks
@@ -1059,7 +1055,37 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                     return w + (count - 1) * 2;
                   })();
                   return (
-                    <div style={{ display: 'flex', gap: 2, zIndex: 1, minWidth: actionMinWidth, visibility: actionVisible ? 'visible' : 'hidden' }}>
+                    <div style={{ display: 'flex', gap: 2, zIndex: 1, minWidth: actionMinWidth }}>
+                      {/* Saved messages button — always visible for background terminals */}
+                      {t.kind === 'background' && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShowSavedMessages(showSavedMessages === t.id ? null : t.id);
+                          }}
+                          style={{
+                            padding: '1px 4px',
+                            fontSize: 10,
+                            background: 'transparent',
+                            border: '1px solid #444',
+                            color: effectiveSavedMessages.length > 0 ? TEXT_MUTED : '#555',
+                            borderRadius: 3,
+                            cursor: 'pointer',
+                            flexShrink: 0,
+                            width: TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH,
+                            height: CONTROL_ROW_HEIGHT - 4,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            opacity: effectiveSavedMessages.length > 0 ? 1 : 0.5,
+                          }}
+                          data-tooltip={effectiveSavedMessages.length > 0 ? 'Send saved message' : 'No saved messages'}
+                        >
+                          💬
+                        </button>
+                      )}
+                      {/* Remaining action buttons — visible only on hover/active */}
+                      <div style={{ display: 'flex', gap: 2, visibility: actionVisible ? 'visible' : 'hidden' }}>
                       {t.kind === 'background' && (
                         <button
                           onClick={(e) => {
@@ -1113,32 +1139,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                           🕒
                         </button>
                       )}
-                      {t.kind === 'background' && effectiveSavedMessages.length > 0 && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setShowSavedMessages(showSavedMessages === t.id ? null : t.id);
-                          }}
-                          style={{
-                            padding: '1px 4px',
-                            fontSize: 10,
-                            background: 'transparent',
-                            border: '1px solid #444',
-                            color: TEXT_MUTED,
-                            borderRadius: 3,
-                            cursor: 'pointer',
-                            flexShrink: 0,
-                            width: TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH,
-                            height: CONTROL_ROW_HEIGHT - 4,
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                          }}
-                          data-tooltip="Send saved message"
-                        >
-                          💬
-                        </button>
-                      )}
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
@@ -1163,6 +1163,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                       >
                         ✕
                       </button>
+                      </div>
                     </div>
                   );
                 })()}

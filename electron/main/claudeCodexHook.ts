@@ -235,6 +235,7 @@ async function runTestCommand(projectPath: string, command: TestCommand): Promis
         cwd: projectPath,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
+        shell: process.platform === 'win32',
       });
     } catch (error) {
       resolve({
@@ -315,10 +316,27 @@ async function runCodexExec(projectPath: string, prompt: string): Promise<{ ok: 
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(program, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true,
-      });
+      // On Windows, .cmd files require shell:true. Stdin piping through
+      // cmd.exe doesn't work, so pass prompt via temp file + shell redirect.
+      if (process.platform === 'win32') {
+        const tmpFile = path.join(os.tmpdir(), `mergen-codex-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+        fs.writeFileSync(tmpFile, prompt, 'utf-8');
+        const quotedArgs = args.map((a) => `"${a}"`).join(' ');
+        child = spawn(`"${program}" ${quotedArgs} < "${tmpFile}"`, [], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+          shell: true,
+        });
+        const cleanup = () => { try { fs.unlinkSync(tmpFile); } catch { /* ignore */ } };
+        child.on('exit', cleanup);
+        child.on('error', cleanup);
+      } else {
+        child = spawn(program, args, {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          windowsHide: true,
+        });
+        child.stdin?.end(prompt);
+      }
     } catch (error) {
       resolve({ ok: false, error: `Failed to start Codex CLI at ${program}: ${error instanceof Error ? error.message : String(error)}` });
       return;
@@ -345,7 +363,6 @@ async function runCodexExec(projectPath: string, prompt: string): Promise<{ ok: 
         error: `Codex CLI exited with ${code ?? signal ?? 'unknown'}.\nstdout:\n${cleanStdout}\nstderr:\n${cleanStderr}`,
       });
     });
-    child.stdin?.end(prompt);
   });
 }
 

@@ -802,7 +802,7 @@ export function restoreAcpQueuedPrompt(chatId: string, index: number, prompt: Qu
   return true;
 }
 
-export function sendAcpPrompt(chatId: string, promptText: string, attachments: string[], modeId?: string): void {
+export function sendAcpPrompt(chatId: string, promptText: string, attachments: string[], modeId?: string, returnIndex?: number): void {
   const session = sessions.get(chatId);
   if (!session) return;
 
@@ -819,7 +819,13 @@ export function sendAcpPrompt(chatId: string, promptText: string, attachments: s
   const shouldQueue = !session.sessionId || session.status === 'starting' || session.status === 'session_created' || session.status === 'running' || session.status === 'permission';
   if (shouldQueue) {
     updateAcpChatTitleFromPrompt(session, fullText);
-    session.queuedPrompts.push({ text: promptText, attachments, modeId: effectiveModeId, finalPromptText: fullText });
+    const entry = { text: promptText, attachments, modeId: effectiveModeId, finalPromptText: fullText };
+    if (returnIndex !== undefined && returnIndex >= 0) {
+      const insertAt = Math.min(returnIndex, session.queuedPrompts.length);
+      session.queuedPrompts.splice(insertAt, 0, entry);
+    } else {
+      session.queuedPrompts.push(entry);
+    }
     broadcast('acp:event', chatId, { type: 'queued', count: session.queuedPrompts.length, queuedPrompts: session.queuedPrompts.length });
     return;
   }

@@ -21,7 +21,7 @@
 ## Build, Test, and Development Commands
 - `cd electron && npm ci`: install primary Electron dependencies.
 - `cd electron && npx vitest run`: run Electron renderer/main/shared unit tests.
-- `cd electron && npm run build`: build and package the primary Electron app. Produces single portable EXE at `electron/out/mergen-ade-<version>-windows-x64-portable.exe`.
+- `cd electron && npm run build`: build and package the primary Electron app. Produces single portable EXE at `electron/out/Mergen ADE.exe`.
 
 ## Coding Style & Naming Conventions
 - TypeScript, UTF-8, LF/CRLF handled by Git.

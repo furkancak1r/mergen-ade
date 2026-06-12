@@ -55,7 +55,7 @@
           "arch": ["x64"]
         }
       ],
-      "artifactName": "mergen-ade-${version}-windows-x64-portable.${ext}"
+      "artifactName": "Mergen ADE.${ext}"
     },
     "mac": {
       "target": [

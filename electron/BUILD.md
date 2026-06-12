@@ -4,7 +4,7 @@
 
 | Target | Output | Format |
 |--------|--------|--------|
-| Windows x64 | `mergen-ade-<version>-windows-x64-portable.exe` | Single portable EXE |
+| Windows x64 | `Mergen ADE.exe` | Single portable EXE |
 | macOS ARM64 | `mergen-ade-<version>-macos-arm64.dmg` | Signed & notarized DMG |
 
 ## Quick Build (Windows)
@@ -15,7 +15,7 @@ npm ci
 npm run build
 ```
 
-Output: `electron/out/mergen-ade-<version>-windows-x64-portable.exe`
+Output: `electron/out/Mergen ADE.exe`
 
 ## Build Steps
 
@@ -37,7 +37,7 @@ Output: `electron/out/mergen-ade-<version>-windows-x64-portable.exe`
 
 3. **Output location**
    ```
-   electron/out/mergen-ade-<version>-windows-x64-portable.exe
+   electron/out/Mergen ADE.exe
    ```
 
 ## Build Configuration
@@ -56,7 +56,7 @@ Build settings are in `electron/package.json` under `"build"`:
           "arch": ["x64"]
         }
       ],
-      "artifactName": "mergen-ade-${version}-windows-x64-portable.${ext}"
+      "artifactName": "Mergen ADE.${ext}"
     }
   }
 }
@@ -68,7 +68,7 @@ Build settings are in `electron/package.json` under `"build"`:
 |---------|-------|-------------|
 | `target` | `portable` | Single EXE, no installer |
 | `arch` | `x64` | 64-bit Windows only |
-| `artifactName` | `mergen-ade-${version}-...` | Version-stamped filename |
+| `artifactName` | `Mergen ADE.${ext}` | Clean filename |
 
 ## Portable EXE Details
 
@@ -171,7 +171,7 @@ This builds and publishes:
 electron/
 ├── out/
 │   ├── win-unpacked/          # Unpacked app files
-│   └── mergen-ade-0.1.40-windows-x64-portable.exe
+│   └── Mergen ADE.exe
 ├── renderer/
 │   ├── dist/                  # Bundled renderer
 │   └── dist-electron/         # Bundled main process

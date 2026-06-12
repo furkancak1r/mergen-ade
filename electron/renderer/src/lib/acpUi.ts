@@ -36,7 +36,7 @@ export interface AcpTerminalManagerBadgeVisual {
   color: string;
 }
 
-export const ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS = 2;
+export const ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS = 4;
 export const ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS = 96;
 export const ACP_CHAT_TITLE_MAX_CHARS = 72;
 export const OPENCODE_ACP_LABEL = 'OpenCode ACP';

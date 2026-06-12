@@ -225,11 +225,11 @@ describe('acpUi', () => {
       { modeId: 'plan' },
     ];
 
-    expect(ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS).toBe(2);
+    expect(ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS).toBe(4);
     expect(acpQueuedPromptHeaderLabel(prompts.length)).toBe('Queued 3');
     expect(acpQueuedPromptHeaderLabel(prompts.length, 1)).toBe('Editing queued #2');
     expect(acpQueuedPromptPlanCount(prompts)).toBe(2);
-    expect(acpQueuedPromptVisibleRowCount(prompts.length, true)).toBe(2);
+    expect(acpQueuedPromptVisibleRowCount(prompts.length, true)).toBe(3);
     expect(acpQueuedPromptVisibleRowCount(prompts.length, false)).toBe(0);
     expect(acpQueuedPromptIndexLabel(0)).toBe('1.');
     expect(acpQueuedPromptIndexLabel(2)).toBe('3.');

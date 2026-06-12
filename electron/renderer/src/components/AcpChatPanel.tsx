@@ -74,9 +74,12 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [customAnswer, setCustomAnswer] = useState('');
   const [questionAnswers, setQuestionAnswers] = useState<Record<number, string>>({});
   const [slashCommandItemsState, setSlashCommandItemsState] = useState<AcpSlashCommandItem[]>([]);
+  const [slashCommandSelectedIndex, setSlashCommandSelectedIndex] = useState(0);
   const [queuedPromptEditReturn, setQueuedPromptEditReturn] = useState<QueuedPromptEditReturn | null>(null);
   const [queueStatusMessage, setQueueStatusMessage] = useState<string | null>(null);
   const [queueExpanded, setQueueExpanded] = useState(true);
+  const [dragSourceIndex, setDragSourceIndex] = useState<number | null>(null);
+  const [dragTargetIndex, setDragTargetIndex] = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modeDropdownRef = useRef<HTMLDivElement>(null);
@@ -93,6 +96,31 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     const s = await api.invoke('acp:getSession', chatId) as AcpChatSession | null;
     setSession(s);
   }, [chatId]);
+
+  const handleDragStart = useCallback((index: number) => {
+    setDragSourceIndex(index);
+  }, []);
+
+  const handleDragOver = useCallback((_e: React.DragEvent, index: number) => {
+    setDragTargetIndex(index);
+  }, []);
+
+  const handleDrop = useCallback((targetIndex: number) => {
+    setSession(prev => {
+      if (!prev || dragSourceIndex === null || dragSourceIndex === targetIndex) return prev;
+      const msgs = [...prev.messages];
+      const [moved] = msgs.splice(dragSourceIndex, 1);
+      msgs.splice(targetIndex, 0, moved);
+      return { ...prev, messages: msgs };
+    });
+    setDragSourceIndex(null);
+    setDragTargetIndex(null);
+  }, [dragSourceIndex]);
+
+  const handleDragEnd = useCallback(() => {
+    setDragSourceIndex(null);
+    setDragTargetIndex(null);
+  }, []);
 
   useEffect(() => {
     refreshSession();
@@ -195,11 +223,21 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   useEffect(() => {
     if (!input.startsWith('/')) {
       setSlashCommandItemsState([]);
+      setSlashCommandSelectedIndex(0);
       return;
     }
     const availableCommands = session?.availableCommands ?? [];
-    setSlashCommandItemsState(slashCommandItemsForComposer(availableCommands, input, actionControlsEnabled(session)));
+    const items = slashCommandItemsForComposer(availableCommands, input, actionControlsEnabled(session));
+    setSlashCommandItemsState(items);
+    setSlashCommandSelectedIndex((prev) => (prev >= items.length ? Math.max(0, items.length - 1) : prev));
   }, [input, session?.availableCommands, session?.sessionId]);
+
+  // Clear blocked-edit message when the composer becomes empty
+  useEffect(() => {
+    if (queueStatusMessage && input.trim().length === 0 && attachments.length === 0 && !queuedPromptEditReturn) {
+      setQueueStatusMessage(null);
+    }
+  }, [input, attachments, queueStatusMessage, queuedPromptEditReturn]);
 
   useEffect(() => {
     if (disabled) return;
@@ -207,6 +245,11 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
         if (modeDropdownOpen) {
           setModeDropdownOpen(false);
+          return;
+        }
+        if (slashCommandItemsState.length > 0) {
+          setSlashCommandItemsState([]);
+          setSlashCommandSelectedIndex(0);
           return;
         }
         if (session?.status === 'running' || session?.status === 'permission') {
@@ -217,13 +260,22 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
         if (document.activeElement === inputRef.current) {
           e.preventDefault();
-          toggleMode();
+          if (slashCommandItemsState.length > 0) {
+            const selected = slashCommandItemsState[slashCommandSelectedIndex];
+            if (selected) {
+              setInput(selected.hint + ' ');
+              setSlashCommandItemsState([]);
+              setSlashCommandSelectedIndex(0);
+            }
+          } else {
+            toggleMode();
+          }
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [session?.status, disabled, modeDropdownOpen]);
+  }, [session?.status, disabled, modeDropdownOpen, slashCommandItemsState, slashCommandSelectedIndex]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -238,12 +290,13 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const send = useCallback(async () => {
     if (!input.trim() && attachments.length === 0) return;
     const text = input.trim();
-    await api.invoke('acp:send', { chatId, promptText: text, attachments, modeId: session?.currentModeId });
+    const returnIndex = queuedPromptEditReturn?.index;
+    await api.invoke('acp:send', { chatId, promptText: text, attachments, modeId: session?.currentModeId, returnIndex });
     setInput('');
     setAttachments([]);
     setQueuedPromptEditReturn(null);
     setQueueStatusMessage(null);
-  }, [chatId, input, attachments, session?.currentModeId]);
+  }, [chatId, input, attachments, session?.currentModeId, queuedPromptEditReturn]);
 
   const cancelAcp = useCallback(async () => {
     await api.invoke('acp:cancel', chatId);
@@ -324,7 +377,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const queuePlanCount = acpQueuedPromptPlanCount(queuedPrompts);
   const queueHeaderLabel = acpQueuedPromptHeaderLabel(queuedPrompts.length, queuedPromptEditReturn?.index);
   const queueVisibleRows = acpQueuedPromptVisibleRowCount(queuedPrompts.length, queueExpanded);
-  const queueRowsMaxHeight = queueVisibleRows * 48;
+  const queueRowsMaxHeight = queueVisibleRows * 35;
 
   const submitPendingInteraction = async () => {
     if (!pendingQuestion) return;
@@ -465,11 +518,19 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
             </div>
           </div>
         ) : (
-          <>
+          <div onDragEnd={handleDragEnd}>
             {session?.messages.map((msg, i) => (
-              <MessageBubble key={i} message={msg} />
+              <MessageBubble
+                key={i}
+                message={msg}
+                index={i}
+                onDragStart={handleDragStart}
+                onDragOver={handleDragOver}
+                onDrop={handleDrop}
+                isDragTarget={dragTargetIndex === i && dragSourceIndex !== i}
+              />
             ))}
-          </>
+          </div>
         )}
         <div ref={messagesEndRef} />
       </div>
@@ -496,7 +557,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
                 title="Collapse or expand queued ACP messages"
                 style={queuedPromptHeaderButtonStyle}
               >
-                {queueExpanded ? 'Hide' : 'Show'}
+                {queueExpanded ? '▼' : '▲'}
               </button>
             ) : null}
           </div>
@@ -528,11 +589,18 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               {slashCommandItemsState.map((item, i) => (
               <button
                 key={i}
+                onMouseEnter={() => setSlashCommandSelectedIndex(i)}
                 onClick={() => {
                   setInput(item.hint + ' ');
+                  setSlashCommandItemsState([]);
+                  setSlashCommandSelectedIndex(0);
                   inputRef.current?.focus();
                 }}
-                style={slashCommandRowStyle}
+                style={{
+                  ...slashCommandRowStyle,
+                  background: i === slashCommandSelectedIndex ? '#2a2a2a' : 'transparent',
+                  borderRadius: 4,
+                }}
               >
                 <span style={{ color: '#6fb4ff', fontWeight: 600, flexShrink: 0 }}>{item.hint}</span>
                 {item.description && (
@@ -634,10 +702,44 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
           </div>
 
           <textarea
-            ref={inputRef}
+            ref={(el) => {
+              // @ts-ignore
+              inputRef.current = el;
+              if (el) {
+                el.style.height = 'auto';
+                el.style.height = Math.min(el.scrollHeight, 100) + 'px';
+              }
+            }}
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onInput={(e) => {
+              const el = e.currentTarget;
+              el.style.height = 'auto';
+              el.style.height = Math.min(el.scrollHeight, 100) + 'px';
+            }}
             onKeyDown={(e) => {
+              if (slashCommandItemsState.length > 0) {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setSlashCommandSelectedIndex((prev) => Math.min(prev + 1, slashCommandItemsState.length - 1));
+                  return;
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setSlashCommandSelectedIndex((prev) => Math.max(prev - 1, 0));
+                  return;
+                }
+                if (e.key === 'Enter' && !e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
+                  e.preventDefault();
+                  const selected = slashCommandItemsState[slashCommandSelectedIndex];
+                  if (selected) {
+                    setInput(selected.hint + ' ');
+                    setSlashCommandItemsState([]);
+                    setSlashCommandSelectedIndex(0);
+                  }
+                  return;
+                }
+              }
               if (e.key === 'Enter' && !e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
                 e.preventDefault();
                 if (hasDraft) send();
@@ -655,10 +757,13 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               color: '#ccc',
               fontSize: 13,
               resize: 'none',
-              minHeight: 28,
-              maxHeight: 120,
+              lineHeight: '20px',
+              minHeight: 20,
+              maxHeight: 100,
               outline: 'none',
-              padding: '0 4px',
+              padding: '4px',
+              transition: 'height 0.15s ease',
+              overflowY: 'auto',
             }}
             rows={1}
           />
@@ -807,25 +912,60 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   );
 };
 
-const MessageBubble: React.FC<{ message: AcpChatMessage }> = ({ message }) => {
+const MessageBubble: React.FC<{
+  message: AcpChatMessage;
+  index: number;
+  onDragStart: (index: number) => void;
+  onDragOver: (e: React.DragEvent, index: number) => void;
+  onDrop: (index: number) => void;
+  isDragTarget: boolean;
+}> = ({ message, index, onDragStart, onDragOver, onDrop, isDragTarget }) => {
   const isUser = message.role === 'user';
   return (
-    <div style={{
-      display: 'flex',
-      justifyContent: isUser ? 'flex-end' : 'flex-start',
-      marginBottom: 8,
-    }}>
-      <div style={{
-        maxWidth: '80%',
-        padding: '8px 12px',
-        borderRadius: 12,
-        background: isUser ? '#1f3a4c' : '#1a1a1a',
-        color: '#ccc',
-        fontSize: 13,
-        whiteSpace: 'pre-wrap',
-        wordBreak: 'break-word',
-      }}>
-        {message.text}
+    <div
+      style={{
+        display: 'flex',
+        justifyContent: isUser ? 'flex-end' : 'flex-start',
+        marginBottom: 8,
+        borderTop: isDragTarget ? '2px solid #4a9eff' : '2px solid transparent',
+        transition: 'border-color 0.15s',
+      }}
+      onDragOver={(e) => { e.preventDefault(); onDragOver(e, index); }}
+      onDrop={() => onDrop(index)}
+    >
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 4, flexDirection: isUser ? 'row-reverse' : 'row' }}>
+        <div
+          draggable
+          onDragStart={() => onDragStart(index)}
+          style={{
+            cursor: 'grab',
+            color: '#555',
+            fontSize: 12,
+            padding: '6px 2px',
+            userSelect: 'none',
+            lineHeight: 1,
+            opacity: 0.6,
+            flexShrink: 0,
+          }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; (e.currentTarget as HTMLElement).style.color = '#999'; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6'; (e.currentTarget as HTMLElement).style.color = '#555'; }}
+          title="Drag to reorder"
+        >
+          ⋮⋮
+        </div>
+        <div style={{
+          maxWidth: '80%',
+          padding: '8px 12px',
+          borderRadius: 12,
+          background: isUser ? '#1f3a4c' : '#1a1a1a',
+          color: '#ccc',
+          fontSize: 13,
+          fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        }}>
+          {message.text}
+        </div>
       </div>
     </div>
   );
@@ -844,7 +984,7 @@ const QueuedPromptRow: React.FC<{
   const attachmentLabel = acpQueuedPromptAttachmentLabel(prompt.attachments.length);
   const preview = queuedPromptPreview(prompt);
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 44, padding: '8px 10px', background: '#1a1a1a', borderRadius: 8, marginBottom: 4, fontSize: 12, color: '#888' }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minHeight: 32, padding: '4px 8px', background: '#1a1a1a', borderRadius: 6, marginBottom: 3, fontSize: 12, color: '#888' }}>
       {indexLabel && <span style={{ color: '#666', fontWeight: 600, flexShrink: 0 }}>{indexLabel}</span>}
       {modeLabel && (
         <span style={{ fontSize: 10, color: '#dca046', flexShrink: 0 }}>{modeLabel}</span>
@@ -861,24 +1001,11 @@ const QueuedPromptRow: React.FC<{
       )}
       <button
         onClick={() => onRunNext(index)}
-        title="Run next"
-        style={queuedPromptActionStyle}
+        title="Send now"
+        style={{ ...queuedPromptActionStyle, width: 'auto', padding: '0 6px', gap: 3, color: '#8bc34a' }}
       >
-        →
-      </button>
-      <button
-        onClick={() => onEdit(index, prompt)}
-        title="Edit queued prompt"
-        style={queuedPromptActionStyle}
-      >
-        ✎
-      </button>
-      <button
-        onClick={() => onDelete(index)}
-        title="Delete"
-        style={{ ...queuedPromptActionStyle, color: '#b98787' }}
-      >
-        ✕
+        <span style={{ fontSize: 11 }}>↑</span>
+        <span style={{ fontSize: 10 }}>Send Now</span>
       </button>
     </div>
   );

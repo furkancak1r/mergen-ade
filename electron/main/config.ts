@@ -76,14 +76,30 @@ export function loadConfig(): AppConfig {
   return config;
 }
 
+function normalizeLegacyProject(raw: Record<string, unknown>): ProjectRecord {
+  return {
+    id: typeof raw.id === 'number' ? raw.id : 0,
+    name: typeof raw.name === 'string' ? raw.name : '',
+    path: typeof raw.path === 'string' ? raw.path : '',
+    savedMessages: Array.isArray(raw.savedMessages) ? raw.savedMessages
+      : Array.isArray(raw.saved_messages) ? raw.saved_messages as unknown as string[]
+      : [],
+    aiConfig: (raw.aiConfig ?? raw.ai_config ?? { hooksEnabled: false, toolOverrides: {} }) as ProjectRecord['aiConfig'],
+    checklist: Array.isArray(raw.checklist) ? raw.checklist : [],
+    browserLastUrl: (raw.browserLastUrl ?? raw.browser_last_url) as string | undefined,
+    isWorktree: Boolean(raw.isWorktree ?? raw.is_worktree),
+  };
+}
+
 function mergeLegacyTomlProjects(jsonConfig: AppConfig): { config: AppConfig; merged: boolean } {
   const legacyPath = legacyConfigPath();
   if (!fs.existsSync(legacyPath)) return { config: jsonConfig, merged: false };
   try {
     const text = fs.readFileSync(legacyPath, 'utf-8');
-    const legacy = parseToml(text) as unknown as AppConfig;
-    const legacyProjects: ProjectRecord[] = legacy.projects ?? [];
-    if (legacyProjects.length === 0) return { config: jsonConfig, merged: false };
+    const legacy = parseToml(text) as unknown as { projects?: Record<string, unknown>[] };
+    const rawLegacyProjects: Record<string, unknown>[] = legacy.projects ?? [];
+    if (rawLegacyProjects.length === 0) return { config: jsonConfig, merged: false };
+    const legacyProjects: ProjectRecord[] = rawLegacyProjects.map(normalizeLegacyProject);
 
     const normalize = (p: string) => normalizeWindowsVerbatimPath(p).replace(/[\\/]+$/, '').toLowerCase();
     const existingPaths = new Set(jsonConfig.projects.map((p) => normalize(p.path)));
@@ -105,6 +121,10 @@ function mergeLegacyTomlProjects(jsonConfig: AppConfig): { config: AppConfig; me
             existing.checklist = legacyProject.checklist;
             merged = true;
           }
+        }
+        if (!existing.browserLastUrl && legacyProject.browserLastUrl) {
+          existing.browserLastUrl = legacyProject.browserLastUrl;
+          merged = true;
         }
       } else if (existingPaths.has(legacyPathNorm)) {
         // Duplicate path, skip

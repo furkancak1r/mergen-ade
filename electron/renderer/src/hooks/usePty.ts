@@ -412,6 +412,18 @@ export function usePty() {
     return 0;
   }, []);
 
+  const pushRecentInput = useCallback((terminalId: number, message: string) => {
+    const t = terminalsRef.current.get(terminalId);
+    if (!t) return;
+    const trimmed = message.trim();
+    if (!trimmed || trimmed.startsWith('/')) return;
+    t.recentInputs.unshift(trimmed);
+    if (t.recentInputs.length > 20) {
+      t.recentInputs.pop();
+    }
+    notify();
+  }, [notify]);
+
   // Auto-dispatch timer for Smart Input After Done tasks + delayed enters
   useEffect(() => {
     const interval = setInterval(() => {
@@ -505,6 +517,11 @@ export function usePty() {
 
         const payloadDelay = writeSmartInputPayload(t, task.text, task.attachments, task.modeId);
 
+        // Record recent input directly (bracketed paste is filtered from PTY history tracking)
+        if (task.text.trim()) {
+          pushRecentInput(t.id, task.text);
+        }
+
         // Schedule two confirmation Enters after 600ms and 1200ms
         t.pendingDelayedEnters.push(now + payloadDelay + 600);
         t.pendingDelayedEnters.push(now + payloadDelay + 1200);
@@ -512,7 +529,7 @@ export function usePty() {
       }
     }, 100);
     return () => clearInterval(interval);
-  }, [notify, writeSmartInputPayload]);
+  }, [notify, pushRecentInput, writeSmartInputPayload]);
 
   const getTerminals = useCallback(() => {
     return Array.from(terminalsRef.current.values());
@@ -557,18 +574,6 @@ export function usePty() {
     const t = terminalsRef.current.get(terminalId);
     if (!t) return;
     t.claudeCodexHookProgress = progress;
-    notify();
-  }, [notify]);
-
-  const pushRecentInput = useCallback((terminalId: number, message: string) => {
-    const t = terminalsRef.current.get(terminalId);
-    if (!t) return;
-    const trimmed = message.trim();
-    if (!trimmed || trimmed.startsWith('/')) return;
-    t.recentInputs.unshift(trimmed);
-    if (t.recentInputs.length > 20) {
-      t.recentInputs.pop();
-    }
     notify();
   }, [notify]);
 

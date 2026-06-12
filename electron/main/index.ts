@@ -20,7 +20,7 @@ function createWindow() {
     height: 980,
     minWidth: 980,
     minHeight: 620,
-    title: 'Mergen ADE',
+    title: '',
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
