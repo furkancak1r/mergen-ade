@@ -3,7 +3,7 @@ import { defaultAppConfig, LeftSidebarTab, TerminalManagerFilter } from '../../.
 import { activityRailItem, activityRailItems, isLeftSidebarTabActive, withLeftSidebarRailToggle, withLeftSidebarTabOpen } from './activityRail';
 
 describe('activityRail', () => {
-  it('keeps the Rust activity rail order and tooltip copy', () => {
+  it('keeps the activity rail order and tooltip copy', () => {
     expect(activityRailItems.map((item) => item.id)).toEqual([
       'directory',
       'sourceControl',
@@ -13,10 +13,10 @@ describe('activityRail', () => {
       'checklist',
       'settings',
     ]);
-    expect(activityRailItem('directory')).toMatchObject({ icon: '▦', title: 'Open Directory', tab: LeftSidebarTab.Directory });
-    expect(activityRailItem('sourceControl')).toMatchObject({ icon: '⑂', title: 'Open Source Control', tab: LeftSidebarTab.SourceControl });
-    expect(activityRailItem('terminalManager')).toMatchObject({ icon: '>_', title: 'Open Terminal Manager', tab: LeftSidebarTab.TerminalManager });
-    expect(activityRailItem('inputHistory')).toMatchObject({ icon: '◷', title: 'Open Input History', tab: LeftSidebarTab.InputHistory });
+    expect(activityRailItem('directory')).toMatchObject({ icon: '▦', title: 'Directory', tab: LeftSidebarTab.Directory });
+    expect(activityRailItem('sourceControl')).toMatchObject({ icon: '⑂', title: 'Source Control', tab: LeftSidebarTab.SourceControl });
+    expect(activityRailItem('terminalManager')).toMatchObject({ icon: '>_', title: 'Terminal Manager', tab: LeftSidebarTab.TerminalManager });
+    expect(activityRailItem('inputHistory')).toMatchObject({ icon: '◷', title: 'Input History', tab: LeftSidebarTab.InputHistory });
     expect(activityRailItem('browser')).toMatchObject({ icon: '◎', title: 'Toggle Browser Panel' });
     expect(activityRailItem('checklist')).toMatchObject({ icon: '✓', title: 'Toggle Check-list' });
     expect(activityRailItem('settings')).toMatchObject({ icon: '⚙', title: 'Settings' });

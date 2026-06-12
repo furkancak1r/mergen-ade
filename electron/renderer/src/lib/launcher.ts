@@ -5,12 +5,12 @@ const PERMISSION_MODE_FLAG = '--permission-mode';
 const DANGEROUS_SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions';
 
 export const launcherBypassPermissionsEffective = (launcher: LauncherEntry): boolean => {
-  if (launcher.builtin === BuiltinLauncherKind.Claude) return true;
+  if (launcher.builtin === BuiltinLauncherKind.Claude || launcher.builtin === BuiltinLauncherKind.ClaudeAcp) return true;
   return launcher.bypassPermissions ?? false;
 };
 
 export const effectiveLauncherCommand = (launcher: LauncherEntry, shell: ShellKind): string => {
-  if (launcher.builtin !== BuiltinLauncherKind.Claude || !launcherBypassPermissionsEffective(launcher)) {
+  if ((launcher.builtin !== BuiltinLauncherKind.Claude && launcher.builtin !== BuiltinLauncherKind.ClaudeAcp) || !launcherBypassPermissionsEffective(launcher)) {
     return launcher.launchCommand;
   }
   return sanitizedClaudeLaunchCommand(shell, launcher.launchCommand);

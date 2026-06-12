@@ -9,10 +9,10 @@ export interface ActivityRailItem {
 }
 
 export const activityRailItems: ActivityRailItem[] = [
-  { id: 'directory', icon: '▦', title: 'Open Directory', tab: LeftSidebarTab.Directory },
-  { id: 'sourceControl', icon: '⑂', title: 'Open Source Control', tab: LeftSidebarTab.SourceControl },
-  { id: 'terminalManager', icon: '>_', title: 'Open Terminal Manager', tab: LeftSidebarTab.TerminalManager },
-  { id: 'inputHistory', icon: '◷', title: 'Open Input History', tab: LeftSidebarTab.InputHistory },
+  { id: 'directory', icon: '▦', title: 'Directory', tab: LeftSidebarTab.Directory },
+  { id: 'sourceControl', icon: '⑂', title: 'Source Control', tab: LeftSidebarTab.SourceControl },
+  { id: 'terminalManager', icon: '>_', title: 'Terminal Manager', tab: LeftSidebarTab.TerminalManager },
+  { id: 'inputHistory', icon: '◷', title: 'Input History', tab: LeftSidebarTab.InputHistory },
   { id: 'browser', icon: '◎', title: 'Toggle Browser Panel' },
   { id: 'checklist', icon: '✓', title: 'Toggle Check-list' },
   { id: 'settings', icon: '⚙', title: 'Settings' },

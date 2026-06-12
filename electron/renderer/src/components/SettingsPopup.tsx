@@ -404,7 +404,7 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
               <div style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>Foreground Launchers</div>
               {draft.launchers.map((launcher, i) => {
                 const isBuiltin = Boolean(launcher.builtin);
-                const isClaude = launcher.builtin === BuiltinLauncherKind.Claude;
+                const isClaude = launcher.builtin === BuiltinLauncherKind.Claude || launcher.builtin === BuiltinLauncherKind.ClaudeAcp;
                 const stem = launcherCommandStem(launcher.launchCommand);
                 const displayNameMissing = launcher.displayName.trim().length === 0;
                 const commandMissing = launcher.launchCommand.trim().length === 0;

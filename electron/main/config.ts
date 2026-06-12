@@ -322,7 +322,7 @@ export function normalizeWindowsVerbatimPath(p: string): string {
 
 function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
   const normalized: LauncherEntry[] = [];
-  for (const builtin of [BuiltinLauncherKind.OpenCode, BuiltinLauncherKind.Codex, BuiltinLauncherKind.Droid, BuiltinLauncherKind.Claude]) {
+  for (const builtin of [BuiltinLauncherKind.OpenCode, BuiltinLauncherKind.OpenCodeAcp, BuiltinLauncherKind.Codex, BuiltinLauncherKind.Droid, BuiltinLauncherKind.Claude, BuiltinLauncherKind.ClaudeAcp]) {
     const existing = entries.find((e) => e.builtin === builtin || e.id === builtin);
     if (existing) {
       normalized.push({
@@ -337,6 +337,8 @@ function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
             case BuiltinLauncherKind.Claude: return LauncherIconKey.Claude;
             case BuiltinLauncherKind.Droid: return LauncherIconKey.Droid;
             case BuiltinLauncherKind.OpenCode: return LauncherIconKey.OpenCode;
+            case BuiltinLauncherKind.OpenCodeAcp: return LauncherIconKey.OpenCode;
+            case BuiltinLauncherKind.ClaudeAcp: return LauncherIconKey.Claude;
           }
         })(),
         bypassPermissions: existing.bypassPermissions,
@@ -354,9 +356,11 @@ function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
             case BuiltinLauncherKind.Claude: return LauncherIconKey.Claude;
             case BuiltinLauncherKind.Droid: return LauncherIconKey.Droid;
             case BuiltinLauncherKind.OpenCode: return LauncherIconKey.OpenCode;
+            case BuiltinLauncherKind.OpenCodeAcp: return LauncherIconKey.OpenCode;
+            case BuiltinLauncherKind.ClaudeAcp: return LauncherIconKey.Claude;
           }
         })(),
-        bypassPermissions: builtin === BuiltinLauncherKind.Claude,
+        bypassPermissions: builtin === BuiltinLauncherKind.Claude || builtin === BuiltinLauncherKind.ClaudeAcp,
       });
     }
   }

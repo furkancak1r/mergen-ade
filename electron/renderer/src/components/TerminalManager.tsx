@@ -977,6 +977,10 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                     key={l.id}
                     onClick={async () => {
                       setShowLauncherMenu(null);
+                      if (l.builtin === BuiltinLauncherKind.OpenCodeAcp) {
+                        onOpenAcpChat?.(project.id);
+                        return;
+                      }
                       const cmd = effectiveLauncherCommand(l, config.defaultShell);
                       if (l.builtin === BuiltinLauncherKind.OpenCode) {
                         const model = activeBuildModel(config.opencode);
@@ -989,7 +993,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                       }
                       const targetId = await onSpawn(project.id, TerminalKindEnum.Foreground);
                       if (targetId) {
-                        if (l.builtin === BuiltinLauncherKind.Claude) {
+                        if (l.builtin === BuiltinLauncherKind.Claude || l.builtin === BuiltinLauncherKind.ClaudeAcp) {
                           onMarkClaudeLaunchPending?.(targetId, l.launchCommand || cmd);
                         }
                         const isSlash = cmd.startsWith('/');

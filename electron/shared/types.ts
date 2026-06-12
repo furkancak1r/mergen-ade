@@ -38,13 +38,17 @@ export enum BuiltinLauncherKind {
   Codex = 'codex',
   OpenCode = 'opencode',
   Claude = 'claude',
+  OpenCodeAcp = 'opencode_acp',
+  ClaudeAcp = 'claude_acp',
 }
 
 export const BuiltinLauncherKindAll: BuiltinLauncherKind[] = [
   BuiltinLauncherKind.OpenCode,
+  BuiltinLauncherKind.OpenCodeAcp,
   BuiltinLauncherKind.Codex,
   BuiltinLauncherKind.Droid,
   BuiltinLauncherKind.Claude,
+  BuiltinLauncherKind.ClaudeAcp,
 ];
 
 export const BuiltinLauncherKindId = (kind: BuiltinLauncherKind): string => {
@@ -53,6 +57,8 @@ export const BuiltinLauncherKindId = (kind: BuiltinLauncherKind): string => {
     case BuiltinLauncherKind.Claude: return 'claude';
     case BuiltinLauncherKind.Droid: return 'droid';
     case BuiltinLauncherKind.OpenCode: return 'opencode';
+    case BuiltinLauncherKind.OpenCodeAcp: return 'opencode_acp';
+    case BuiltinLauncherKind.ClaudeAcp: return 'claude_acp';
   }
 };
 
@@ -62,6 +68,8 @@ export const BuiltinLauncherKindDefaultDisplayName = (kind: BuiltinLauncherKind)
     case BuiltinLauncherKind.Claude: return 'Claude';
     case BuiltinLauncherKind.Droid: return 'Droid';
     case BuiltinLauncherKind.OpenCode: return 'OpenCode';
+    case BuiltinLauncherKind.OpenCodeAcp: return 'OpenCode ACP';
+    case BuiltinLauncherKind.ClaudeAcp: return 'Claude ACP';
   }
 };
 
@@ -71,6 +79,8 @@ export const BuiltinLauncherKindDefaultLaunchCommand = (kind: BuiltinLauncherKin
     case BuiltinLauncherKind.Claude: return defaultClaudeLaunchCommand();
     case BuiltinLauncherKind.Droid: return 'droid';
     case BuiltinLauncherKind.OpenCode: return 'opencode';
+    case BuiltinLauncherKind.OpenCodeAcp: return '';
+    case BuiltinLauncherKind.ClaudeAcp: return '';
   }
 };
 
@@ -80,7 +90,7 @@ export const defaultClaudeLaunchCommand = (): string =>
 export const normalizeBuiltinLaunchCommand = (kind: BuiltinLauncherKind, command: string): string => {
   const trimmed = command.trim();
   if (trimmed.length === 0) return BuiltinLauncherKindDefaultLaunchCommand(kind);
-  if (kind === BuiltinLauncherKind.Claude) return normalizeClaudeLaunchCommand(trimmed);
+  if (kind === BuiltinLauncherKind.Claude || kind === BuiltinLauncherKind.ClaudeAcp) return normalizeClaudeLaunchCommand(trimmed);
   return trimmed;
 };
 
@@ -183,9 +193,11 @@ export const defaultLaunchers = (): LauncherEntry[] =>
         case BuiltinLauncherKind.Claude: return LauncherIconKey.Claude;
         case BuiltinLauncherKind.Droid: return LauncherIconKey.Droid;
         case BuiltinLauncherKind.OpenCode: return LauncherIconKey.OpenCode;
+        case BuiltinLauncherKind.OpenCodeAcp: return LauncherIconKey.OpenCode;
+        case BuiltinLauncherKind.ClaudeAcp: return LauncherIconKey.Claude;
       }
     })(),
-    bypassPermissions: kind === BuiltinLauncherKind.Claude,
+    bypassPermissions: kind === BuiltinLauncherKind.Claude || kind === BuiltinLauncherKind.ClaudeAcp,
   }));
 
 export enum TerminalKind {
