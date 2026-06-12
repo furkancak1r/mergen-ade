@@ -4,6 +4,39 @@
   padding: 0;
 }
 
+:root {
+  --button-hover-fill: rgba(255, 255, 255, 0.075);
+  --button-active-fill: rgba(255, 255, 255, 0.115);
+  --button-focus-ring: rgba(127, 214, 208, 0.62);
+}
+
+button {
+  border-color: transparent !important;
+  box-shadow: none;
+  transition:
+    background-color 0.14s ease,
+    box-shadow 0.14s ease,
+    color 0.14s ease,
+    opacity 0.14s ease;
+}
+
+button:not(:disabled) {
+  border-radius: 7px !important;
+}
+
+button:not(:disabled):hover {
+  box-shadow: inset 0 0 0 999px var(--button-hover-fill);
+}
+
+button:not(:disabled):active {
+  box-shadow: inset 0 0 0 999px var(--button-active-fill);
+}
+
+button:focus-visible {
+  outline: 1px solid var(--button-focus-ring);
+  outline-offset: 2px;
+}
+
 /* Global tooltip with delay */
 [data-tooltip] {
   position: relative;
@@ -121,7 +154,7 @@ body {
   border: none;
   color: #888;
   cursor: pointer;
-  border-radius: 6px;
+  border-radius: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -129,12 +162,12 @@ body {
 }
 
 .rail-btn:hover {
-  background: #222;
+  background: rgba(255, 255, 255, 0.06);
   color: #ccc;
 }
 
 .rail-btn.active {
-  background: #1f1f1f;
+  background: rgba(255, 255, 255, 0.085);
   color: #eee;
 }
 
@@ -334,9 +367,9 @@ body {
 
 .project-explorer-toolbar-btn {
   align-items: center;
-  background: #1e1e1e;
-  border: 1px solid #2a2a2a;
-  border-radius: 4px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
   color: #c8c8c8;
   cursor: pointer;
   display: inline-flex;
@@ -349,7 +382,7 @@ body {
 }
 
 .project-explorer-toolbar-btn:hover:not(:disabled) {
-  background: #2d2d2d;
+  background: rgba(255, 255, 255, 0.065);
   color: #f4f4f4;
 }
 
@@ -380,7 +413,7 @@ body {
 .project-explorer-context-menu button {
   background: transparent;
   border: none;
-  border-radius: 4px;
+  border-radius: 7px;
   color: #c8c8c8;
   cursor: pointer;
   display: block;
@@ -391,7 +424,7 @@ body {
 }
 
 .project-explorer-context-menu button:hover {
-  background: #2d2d2d;
+  background: rgba(255, 255, 255, 0.065);
   color: #f4f4f4;
 }
 
@@ -429,7 +462,7 @@ body {
 .file-editor-context-menu button {
   background: transparent;
   border: none;
-  border-radius: 4px;
+  border-radius: 7px;
   color: #c8c8c8;
   cursor: pointer;
   display: block;
@@ -440,7 +473,7 @@ body {
 }
 
 .file-editor-context-menu button:hover:not(:disabled) {
-  background: #2d2d2d;
+  background: rgba(255, 255, 255, 0.065);
   color: #f4f4f4;
 }
 
@@ -478,7 +511,7 @@ body {
   align-items: center;
   background: transparent;
   border: none;
-  border-radius: 4px;
+  border-radius: 7px;
   color: #c8c8c8;
   cursor: pointer;
   display: inline-flex;
@@ -491,7 +524,7 @@ body {
 }
 
 .file-editor-toolbar-btn:hover:not(:disabled) {
-  background: #2d2d2d;
+  background: rgba(255, 255, 255, 0.065);
   color: #f4f4f4;
 }
 
@@ -554,7 +587,7 @@ body {
   align-items: center;
   background: transparent;
   border: none;
-  border-radius: 6px;
+  border-radius: 7px;
   color: #c8c8c8;
   cursor: pointer;
   display: inline-flex;
@@ -568,7 +601,7 @@ body {
 }
 
 .source-control-toolbar-btn:hover {
-  background: #2d2d2d;
+  background: rgba(255, 255, 255, 0.065);
   color: #f4f4f4;
 }
 
@@ -577,7 +610,7 @@ body {
 }
 
 .source-control-toolbar-btn.accent:hover {
-  background: #173f3c;
+  background: rgba(23, 63, 60, 0.76);
   color: #c6fffb;
 }
 
@@ -666,8 +699,8 @@ body {
 .browser-tab {
   align-items: center;
   background: transparent;
-  border: 1px solid rgb(200 200 200 / 24%);
-  border-radius: 4px;
+  border: 1px solid transparent;
+  border-radius: 7px;
   color: #888;
   cursor: pointer;
   display: inline-flex;
@@ -686,7 +719,7 @@ body {
 
 .browser-tab.active {
   background: rgb(31 58 76 / 51%);
-  border-color: rgb(244 244 244 / 24%);
+  border-color: transparent;
   color: #f4f4f4;
 }
 
@@ -702,7 +735,7 @@ body {
   align-items: center;
   background: transparent;
   border: none;
-  border-radius: 3px;
+  border-radius: 6px;
   color: #888;
   cursor: pointer;
   display: inline-flex;
@@ -724,7 +757,7 @@ body {
   align-items: center;
   background: transparent;
   border: none;
-  border-radius: 4px;
+  border-radius: 7px;
   color: #f4f4f4;
   cursor: pointer;
   display: inline-flex;
@@ -748,8 +781,8 @@ body {
 .browser-screenshot-group {
   align-items: center;
   background: #0f0f0f;
-  border: 1px solid #333;
-  border-radius: 6px;
+  border: 1px solid transparent;
+  border-radius: 8px;
   display: inline-flex;
   flex-shrink: 0;
   gap: 3px;
@@ -761,7 +794,7 @@ body {
   align-items: center;
   background: transparent;
   border: none;
-  border-radius: 3px;
+  border-radius: 6px;
   color: #ccc;
   cursor: pointer;
   display: inline-flex;
@@ -886,7 +919,7 @@ body {
 .input-history-context-menu button {
   background: transparent;
   border: none;
-  border-radius: 4px;
+  border-radius: 7px;
   color: #c8c8c8;
   cursor: pointer;
   display: block;
@@ -897,7 +930,7 @@ body {
 }
 
 .input-history-context-menu button:hover {
-  background: #2d2d2d;
+  background: rgba(255, 255, 255, 0.065);
   color: #f4f4f4;
 }
 
@@ -932,7 +965,7 @@ body {
 .source-control-context-menu button {
   background: transparent;
   border: none;
-  border-radius: 4px;
+  border-radius: 7px;
   color: #c8c8c8;
   cursor: pointer;
   display: block;
@@ -943,7 +976,7 @@ body {
 }
 
 .source-control-context-menu button:hover {
-  background: #2d2d2d;
+  background: rgba(255, 255, 255, 0.065);
   color: #f4f4f4;
 }
 
@@ -978,7 +1011,7 @@ body {
 .terminal-manager-context-menu button {
   background: transparent;
   border: none;
-  border-radius: 4px;
+  border-radius: 7px;
   color: #c8c8c8;
   cursor: pointer;
   display: block;
@@ -989,7 +1022,7 @@ body {
 }
 
 .terminal-manager-context-menu button:hover {
-  background: #2d2d2d;
+  background: rgba(255, 255, 255, 0.065);
   color: #f4f4f4;
 }
 
@@ -1285,11 +1318,12 @@ body {
 .acp-icon-button {
   background: transparent;
   border: none;
+  border-radius: 7px;
   color: #9fb8c8;
   cursor: pointer;
   font-size: 11px;
   margin-top: 6px;
-  padding: 0;
+  padding: 2px 6px;
 }
 
 .acp-card-link-button:hover,

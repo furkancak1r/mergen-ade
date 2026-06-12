@@ -195,11 +195,6 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, proje
     };
   }, [refreshRoot]);
 
-  const copyProjectPath = useCallback(() => {
-    api.invoke('clipboard:writeText', project.path).catch(() => {});
-    showFeedback(`Copied path for project '${project.name}'`);
-  }, [project.path, project.name, showFeedback]);
-
   const openProjectFolder = useCallback(() => {
     api.invoke('shell:showItemInFolder', project.path)
       .then(() => showFeedback(`Opened project '${project.name}' in Explorer`))
@@ -500,9 +495,6 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, proje
             +
           </button>
         )}
-        <button type="button" className="project-explorer-toolbar-btn" title="Copy Path" onClick={copyProjectPath}>
-          ⧉
-        </button>
         <button type="button" className="project-explorer-toolbar-btn" title="Open in Folder" onClick={openProjectFolder}>
           📁
         </button>
