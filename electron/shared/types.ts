@@ -246,7 +246,6 @@ export enum TerminalInputHistoryFilter {
 }
 
 export const defaultProjectExplorerWidth = 352;
-export const defaultChecklistPanelWidth = 352;
 export const defaultBrowserPanelWidth = 520;
 
 export interface UiConfig {
@@ -261,9 +260,7 @@ export interface UiConfig {
   lastSelectedProjectId?: number;
   mainVisibilityMode: MainVisibilityMode;
   leftSidebarTab: LeftSidebarTab;
-  checklistPanelExpanded: boolean;
   browserPanelExpanded: boolean;
-  checklistPanelWidth: number;
   browserPanelWidth: number;
   inputHistoryFilter: InputHistoryFilter;
 }
@@ -280,9 +277,7 @@ export const defaultUiConfig = (): UiConfig => ({
   lastSelectedProjectId: undefined,
   mainVisibilityMode: MainVisibilityMode.Global,
   leftSidebarTab: LeftSidebarTab.Directory,
-  checklistPanelExpanded: false,
   browserPanelExpanded: false,
-  checklistPanelWidth: defaultChecklistPanelWidth,
   browserPanelWidth: defaultBrowserPanelWidth,
   inputHistoryFilter: InputHistoryFilter.All,
 });

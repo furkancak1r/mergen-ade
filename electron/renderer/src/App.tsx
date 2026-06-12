@@ -8,7 +8,6 @@ import { ProjectExplorer } from './components/ProjectExplorer';
 import { TerminalManager } from './components/TerminalManager';
 import { SourceControl } from './components/SourceControl';
 import { FileEditor } from './components/FileEditor';
-import { Checklist } from './components/Checklist';
 import { AcpChatPanel } from './components/AcpChatPanel';
 import { AcpErrorBoundary } from './components/AcpErrorBoundary';
 import { BrowserPanel } from './components/BrowserPanel';
@@ -40,7 +39,6 @@ import {
 } from './lib/terminalManagerState';
 import { recordInputHistory, removeProjectsInputHistory } from './lib/inputHistory';
 import { activityRailItem, isLeftSidebarTabActive, withLeftSidebarRailToggle, withLeftSidebarTabOpen } from './lib/activityRail';
-import { checklistRightOffset } from './lib/checklist';
 import { browserProjectIdsAfterScopeEmpty } from './lib/browserToolbar';
 import {
   fileEditorLocationFromPath,
@@ -72,8 +70,6 @@ function App() {
   const fileEditorOpen = fileEditorState.open;
   const fileEditorPath = fileEditorState.active?.path ?? null;
   const fileEditorName = fileEditorState.active?.displayName ?? null;
-
-  const [checklistVisible, setChecklistVisible] = useState(false);
 
   const [activeAcpChat, setActiveAcpChat] = useState<{ chatId: string; projectId: number; tool: string } | null>(null);
   const [activeAcpChatByProject, setActiveAcpChatByProject] = useState<Map<string, string>>(new Map());
@@ -260,7 +256,6 @@ function App() {
   }, [activeAcpChat, activeAcpChatByProject, acpRunning, acpQueuedPrompts]);
 
   // Browser hide on modal open (Settings) with grace period after close.
-  // Check-list is a non-modal floating panel and must not hide Browser.
   useEffect(() => {
     if (settingsOpen) {
       api.invoke('browser:hideAll');
@@ -552,7 +547,7 @@ function App() {
     if (fileEditorOpen) return;
 
     // Modal/popup open blocks terminal keyboard capture
-    if (settingsOpen || checklistVisible) return;
+    if (settingsOpen) return;
 
     // Check if Smart Input has focus
     const smartInputFocused = document.activeElement?.closest('[data-smart-input]') !== null;
@@ -612,7 +607,7 @@ function App() {
       const idx = terminals.findIndex((t) => t.id === activeTerminalId);
       if (idx >= 0 && idx < terminals.length - 1) activateTerminal(terminals[idx + 1].id);
     }
-  }, [config, activeTerminals, activeTerminalId, pty, activateTerminal, activeAcpChat, terminals, shortcutMatchesEvent, formatShortcutCombo, settingsOpen, checklistVisible, fileEditorOpen]);
+  }, [config, activeTerminals, activeTerminalId, pty, activateTerminal, activeAcpChat, terminals, shortcutMatchesEvent, formatShortcutCombo, settingsOpen, fileEditorOpen]);
 
   useEffect(() => {
     if (!mainRef.current) return;
@@ -1228,7 +1223,7 @@ function App() {
     if (activeTerminal.terminalOutputFocusOverride) return;
     if (activeAcpChat) return;
     // Surrender Smart Input focus when any modal/popup is open
-    if (settingsOpen || checklistVisible) return;
+    if (settingsOpen) return;
     // Do not steal focus from browser URL input or other text inputs
     const active = document.activeElement;
     if (active && (active.hasAttribute('data-browser-url') || active.closest('[data-browser-panel]'))) return;
@@ -1238,7 +1233,7 @@ function App() {
     if (smartInput && document.activeElement !== smartInput) {
       smartInput.focus();
     }
-  }, [activeTerminals, activeTerminalId, activeAcpChat, settingsOpen, checklistVisible]);
+  }, [activeTerminals, activeTerminalId, activeAcpChat, settingsOpen]);
 
   const leftSidebarVisible = Boolean(config?.ui.showProjectExplorer && config.ui.projectExplorerExpanded);
   const openLeftSidebarTab = useCallback((tab: LeftSidebarTab) => {
@@ -1289,14 +1284,6 @@ function App() {
           aria-label={activityRailItem('browser').title}
         >
           <span className="rail-icon">{activityRailItem('browser').icon}</span>
-        </button>
-        <button
-          className={`rail-btn ${checklistVisible ? 'active' : ''}`}
-          onClick={() => setChecklistVisible((v) => !v)}
-          data-tooltip={activityRailItem('checklist').title}
-          aria-label={activityRailItem('checklist').title}
-        >
-          <span className="rail-icon">{activityRailItem('checklist').icon}</span>
         </button>
         <button
           className={`rail-btn ${settingsOpen ? 'active' : ''}`}
@@ -1471,7 +1458,7 @@ function App() {
               chatId={activeAcpChat.chatId}
               config={config || defaultAppConfig()}
               onClose={closeAcpChat}
-              disabled={settingsOpen || checklistVisible}
+              disabled={settingsOpen}
               branchName={branchNameByProject.get(activeAcpChat.projectId)}
             />
           </AcpErrorBoundary>
@@ -1499,8 +1486,8 @@ function App() {
             onTerminalOutputClick={handleTerminalOutputClick}
             onClearTerminalOutputFocusOverride={handleClearTerminalOutputFocusOverride}
             onScrollDetached={handleScrollDetached}
-            wheelEnabled={terminalWheelEnabled({ settingsOpen, checklistVisible, terminalManagerOverlayOpen })}
-            disabled={settingsOpen || checklistVisible}
+            wheelEnabled={terminalWheelEnabled({ settingsOpen, terminalManagerOverlayOpen })}
+            disabled={settingsOpen}
           />
         )}
       </div>
@@ -1549,25 +1536,6 @@ function App() {
             />
           </div>
         </>
-      )}
-
-      {checklistVisible && config && (
-        <Checklist
-          projects={config.projects}
-          rightOffset={checklistRightOffset(isBrowserOpen && !settingsOpen, browserPanelWidth)}
-          onRemoveItem={(projectId, index) => {
-            const newProjects = config.projects.map((p) => {
-              if (p.id === projectId) {
-                const newChecklist = [...p.checklist];
-                newChecklist.splice(index, 1);
-                return { ...p, checklist: newChecklist };
-              }
-              return p;
-            });
-            setConfig({ ...config, projects: newProjects });
-          }}
-          onClose={() => setChecklistVisible(false)}
-        />
       )}
 
       {settingsOpen && config && (

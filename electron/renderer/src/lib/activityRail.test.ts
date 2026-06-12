@@ -10,7 +10,6 @@ describe('activityRail', () => {
       'terminalManager',
       'inputHistory',
       'browser',
-      'checklist',
       'settings',
     ]);
     expect(activityRailItem('directory')).toMatchObject({ icon: '▦', title: 'Directory', tab: LeftSidebarTab.Directory });
@@ -18,7 +17,6 @@ describe('activityRail', () => {
     expect(activityRailItem('terminalManager')).toMatchObject({ icon: '>_', title: 'Terminal Manager', tab: LeftSidebarTab.TerminalManager });
     expect(activityRailItem('inputHistory')).toMatchObject({ icon: '◷', title: 'Input History', tab: LeftSidebarTab.InputHistory });
     expect(activityRailItem('browser')).toMatchObject({ icon: '◎', title: 'Toggle Browser Panel' });
-    expect(activityRailItem('checklist')).toMatchObject({ icon: '✓', title: 'Toggle Check-list' });
     expect(activityRailItem('settings')).toMatchObject({ icon: '⚙', title: 'Settings' });
   });
 
