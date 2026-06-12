@@ -36,8 +36,8 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
   modeControlsVisible = true,
   disabled = false,
 }) => {
-  const [deliveryMode, setDeliveryMode] = useState<'now' | 'after'>('now');
   const [draftMode, setDraftMode] = useState<SmartInputModeId>('build');
+  const [editRestoreIndex, setEditRestoreIndex] = useState<number | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
   const [resizing, setResizing] = useState(false);
@@ -54,21 +54,30 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
       text: state.draftText.trim(),
       attachments: [...state.draftAttachments],
       modeId: modeControlsVisible ? draftMode : 'build',
-      afterDone: deliveryMode === 'after',
+      afterDone: true,
     };
+    const queue = [...state.queue];
+    if (editRestoreIndex !== null && editRestoreIndex >= 0 && editRestoreIndex <= queue.length) {
+      queue.splice(editRestoreIndex, 0, task);
+    } else {
+      queue.push(task);
+    }
     onUpdateState({
       ...state,
-      queue: [...state.queue, task],
+      queue,
       draftText: '',
       draftAttachments: [],
     });
-  }, [state, draftMode, deliveryMode, modeControlsVisible, onUpdateState]);
+    setEditRestoreIndex(null);
+  }, [state, draftMode, modeControlsVisible, editRestoreIndex, onUpdateState]);
 
-  const sendNow = useCallback(() => {
-    if (!state.draftText.trim() && state.draftAttachments.length === 0) return;
-    onSendToTerminal(terminalId, state.draftText.trim(), state.draftAttachments, modeControlsVisible ? draftMode : 'build');
-    onUpdateState({ ...state, draftText: '', draftAttachments: [] });
-  }, [state, terminalId, draftMode, modeControlsVisible, onSendToTerminal, onUpdateState]);
+  const steerTask = useCallback((index: number) => {
+    const task = state.queue[index];
+    if (!task) return;
+    onSendToTerminal(terminalId, task.text, task.attachments, task.modeId as SmartInputModeId);
+    const queue = state.queue.filter((_, i) => i !== index);
+    onUpdateState({ ...state, queue });
+  }, [state, terminalId, onSendToTerminal, onUpdateState]);
 
   const removeTask = useCallback((index: number) => {
     const queue = state.queue.filter((_, i) => i !== index);
@@ -83,12 +92,8 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
   }, [state, onUpdateState]);
 
   const submit = useCallback(() => {
-    if (deliveryMode === 'now') {
-      sendNow();
-    } else {
-      addTask();
-    }
-  }, [deliveryMode, sendNow, addTask]);
+    addTask();
+  }, [addTask]);
 
   // Footer resize handling
   useEffect(() => {
@@ -204,8 +209,17 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
 
   // Context menu selection preservation
   const draftRef = useRef<HTMLTextAreaElement>(null);
-  const editRef = useRef<HTMLTextAreaElement>(null);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; target: 'draft' | 'edit' } | null>(null);
+
+  // Auto-resize draft textarea to fit content
+  const resizeDraft = useCallback(() => {
+    const ta = draftRef.current;
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+  }, []);
+
+  useEffect(() => { resizeDraft(); }, [state.draftText, resizeDraft]);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
   const handleDraftContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -217,56 +231,34 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
         onUpdateState({ ...state, draftContextMenuSelectionRange: [start, end] });
       }
     }
-    setContextMenu({ x: e.clientX, y: e.clientY, target: 'draft' });
-  }, [state, onUpdateState]);
-
-  const handleEditContextMenu = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    const ta = editRef.current;
-    if (ta) {
-      const start = ta.selectionStart;
-      const end = ta.selectionEnd;
-      if (start !== end) {
-        onUpdateState({ ...state, editContextMenuSelectionRange: [start, end] });
-      }
-    }
-    setContextMenu({ x: e.clientX, y: e.clientY, target: 'edit' });
+    setContextMenu({ x: e.clientX, y: e.clientY });
   }, [state, onUpdateState]);
 
   const handleMenuCopy = useCallback(() => {
     if (!contextMenu) return;
-    const isDraft = contextMenu.target === 'draft';
-    const ta = isDraft ? draftRef.current : editRef.current;
+    const ta = draftRef.current;
     if (!ta) return;
-    const range = isDraft ? state.draftContextMenuSelectionRange : state.editContextMenuSelectionRange;
-    const text = isDraft ? state.draftText : state.editText;
-    if (range) {
-      const [start, end] = range;
-      const selected = text.slice(start, end);
+    if (state.draftContextMenuSelectionRange) {
+      const [start, end] = state.draftContextMenuSelectionRange;
+      const selected = state.draftText.slice(start, end);
       navigator.clipboard.writeText(selected).catch(() => {});
     } else {
-      const selected = text.slice(ta.selectionStart, ta.selectionEnd);
+      const selected = state.draftText.slice(ta.selectionStart, ta.selectionEnd);
       navigator.clipboard.writeText(selected).catch(() => {});
     }
     setContextMenu(null);
-  }, [contextMenu, state.draftText, state.draftContextMenuSelectionRange, state.editText, state.editContextMenuSelectionRange]);
+  }, [contextMenu, state.draftText, state.draftContextMenuSelectionRange]);
 
   const handleMenuPaste = useCallback(async () => {
     if (!contextMenu) return;
-    const isDraft = contextMenu.target === 'draft';
-    const ta = isDraft ? draftRef.current : editRef.current;
+    const ta = draftRef.current;
     if (!ta) return;
     try {
       const text = await navigator.clipboard.readText();
       const start = ta.selectionStart;
       const end = ta.selectionEnd;
-      const currentText = isDraft ? state.draftText : state.editText;
-      const newText = currentText.slice(0, start) + text + currentText.slice(end);
-      if (isDraft) {
-        updateDraft(newText);
-      } else {
-        onUpdateState({ ...state, editText: newText });
-      }
+      const newText = state.draftText.slice(0, start) + text + state.draftText.slice(end);
+      updateDraft(newText);
       requestAnimationFrame(() => {
         ta.selectionStart = ta.selectionEnd = start + text.length;
       });
@@ -274,7 +266,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
       // ignore
     }
     setContextMenu(null);
-  }, [contextMenu, state.draftText, state.editText, updateDraft, onUpdateState, state]);
+  }, [contextMenu, state.draftText, updateDraft]);
 
   // Close context menu on outside click
   useEffect(() => {
@@ -396,20 +388,6 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
         <>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
             <span style={{ fontSize: 11, color: '#888', fontWeight: 600 }}>Smart Input</span>
-            <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
-              <button
-                onClick={() => setDeliveryMode('now')}
-                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 3, border: '1px solid #333', background: deliveryMode === 'now' ? '#1f3a4c' : 'transparent', color: '#ccc', cursor: 'pointer' }}
-              >
-                Steer Now
-              </button>
-              <button
-                onClick={() => setDeliveryMode('after')}
-                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 3, border: '1px solid #333', background: deliveryMode === 'after' ? '#1f3a4c' : 'transparent', color: '#ccc', cursor: 'pointer' }}
-              >
-                After Done
-              </button>
-            </div>
           </div>
 
           {state.queue.length > 0 && (
@@ -420,160 +398,57 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
                     <div style={{ height: 2, background: '#64c864', borderRadius: 1, margin: '2px 0' }} />
                   )}
                   <div
-                    draggable={state.editIndex !== i}
-                    onDragStart={() => setDragIndex(i)}
-                    onDragEnd={() => {
-                      if (dragIndex !== null && dropIndex !== null && dragIndex !== dropIndex) {
-                        moveTask(dragIndex, dropIndex);
-                      }
-                      setDragIndex(null);
-                      setDropIndex(null);
-                    }}
                     onDragOver={(e) => {
                       e.preventDefault();
                       if (dragIndex !== null && dragIndex !== i) {
                         setDropIndex(i);
                       }
                     }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0', fontSize: 11, color: '#aaa', cursor: state.editIndex === i ? 'default' : 'grab' }}
+                    style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0', fontSize: 11, color: '#aaa' }}
                   >
-                    <span style={{ color: '#666', cursor: 'grab' }}>⋮⋮</span>
+                    <span
+                      draggable
+                      onDragStart={() => setDragIndex(i)}
+                      onDragEnd={() => {
+                        if (dragIndex !== null && dropIndex !== null && dragIndex !== dropIndex) {
+                          moveTask(dragIndex, dropIndex);
+                        }
+                        setDragIndex(null);
+                        setDropIndex(null);
+                      }}
+                      style={{ color: '#666', cursor: 'grab' }}
+                    >⋮⋮</span>
                     <span style={{ color: '#666' }}>{i + 1}.</span>
                     {modeControlsVisible && smartInputModeLabel(task.modeId) && (
                       <span style={{ color: '#dcb43c', fontSize: 10, border: '1px solid #5d4722', borderRadius: 3, padding: '1px 4px', background: '#281c10' }}>
                         {smartInputModeLabel(task.modeId)}
                       </span>
                     )}
-                    {state.editIndex === i ? (
-                      <textarea
-                        ref={editRef}
-                        value={state.editText}
-                        onChange={(e) => onUpdateState({ ...state, editText: e.target.value })}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' && !e.ctrlKey && !e.shiftKey) {
-                            e.preventDefault();
-                            // Save edit
-                            const queue = state.queue.map((t, idx) =>
-                              idx === i ? { ...t, text: state.editText.trim(), attachments: [...state.editAttachments] } : t
-                            );
-                            onUpdateState({ ...state, queue, editIndex: undefined, editText: '', editAttachments: [] });
-                          }
-                          if (e.key === 'Enter' && e.ctrlKey) {
-                            e.preventDefault();
-                            onUpdateState({ ...state, editText: state.editText + '\n' });
-                          }
-                          if (e.key === 'Escape') {
-                            onUpdateState({ ...state, editIndex: undefined, editText: '', editAttachments: [] });
-                          }
-                        }}
-                        autoFocus
-                        onFocus={() => onClearTerminalOutputFocusOverride?.()}
-                        onContextMenu={handleEditContextMenu}
-                        onPaste={async (e) => {
-                          e.preventDefault();
-                          const paste = snapshotClipboardPaste(e.clipboardData);
-                          if (shouldReadNativeClipboardFilePaths(paste)) {
-                            const paths = await api.invoke('clipboard:readFilePaths') as string[] | undefined;
-                            if (paths && paths.length > 0) {
-                              let newText = state.editText;
-                              const newAttachments = [...state.editAttachments];
-                              for (const p of paths) {
-                                const name = p.split(/[/\\]/).pop() || p;
-                                newAttachments.push({ path: p, name });
-                                newText = newText ? `${newText} @${name}` : `@${name}`;
-                              }
-                              onUpdateState({ ...state, editAttachments: newAttachments, editText: newText });
-                              return;
-                            }
-                          }
-                          if (shouldReadNativeClipboardImage(paste)) {
-                            const imgResult = await api.invoke('clipboard:readImage') as { path?: string; dataUrl?: string } | undefined;
-                            if (imgResult?.path) {
-                              const p = imgResult.path;
-                              const name = p.split(/[/\\]/).pop() || p;
-                              onUpdateState({
-                                ...state,
-                                editAttachments: [...state.editAttachments, { path: p, name }],
-                                editText: state.editText ? `${state.editText} @${name}` : `@${name}`,
-                              });
-                              return;
-                            }
-                          }
-                          const text = paste.text;
-                          if (text) {
-                            onUpdateState({ ...state, editText: state.editText + text });
-                          }
-                        }}
-                        style={{
-                          flex: 1,
-                          background: '#1a1a1a',
-                          border: '1px solid #333',
-                          borderRadius: 4,
-                          padding: '3px 6px',
-                          color: '#ccc',
-                          fontSize: 11,
-                          resize: 'none',
-                          minHeight: 24,
-                          maxHeight: 60,
-                          outline: 'none',
-                        }}
-                        rows={1}
-                      />
-                    ) : (
-                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.text || '(attachment)'}</span>
-                    )}
-                    {state.editIndex === i ? (
-                      <>
-                        {/* Edit attachment chips */}
-                        {state.editAttachments.length > 0 && (
-                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginRight: 4 }}>
-                            {state.editAttachments.map((a, ai) => (
-                              <span key={ai} style={{ fontSize: 10, color: '#aaa', background: '#1a1a1a', padding: '1px 4px', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 2, border: '1px solid #333' }}>
-                                {a.name}
-                                <button
-                                  onClick={() => {
-                                    const mention = `@${a.name}`;
-                                    const newAttachments = state.editAttachments.filter((_, idx) => idx !== ai);
-                                    const newEditText = removeMentionFromInput(state.editText, mention);
-                                    onUpdateState({ ...state, editAttachments: newAttachments, editText: newEditText });
-                                  }}
-                                  style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 9 }}
-                                >
-                                  ✕
-                                </button>
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                        <button
-                          onClick={() => {
-                            const queue = state.queue.map((t, idx) =>
-                              idx === i ? { ...t, text: state.editText.trim(), attachments: [...state.editAttachments] } : t
-                            );
-                            onUpdateState({ ...state, queue, editIndex: undefined, editText: '', editAttachments: [] });
-                          }}
-                          style={{ background: 'transparent', border: 'none', color: '#64c864', cursor: 'pointer', fontSize: 10 }}
-                        >
-                          ✓
-                        </button>
-                        <button
-                          onClick={() => onUpdateState({ ...state, editIndex: undefined, editText: '', editAttachments: [] })}
-                          style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}
-                        >
-                          ✕
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <button
-                          onClick={() => onUpdateState({ ...state, editIndex: i, editText: task.text, editAttachments: [...task.attachments] })}
-                          style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}
-                        >
-                          ✎
-                        </button>
-                        <button onClick={() => removeTask(i)} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}>✕</button>
-                      </>
-                    )}
+                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.text || '(attachment)'}</span>
+                    <button
+                      onClick={() => steerTask(i)}
+                      title="Steer now"
+                      style={{ background: 'transparent', border: 'none', color: '#dcb43c', cursor: 'pointer', fontSize: 10 }}
+                    >
+                      ⚡
+                    </button>
+                    <button
+                      onClick={() => {
+                        onUpdateState({
+                          ...state,
+                          queue: state.queue.filter((_, idx) => idx !== i),
+                          draftText: task.text,
+                          draftAttachments: [...task.attachments],
+                        });
+                        setDraftMode(task.modeId as SmartInputModeId);
+                        setEditRestoreIndex(i);
+                      }}
+                      title="Düzenle"
+                      style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}
+                    >
+                      ✎
+                    </button>
+                    <button onClick={() => removeTask(i)} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10 }}>✕</button>
                   </div>
                 </div>
               ))}
@@ -720,7 +595,8 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
                 fontSize: 12,
                 resize: 'none',
                 minHeight: 32,
-                maxHeight: 80,
+                maxHeight: 160,
+                overflow: 'auto',
                 outline: 'none',
               }}
               rows={1}

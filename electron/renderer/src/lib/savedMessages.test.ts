@@ -15,7 +15,6 @@ const project = (partial: Partial<ProjectRecord>): ProjectRecord => ({
   savedMessages: partial.savedMessages ?? [],
   aiConfig: partial.aiConfig ?? {},
   checklist: partial.checklist ?? [],
-  foregroundSavedMessages: partial.foregroundSavedMessages ?? [],
   repoRoot: partial.repoRoot,
   isWorktree: partial.isWorktree ?? false,
 });

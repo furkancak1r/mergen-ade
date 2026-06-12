@@ -295,7 +295,6 @@ export interface ProjectRecord {
   aiConfig: ProjectAiConfig;
   checklist: string[];
   browserLastUrl?: string;
-  foregroundSavedMessages: string[];
   repoRoot?: string;
   isWorktree: boolean;
 }

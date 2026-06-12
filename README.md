@@ -158,7 +158,7 @@ The Electron build is the supported path for portable binaries.
 What it does:
 
 1. Builds the Electron app with `electron-builder`
-2. Produces a portable Windows ZIP containing `mergen-ade.exe`
+2. Produces a single portable Windows EXE (`mergen-ade-<version>-windows-x64-portable.exe`)
 3. Produces a signed and notarized macOS ARM64 DMG
 
 Build commands:
@@ -168,6 +168,10 @@ cd electron
 npm ci
 npm run build
 ```
+
+Output: `electron/out/mergen-ade-<version>-windows-x64-portable.exe`
+
+> For detailed build configuration, troubleshooting, and macOS signing info, see [electron/BUILD.md](electron/BUILD.md).
 
 For macOS release packaging, GitHub Actions builds the Electron app, signs it with a Developer ID Application certificate, notarizes the DMG through `notarytool`, and staples the notarization ticket onto the DMG before publishing. The blocking CI gates are notarization acceptance plus `stapler validate`. The same script can still package locally without signing when the Apple credentials are not provided.
 

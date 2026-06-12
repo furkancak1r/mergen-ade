@@ -75,10 +75,10 @@ function App() {
 
   const [checklistVisible, setChecklistVisible] = useState(false);
 
-  const [activeAcpChat, setActiveAcpChat] = useState<{ chatId: string; projectId: number } | null>(null);
-  const [activeAcpChatByProject, setActiveAcpChatByProject] = useState<Map<number, string>>(new Map());
-  const [activeAcpSessionByProject, setActiveAcpSessionByProject] = useState<Map<number, AcpChatSession>>(new Map());
-  const [activeAcpAttentionByProject, setActiveAcpAttentionByProject] = useState<Map<number, AcpTerminalManagerAttentionReason>>(new Map());
+  const [activeAcpChat, setActiveAcpChat] = useState<{ chatId: string; projectId: number; tool: string } | null>(null);
+  const [activeAcpChatByProject, setActiveAcpChatByProject] = useState<Map<string, string>>(new Map());
+  const [activeAcpSessionByProject, setActiveAcpSessionByProject] = useState<Map<string, AcpChatSession>>(new Map());
+  const [activeAcpAttentionByProject, setActiveAcpAttentionByProject] = useState<Map<string, AcpTerminalManagerAttentionReason>>(new Map());
   const [acpRunning, setAcpRunning] = useState(false);
   const [acpQueuedPrompts, setAcpQueuedPrompts] = useState(false);
 
@@ -226,16 +226,16 @@ function App() {
     const unsub = api.on('acp:event', (eventChatId: string, event: AcpEventLike) => {
       const projectEntry = Array.from(activeAcpChatByProject.entries()).find(([, chatId]) => chatId === eventChatId);
       if (projectEntry) {
-        const [projectId] = projectEntry;
+        const [projectKey] = projectEntry;
         setActiveAcpAttentionByProject((prev) => {
-          const currentReason = prev.get(projectId);
+          const currentReason = prev.get(projectKey);
           const nextReason = nextAcpTerminalManagerAttention(currentReason, event);
           if (nextReason === currentReason) return prev;
           const next = new Map(prev);
           if (nextReason) {
-            next.set(projectId, nextReason);
+            next.set(projectKey, nextReason);
           } else {
-            next.delete(projectId);
+            next.delete(projectKey);
           }
           return next;
         });
@@ -243,9 +243,9 @@ function App() {
           setActiveAcpSessionByProject((prev) => {
             const next = new Map(prev);
             if (session) {
-              next.set(projectId, session as AcpChatSession);
+              next.set(projectKey, session as AcpChatSession);
             } else {
-              next.delete(projectId);
+              next.delete(projectKey);
             }
             return next;
           });
@@ -455,15 +455,18 @@ function App() {
   }, [terminals, pty]);
 
   const restoreActiveAcpForProject = useCallback((projectId: number) => {
-    const chatId = activeAcpChatByProject.get(projectId);
-    if (chatId) {
+    const prefix = `${projectId}:`;
+    const entry = Array.from(activeAcpChatByProject.entries()).find(([key]) => key.startsWith(prefix));
+    if (entry) {
+      const [projectKey, chatId] = entry;
       setActiveAcpAttentionByProject((prev) => {
-        if (!prev.has(projectId)) return prev;
+        if (!prev.has(projectKey)) return prev;
         const next = new Map(prev);
-        next.delete(projectId);
+        next.delete(projectKey);
         return next;
       });
-      setActiveAcpChat({ chatId, projectId });
+      const tool = projectKey.slice(prefix.length);
+      setActiveAcpChat({ chatId, projectId, tool });
       setFileEditorState((prev) => withFileEditorHidden(prev));
       setActiveTab(LeftSidebarTabEnum.TerminalManager);
       setConfig((prev) => prev ? withTerminalManagerOpened(prev) : prev);
@@ -489,9 +492,12 @@ function App() {
       suppressAcpRestoreRef.current = false;
       return;
     }
-    const chatId = activeAcpChatByProject.get(selectedProjectId);
-    if (chatId) {
-      setActiveAcpChat({ chatId, projectId: selectedProjectId });
+    const prefix = `${selectedProjectId}:`;
+    const entry = Array.from(activeAcpChatByProject.entries()).find(([key]) => key.startsWith(prefix));
+    if (entry) {
+      const [projectKey, chatId] = entry;
+      const tool = projectKey.slice(prefix.length);
+      setActiveAcpChat({ chatId, projectId: selectedProjectId, tool });
     }
   }, [selectedProjectId, activeAcpChatByProject]);
 
@@ -789,7 +795,6 @@ function App() {
       savedMessages: [],
       aiConfig: {},
       checklist: [],
-      foregroundSavedMessages: [],
       isWorktree: false,
     };
     setConfig((prev) => {
@@ -835,6 +840,8 @@ function App() {
     const project = config.projects.find((p) => p.id === projectId);
     if (!project) return;
 
+    const effectiveTool = tool || 'opencode';
+    const projectKey = `${projectId}:${effectiveTool}`;
     let chatId: string;
 
     // Claude Code: bypass standby, spawn directly
@@ -857,24 +864,24 @@ function App() {
 
     setActiveAcpChatByProject((prev) => {
       const next = new Map(prev);
-      next.set(projectId, chatId);
+      next.set(projectKey, chatId);
       return next;
     });
     setActiveAcpAttentionByProject((prev) => {
-      if (!prev.has(projectId)) return prev;
+      if (!prev.has(projectKey)) return prev;
       const next = new Map(prev);
-      next.delete(projectId);
+      next.delete(projectKey);
       return next;
     });
     const session = await api.invoke('acp:getSession', chatId) as AcpChatSession | undefined;
     if (session) {
       setActiveAcpSessionByProject((prev) => {
         const next = new Map(prev);
-        next.set(projectId, session);
+        next.set(projectKey, session);
         return next;
       });
     }
-    setActiveAcpChat({ chatId, projectId });
+    setActiveAcpChat({ chatId, projectId, tool: effectiveTool });
     setFileEditorState((prev) => withFileEditorHidden(prev));
     // Reveal Terminal Manager with Foreground filter and expand root project
     setActiveTab(LeftSidebarTabEnum.TerminalManager);
@@ -886,34 +893,50 @@ function App() {
   }, []);
 
   const removeAcpChatForProject = useCallback((projectId: number) => {
+    const prefix = `${projectId}:`;
+    // Kill all ACP chats for this project
+    for (const [key, chatId] of activeAcpChatByProject.entries()) {
+      if (key.startsWith(prefix)) {
+        api.invoke('acp:kill', chatId);
+      }
+    }
     setActiveAcpChatByProject((prev) => {
       const next = new Map(prev);
-      next.delete(projectId);
+      for (const key of prev.keys()) {
+        if (key.startsWith(prefix)) next.delete(key);
+      }
       return next;
     });
     setActiveAcpSessionByProject((prev) => {
       const next = new Map(prev);
-      next.delete(projectId);
+      for (const key of prev.keys()) {
+        if (key.startsWith(prefix)) next.delete(key);
+      }
       return next;
     });
     setActiveAcpAttentionByProject((prev) => {
       const next = new Map(prev);
-      next.delete(projectId);
+      for (const key of prev.keys()) {
+        if (key.startsWith(prefix)) next.delete(key);
+      }
       return next;
     });
     if (activeAcpChat && activeAcpChat.projectId === projectId) {
       setActiveAcpChat(null);
-    }
-    // Kill visible ACP chat and clear standby
-    const chatId = activeAcpChatByProject.get(projectId);
-    if (chatId) {
-      api.invoke('acp:kill', chatId);
     }
     api.invoke('acp:standby:clear', projectId);
   }, [activeAcpChat, activeAcpChatByProject]);
 
   const toggleBrowser = useCallback(() => {
     if (!selectedProjectId) return;
+    // Only allow opening if project has a foreground terminal or ACP chat
+    const isCurrentlyOpen = browserOpenProjects.has(selectedProjectId);
+    if (!isCurrentlyOpen) {
+      const hasForegroundTerminal = terminals.some((t) => t.projectId === selectedProjectId && t.kind === 'foreground' && !t.exited);
+      const prefix = `${selectedProjectId}:`;
+      const hasAcpChat = Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix));
+      if (!hasForegroundTerminal && !hasAcpChat) return;
+    }
     setBrowserOpenProjects((prev) => {
       const next = new Set(prev);
       if (next.has(selectedProjectId)) {
@@ -923,7 +946,24 @@ function App() {
       }
       return next;
     });
-  }, [selectedProjectId]);
+  }, [selectedProjectId, browserOpenProjects, terminals, activeAcpChatByProject]);
+
+  // Auto-close browser when project loses all foreground terminals and ACP chats
+  useEffect(() => {
+    setBrowserOpenProjects((prev) => {
+      if (prev.size === 0) return prev;
+      const next = new Set<number>();
+      for (const projectId of prev) {
+        const hasForegroundTerminal = terminals.some((t) => t.projectId === projectId && t.kind === 'foreground' && !t.exited);
+        const prefix = `${projectId}:`;
+        const hasAcpChat = Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix));
+        if (hasForegroundTerminal || hasAcpChat) {
+          next.add(projectId);
+        }
+      }
+      return next.size === prev.size ? prev : next;
+    });
+  }, [terminals, activeAcpChatByProject]);
 
   const acpProject = activeAcpChat ? config?.projects.find((p) => p.id === activeAcpChat.projectId) ?? null : null;
 
@@ -1140,34 +1180,42 @@ function App() {
   useEffect(() => {
     if (!config) return;
     const existingIds = new Set(config.projects.map((p) => p.id));
-    const removedIds = Array.from(activeAcpChatByProject.keys()).filter((projectId) => !existingIds.has(projectId));
-    if (removedIds.length === 0) return;
-    const removedIdSet = new Set(removedIds);
+    // Find composite keys whose projectId no longer exists
+    const removedKeys = Array.from(activeAcpChatByProject.keys()).filter((key) => {
+      const pid = parseInt(key.split(':')[0], 10);
+      return !existingIds.has(pid);
+    });
+    if (removedKeys.length === 0) return;
+    const removedKeySet = new Set(removedKeys);
+    // Collect removed projectIds for standby cleanup
+    const removedProjectIds = new Set(removedKeys.map((key) => parseInt(key.split(':')[0], 10)));
 
     setActiveAcpChatByProject((prev) => {
       const next = new Map(prev);
-      for (const projectId of removedIdSet) next.delete(projectId);
+      for (const key of removedKeySet) next.delete(key);
       return next;
     });
-    if (activeAcpChat && removedIdSet.has(activeAcpChat.projectId)) {
+    if (activeAcpChat && removedProjectIds.has(activeAcpChat.projectId)) {
       setActiveAcpChat(null);
     }
     setActiveAcpSessionByProject((prev) => {
       const next = new Map(prev);
-      for (const projectId of removedIdSet) next.delete(projectId);
+      for (const key of removedKeySet) next.delete(key);
       return next;
     });
     setActiveAcpAttentionByProject((prev) => {
       const next = new Map(prev);
-      for (const projectId of removedIdSet) next.delete(projectId);
+      for (const key of removedKeySet) next.delete(key);
       return next;
     });
-    // Kill visible ACP chats and clear standby for removed projects
-    for (const projectId of removedIds) {
-      const chatId = activeAcpChatByProject.get(projectId);
+    // Kill ACP chats and clear standby for removed projects
+    for (const key of removedKeys) {
+      const chatId = activeAcpChatByProject.get(key);
       if (chatId) {
         api.invoke('acp:kill', chatId);
       }
+    }
+    for (const projectId of removedProjectIds) {
       api.invoke('acp:standby:clear', projectId);
     }
   }, [config, activeAcpChat, activeAcpChatByProject]);
@@ -1182,6 +1230,10 @@ function App() {
     if (activeAcpChat) return;
     // Surrender Smart Input focus when any modal/popup is open
     if (settingsOpen || checklistVisible) return;
+    // Do not steal focus from browser URL input or other text inputs
+    const active = document.activeElement;
+    if (active && (active.hasAttribute('data-browser-url') || active.closest('[data-browser-panel]'))) return;
+    if (active && (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active instanceof HTMLSelectElement || (active instanceof HTMLElement && active.isContentEditable))) return;
     // Auto-focus Smart Input draft
     const smartInput = document.querySelector(`[data-smart-input="${activeTerminalId}"]`) as HTMLElement | null;
     if (smartInput && document.activeElement !== smartInput) {
@@ -1307,38 +1359,6 @@ function App() {
             onKillTerminal={killTerminal}
             rerunBackground={pty.rerunBackground}
             sendSavedMessageToTerminal={pty.sendSavedMessageToTerminal}
-            onRemoveForegroundMessage={(projectId, message) => {
-              if (!config) return;
-              const newProjects = config.projects.map((p) => {
-                if (p.id === projectId) {
-                  return { ...p, foregroundSavedMessages: p.foregroundSavedMessages.filter((m) => m !== message) };
-                }
-                return p;
-              });
-              setConfig({ ...config, projects: newProjects });
-            }}
-            onAddForegroundMessage={(projectId, message) => {
-              if (!config) return;
-              const newProjects = config.projects.map((p) => {
-                if (p.id === projectId) {
-                  return { ...p, foregroundSavedMessages: [...p.foregroundSavedMessages, message] };
-                }
-                return p;
-              });
-              setConfig({ ...config, projects: newProjects });
-            }}
-            onUpdateForegroundMessage={(projectId, index, message) => {
-              if (!config) return;
-              const newProjects = config.projects.map((p) => {
-                if (p.id === projectId) {
-                  const newMessages = [...p.foregroundSavedMessages];
-                  newMessages[index] = message;
-                  return { ...p, foregroundSavedMessages: newMessages };
-                }
-                return p;
-              });
-              setConfig({ ...config, projects: newProjects });
-            }}
             activeAcpChatByProject={activeAcpChatByProject}
             activeAcpSessionByProject={activeAcpSessionByProject}
             activeAcpAttentionByProject={activeAcpAttentionByProject}
@@ -1398,7 +1418,6 @@ function App() {
                 savedMessages: config.projects.find((p) => p.path === selectedProject?.repoRoot || p.path === selectedProject?.path)?.savedMessages || [],
                 aiConfig: {},
                 checklist: [],
-                foregroundSavedMessages: [],
                 isWorktree: true,
                 repoRoot: selectedProject?.repoRoot || selectedProject?.path,
               };

@@ -1,9 +1,15 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { BrowserScopeKeyType } from '../../../shared/types';
 import '@xterm/xterm/css/xterm.css';
+
+interface TerminalContextMenu {
+  x: number;
+  y: number;
+  hasSelection: boolean;
+}
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -23,6 +29,7 @@ interface TerminalPaneProps {
 export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectId, active, onClick, onTerminalOutputClick, wheelEnabled = true, isOpenCodeActive = false, opencodeManualScrollDetached = false, opencodeLeadingBlankRows = 0, onScrollDetached }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
+  const [contextMenu, setContextMenu] = useState<TerminalContextMenu | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const dataUnsubRef = useRef<(() => void) | null>(null);
   const isOpenCodeActiveRef = useRef(isOpenCodeActive);
@@ -44,7 +51,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
 
     const term = new Terminal({
       cursorBlink: true,
-      fontFamily: 'Consolas, "Courier New", monospace',
+      fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace',
       fontSize: 14,
       theme: {
         background: '#0c0c0c',
@@ -53,6 +60,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
         selectionBackground: '#264f78',
       },
       scrollback: 10000,
+      allowProposedApi: true,
     });
 
     const fit = new FitAddon();
@@ -77,6 +85,18 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
 
     term.onData((data) => {
       api.invoke('pty:write', terminalId, data);
+    });
+
+    // Ctrl+C: copy selection to clipboard when text is selected, otherwise send to PTY
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type === 'keydown' && event.ctrlKey && !event.altKey && !event.metaKey && event.key === 'c') {
+        const selection = term.getSelection();
+        if (selection) {
+          navigator.clipboard.writeText(selection).catch(() => {});
+          return false; // prevent xterm from sending \x03 to PTY
+        }
+      }
+      return true; // let xterm handle normally
     });
 
     const unsub = api.on('pty:data', (id: number, data: string) => {
@@ -246,22 +266,151 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
     return () => ro.disconnect();
   }, [terminalId]);
 
-  return (
-    <div
-      ref={containerRef}
-      className="terminal-pane"
-      style={{
-        width: '100%',
-        height: '100%',
-        cursor: 'text',
-      }}
-      onClick={(e) => {
-        onClick?.();
-        // Only trigger terminal output click if not clicking on the xterm selection
-        if ((e.target as HTMLElement).classList.contains('xterm-screen') || (e.target as HTMLElement).classList.contains('xterm-rows')) {
-          onTerminalOutputClick?.();
+  // Close context menu on click outside
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener('click', close);
+    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+    return () => {
+      window.removeEventListener('click', close);
+    };
+  }, [contextMenu]);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const term = termRef.current;
+    const hasSelection = term ? term.hasSelection() : false;
+    setContextMenu({ x: e.clientX, y: e.clientY, hasSelection });
+  }, []);
+
+  const handleCopy = useCallback(() => {
+    const term = termRef.current;
+    if (term && term.hasSelection()) {
+      const selection = term.getSelection();
+      navigator.clipboard.writeText(selection).catch(() => {});
+    }
+    setContextMenu(null);
+  }, []);
+
+  const handlePaste = useCallback(async () => {
+    const term = termRef.current;
+    if (term) {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text) {
+          api.invoke('pty:write', terminalId, text);
         }
-      }}
-    />
+      } catch {
+        // ignore
+      }
+    }
+    setContextMenu(null);
+  }, [terminalId]);
+
+  const handleSelectAll = useCallback(() => {
+    const term = termRef.current;
+    if (term) {
+      term.selectAll();
+    }
+    setContextMenu(null);
+  }, []);
+
+  return (
+    <>
+      <div
+        ref={containerRef}
+        className="terminal-pane"
+        style={{
+          width: '100%',
+          height: '100%',
+          cursor: 'text',
+        }}
+        onClick={(e) => {
+          onClick?.();
+          // Only trigger terminal output click if not clicking on the xterm selection
+          if ((e.target as HTMLElement).classList.contains('xterm-screen') || (e.target as HTMLElement).classList.contains('xterm-rows')) {
+            onTerminalOutputClick?.();
+          }
+        }}
+        onContextMenu={handleContextMenu}
+      />
+      {contextMenu && (
+        <div
+          style={{
+            position: 'fixed',
+            left: contextMenu.x,
+            top: contextMenu.y,
+            zIndex: 1000,
+            background: '#1a1a1a',
+            border: '1px solid #333',
+            borderRadius: 4,
+            padding: '4px 0',
+            fontSize: 12,
+            color: '#ccc',
+            minWidth: 120,
+            boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {contextMenu.hasSelection && (
+            <button
+              onClick={handleCopy}
+              style={{
+                display: 'block',
+                width: '100%',
+                textAlign: 'left',
+                padding: '4px 12px',
+                background: 'transparent',
+                border: 'none',
+                color: '#ccc',
+                cursor: 'pointer',
+                fontSize: 12,
+              }}
+              onMouseEnter={(e) => { (e.target as HTMLElement).style.background = '#333'; }}
+              onMouseLeave={(e) => { (e.target as HTMLElement).style.background = 'transparent'; }}
+            >
+              Copy
+            </button>
+          )}
+          <button
+            onClick={handlePaste}
+            style={{
+              display: 'block',
+              width: '100%',
+              textAlign: 'left',
+              padding: '4px 12px',
+              background: 'transparent',
+              border: 'none',
+              color: '#ccc',
+              cursor: 'pointer',
+              fontSize: 12,
+            }}
+            onMouseEnter={(e) => { (e.target as HTMLElement).style.background = '#333'; }}
+            onMouseLeave={(e) => { (e.target as HTMLElement).style.background = 'transparent'; }}
+          >
+            Paste
+          </button>
+          <button
+            onClick={handleSelectAll}
+            style={{
+              display: 'block',
+              width: '100%',
+              textAlign: 'left',
+              padding: '4px 12px',
+              background: 'transparent',
+              border: 'none',
+              color: '#ccc',
+              cursor: 'pointer',
+              fontSize: 12,
+            }}
+            onMouseEnter={(e) => { (e.target as HTMLElement).style.background = '#333'; }}
+            onMouseLeave={(e) => { (e.target as HTMLElement).style.background = 'transparent'; }}
+          >
+            Select All
+          </button>
+        </div>
+      )}
+    </>
   );
 };

@@ -13,14 +13,15 @@
 
 ## Project Structure & Module Organization
 - `electron/`: primary Electron application, with `main/`, `preload/`, `renderer/`, and `shared/` TypeScript code.
-- `.github/workflows/release.yml`: GitHub release pipeline for Electron Windows ZIP and signed/notarized macOS ARM64 DMG assets.
+- `electron/BUILD.md`: detailed build configuration, troubleshooting, and macOS signing info.
+- `.github/workflows/release.yml`: GitHub release pipeline for Electron Windows portable EXE and signed/notarized macOS ARM64 DMG assets.
 - Build artifacts are in `electron/out/`, `electron/renderer/dist/`, and `electron/renderer/dist-electron/` (do not commit).
 - **Do not watch the GitHub release workflow via CLI.** Once the release is triggered by pushing a version tag, the workflow runs asynchronously on GitHub Actions. There is no need to poll or watch it with `gh run watch` / `gh run list`; the user can track progress through the GitHub web interface if desired.
 
 ## Build, Test, and Development Commands
 - `cd electron && npm ci`: install primary Electron dependencies.
 - `cd electron && npx vitest run`: run Electron renderer/main/shared unit tests.
-- `cd electron && npm run build`: build and package the primary Electron app.
+- `cd electron && npm run build`: build and package the primary Electron app. Produces single portable EXE at `electron/out/mergen-ade-<version>-windows-x64-portable.exe`.
 
 ## Coding Style & Naming Conventions
 - TypeScript, UTF-8, LF/CRLF handled by Git.

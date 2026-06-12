@@ -76,30 +76,90 @@ export function loadConfig(): AppConfig {
   return config;
 }
 
+function mergeLegacyTomlProjects(jsonConfig: AppConfig): { config: AppConfig; merged: boolean } {
+  const legacyPath = legacyConfigPath();
+  if (!fs.existsSync(legacyPath)) return { config: jsonConfig, merged: false };
+  try {
+    const text = fs.readFileSync(legacyPath, 'utf-8');
+    const legacy = parseToml(text) as unknown as AppConfig;
+    const legacyProjects: ProjectRecord[] = legacy.projects ?? [];
+    if (legacyProjects.length === 0) return { config: jsonConfig, merged: false };
+
+    const normalize = (p: string) => normalizeWindowsVerbatimPath(p).replace(/[\\/]+$/, '').toLowerCase();
+    const existingPaths = new Set(jsonConfig.projects.map((p) => normalize(p.path)));
+    let maxId = jsonConfig.projects.reduce((max, p) => Math.max(max, p.id), 0);
+    let merged = false;
+
+    for (const legacyProject of legacyProjects) {
+      const legacyPathNorm = normalize(legacyProject.path);
+      const existing = jsonConfig.projects.find((p) => normalize(p.path) === legacyPathNorm);
+      if (existing) {
+        // Recover saved messages from legacy if current project has none
+        if ((!existing.savedMessages || existing.savedMessages.length === 0)
+          && legacyProject.savedMessages && legacyProject.savedMessages.length > 0) {
+          existing.savedMessages = legacyProject.savedMessages;
+          merged = true;
+        }
+        if (!existing.checklist || existing.checklist.length === 0) {
+          if (legacyProject.checklist && legacyProject.checklist.length > 0) {
+            existing.checklist = legacyProject.checklist;
+            merged = true;
+          }
+        }
+      } else if (existingPaths.has(legacyPathNorm)) {
+        // Duplicate path, skip
+      } else {
+        // Add missing legacy project
+        maxId++;
+        jsonConfig.projects.push({
+          id: maxId,
+          name: legacyProject.name,
+          path: legacyProject.path,
+          savedMessages: legacyProject.savedMessages ?? [],
+          aiConfig: legacyProject.aiConfig ?? { hooksEnabled: false, toolOverrides: {} },
+          checklist: legacyProject.checklist ?? [],
+          browserLastUrl: legacyProject.browserLastUrl,
+          isWorktree: legacyProject.isWorktree ?? false,
+        });
+        existingPaths.add(legacyPathNorm);
+        merged = true;
+      }
+    }
+    return { config: jsonConfig, merged };
+  } catch {
+    return { config: jsonConfig, merged: false };
+  }
+}
+
 export function loadConfigWithStatus(): { config: AppConfig; repaired: boolean } {
   const legacyPath = legacyConfigPath();
   const jsonPath = configPath();
+  if (fs.existsSync(jsonPath)) {
+    try {
+      const text = fs.readFileSync(jsonPath, 'utf-8');
+      const parsed = JSON.parse(text) as AppConfig;
+      let config = normalizeConfig(parsed);
+      // Merge legacy TOML projects and saved messages into JSON config
+      const { config: merged, merged: didMerge } = mergeLegacyTomlProjects(config);
+      config = merged;
+      if (didMerge) {
+        saveConfig(config);
+      }
+      return { config, repaired: didMerge };
+    } catch {
+      return { config: defaultAppConfig(), repaired: false };
+    }
+  }
+  // No JSON yet — try legacy TOML as the sole source
   if (fs.existsSync(legacyPath)) {
     try {
       const text = fs.readFileSync(legacyPath, 'utf-8');
       const parsed = parseToml(text) as unknown as AppConfig;
       const config = normalizeConfig(parsed);
-      // Save migrated config to JSON immediately so legacy TOML is retired
       saveConfig(config);
-      const repaired = true;
-      return { config, repaired };
+      return { config, repaired: true };
     } catch {
-      // fall through to JSON
-    }
-  }
-  if (fs.existsSync(jsonPath)) {
-    try {
-      const text = fs.readFileSync(jsonPath, 'utf-8');
-      const parsed = JSON.parse(text) as AppConfig;
-      const config = normalizeConfig(parsed);
-      return { config, repaired: false };
-    } catch {
-      return { config: defaultAppConfig(), repaired: false };
+      // fall through
     }
   }
   return { config: defaultAppConfig(), repaired: false };
@@ -267,10 +327,11 @@ function normalizeConfig(config: AppConfig): AppConfig {
     changed = true;
   }
 
-  // Ensure foreground_saved_messages exists on all projects
+  // Remove legacy foregroundSavedMessages from all projects
   for (const project of config.projects ?? []) {
-    if (!project.foregroundSavedMessages) {
-      project.foregroundSavedMessages = [];
+    const rec = project as unknown as Record<string, unknown>;
+    if ('foregroundSavedMessages' in rec) {
+      delete rec.foregroundSavedMessages;
       changed = true;
     }
   }

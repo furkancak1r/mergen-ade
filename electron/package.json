@@ -38,6 +38,9 @@
       "output": "out",
       "buildResources": "build"
     },
+    "asarUnpack": [
+      "node_modules/node-pty/**/*"
+    ],
     "files": [
       "renderer/dist/**/*",
       "renderer/dist-electron/**/*",
@@ -48,7 +51,7 @@
     "win": {
       "target": [
         {
-          "target": "zip",
+          "target": "portable",
           "arch": ["x64"]
         }
       ],

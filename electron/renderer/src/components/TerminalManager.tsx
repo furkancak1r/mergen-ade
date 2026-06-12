@@ -86,12 +86,9 @@ interface TerminalManagerProps {
   onKillTerminal: (id: number) => void;
   rerunBackground: (terminalId: number) => void;
   sendSavedMessageToTerminal?: (terminalId: number, message: string, recordRecentInput: boolean) => void;
-  onRemoveForegroundMessage?: (projectId: number, message: string) => void;
-  onAddForegroundMessage?: (projectId: number, message: string) => void;
-  onUpdateForegroundMessage?: (projectId: number, index: number, message: string) => void;
-  activeAcpChatByProject?: Map<number, string>;
-  activeAcpSessionByProject?: Map<number, AcpChatSession>;
-  activeAcpAttentionByProject?: Map<number, AcpTerminalManagerAttentionReason>;
+  activeAcpChatByProject?: Map<string, string>;
+  activeAcpSessionByProject?: Map<string, AcpChatSession>;
+  activeAcpAttentionByProject?: Map<string, AcpTerminalManagerAttentionReason>;
   activeAcpProjectId?: number | null;
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
@@ -112,9 +109,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onKillTerminal,
   rerunBackground,
   sendSavedMessageToTerminal,
-  onRemoveForegroundMessage,
-  onAddForegroundMessage,
-  onUpdateForegroundMessage,
   activeAcpChatByProject,
   activeAcpSessionByProject,
   activeAcpAttentionByProject,
@@ -129,13 +123,9 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
 }) => {
   const [expandedProjects, setExpandedProjects] = useState<Set<number>>(new Set(config.projects.map((p) => p.id)));
   const [showSavedMessages, setShowSavedMessages] = useState<number | null>(null);
-  const [showFgMessages, setShowFgMessages] = useState<number | null>(null);
   const [showLauncherMenu, setShowLauncherMenu] = useState<number | null>(null);
   const [diffSummaries, setDiffSummaries] = useState<Map<number, GitDiffSummary>>(new Map());
   const [diffSummaryLoading, setDiffSummaryLoading] = useState<Set<number>>(new Set());
-  const [fgMessagePopupProject, setFgMessagePopupProject] = useState<number | null>(null);
-  const [fgMessagePopupText, setFgMessagePopupText] = useState('');
-  const [fgMessageEditIndex, setFgMessageEditIndex] = useState<number | null>(null);
   const [historyPopupTerminalId, setHistoryPopupTerminalId] = useState<number | null>(null);
   const [historyPopupJustOpened, setHistoryPopupJustOpened] = useState(false);
   const [pathContextMenu, setPathContextMenu] = useState<TerminalManagerPathContextMenu | null>(null);
@@ -144,9 +134,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   const feedbackTimerRef = useRef<number | null>(null);
 
   const overlayOpen = showSavedMessages !== null
-    || showFgMessages !== null
     || showLauncherMenu !== null
-    || fgMessagePopupProject !== null
     || historyPopupTerminalId !== null
     || pathContextMenu !== null;
 
@@ -264,10 +252,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
     }
     if (!target) return;
     sendSavedMessageToTerminal?.(target.id, message, kind === TerminalKindEnum.Background);
-    if (kind === TerminalKindEnum.Foreground) {
-      onRemoveForegroundMessage?.(projectId, message);
-    }
-  }, [terminals, activeTerminalId, sendSavedMessageToTerminal, onRemoveForegroundMessage]);
+  }, [terminals, activeTerminalId, sendSavedMessageToTerminal]);
 
   // Group projects: root projects first, then their worktrees
   const rootProjects = config.projects.filter((p) => !p.isWorktree);
@@ -300,22 +285,18 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
     return () => document.removeEventListener('click', handleClick);
   }, [historyPopupTerminalId, historyPopupJustOpened]);
 
-  // Close saved messages / fg tasks popups when clicking outside
+  // Close saved messages popup when clicking outside
   useEffect(() => {
-    if (showSavedMessages === null && showFgMessages === null) return;
+    if (showSavedMessages === null) return;
     const handleClick = (e: MouseEvent) => {
       const savedPopup = document.querySelector('[data-saved-popup]');
-      const fgPopup = document.querySelector('[data-fg-popup]');
       if (savedPopup && !savedPopup.contains(e.target as Node)) {
         setShowSavedMessages(null);
-      }
-      if (fgPopup && !fgPopup.contains(e.target as Node)) {
-        setShowFgMessages(null);
       }
     };
     document.addEventListener('click', handleClick);
     return () => document.removeEventListener('click', handleClick);
-  }, [showSavedMessages, showFgMessages]);
+  }, [showSavedMessages]);
 
   useEffect(() => {
     if (!pathContextMenu) return undefined;
@@ -336,7 +317,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
     event.preventDefault();
     event.stopPropagation();
     setShowSavedMessages(null);
-    setShowFgMessages(null);
     setShowLauncherMenu(null);
     setPathContextMenu({
       x: event.clientX,
@@ -434,8 +414,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 onKill={onKillTerminal}
                 showSavedMessages={showSavedMessages}
                 setShowSavedMessages={setShowSavedMessages}
-                showFgMessages={showFgMessages}
-                setShowFgMessages={setShowFgMessages}
                 showLauncherMenu={showLauncherMenu}
                 setShowLauncherMenu={setShowLauncherMenu}
                 sendSavedMessage={sendSavedMessage}
@@ -452,17 +430,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 onOpenAcpChat={onOpenAcpChat}
                 onCreateWorktree={onCreateWorktree}
                 onPathContextMenu={openPathContextMenu}
-                onRemoveForegroundMessage={onRemoveForegroundMessage}
-                onOpenFgMessagePopup={(projectId, message, index) => {
-                  setFgMessagePopupProject(projectId);
-                  setFgMessagePopupText(message);
-                  setFgMessageEditIndex(index);
-                }}
-                onOpenAddFgMessagePopup={(projectId) => {
-                  setFgMessagePopupProject(projectId);
-                  setFgMessagePopupText('');
-                  setFgMessageEditIndex(null);
-                }}
                 historyPopupTerminalId={historyPopupTerminalId}
                 setHistoryPopupTerminalId={(id) => {
                   setHistoryPopupTerminalId(id);
@@ -489,8 +456,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                     onKill={onKillTerminal}
                     showSavedMessages={showSavedMessages}
                     setShowSavedMessages={setShowSavedMessages}
-                    showFgMessages={showFgMessages}
-                    setShowFgMessages={setShowFgMessages}
                     showLauncherMenu={showLauncherMenu}
                     setShowLauncherMenu={setShowLauncherMenu}
                     sendSavedMessage={sendSavedMessage}
@@ -508,17 +473,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                     onOpenAcpChat={onOpenAcpChat}
                     onCreateWorktree={onCreateWorktree}
                     onPathContextMenu={openPathContextMenu}
-                    onRemoveForegroundMessage={onRemoveForegroundMessage}
-                    onOpenFgMessagePopup={(projectId, message, index) => {
-                      setFgMessagePopupProject(projectId);
-                      setFgMessagePopupText(message);
-                      setFgMessageEditIndex(index);
-                    }}
-                    onOpenAddFgMessagePopup={(projectId) => {
-                      setFgMessagePopupProject(projectId);
-                      setFgMessagePopupText('');
-                      setFgMessageEditIndex(null);
-                    }}
                     historyPopupTerminalId={historyPopupTerminalId}
                     setHistoryPopupTerminalId={(id) => {
                       setHistoryPopupTerminalId(id);
@@ -536,142 +490,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
           <div style={{ padding: 12, color: TEXT_MUTED, fontSize: 12 }}>No projects. Add a project in Settings.</div>
         )}
       </div>
-
-      {/* Foreground Message Add/Edit Popup */}
-      {fgMessagePopupProject !== null && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0,0,0,0.6)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 1000,
-          }}
-          onClick={(e) => {
-            if (e.target === e.currentTarget) {
-              setFgMessagePopupProject(null);
-              setFgMessagePopupText('');
-              setFgMessageEditIndex(null);
-            }
-          }}
-        >
-          <div
-            style={{
-              background: SURFACE_BG,
-              border: `1px solid ${BORDER_COLOR}`,
-              borderRadius: 8,
-              width: 480,
-              maxWidth: '90vw',
-              padding: '16px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 12,
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <span style={{ fontSize: 14, fontWeight: 600, color: TEXT_PRIMARY }}>
-                {fgMessageEditIndex !== null ? 'Edit Task' : 'Add Task'}
-              </span>
-              <button
-                onClick={() => {
-                  setFgMessagePopupProject(null);
-                  setFgMessagePopupText('');
-                  setFgMessageEditIndex(null);
-                }}
-                style={{ background: 'transparent', border: 'none', color: TEXT_MUTED, cursor: 'pointer', fontSize: 14 }}
-              >
-                ✕
-              </button>
-            </div>
-            <textarea
-              value={fgMessagePopupText}
-              onChange={(e) => setFgMessagePopupText(e.target.value)}
-              placeholder="Enter task text..."
-              autoFocus
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && e.ctrlKey) {
-                  e.preventDefault();
-                  setFgMessagePopupText((prev) => prev + '\n');
-                }
-                if (e.key === 'Enter' && !e.ctrlKey && !e.shiftKey) {
-                  e.preventDefault();
-                  const text = fgMessagePopupText.trim();
-                  if (!text) return;
-                  if (fgMessageEditIndex !== null) {
-                    onUpdateForegroundMessage?.(fgMessagePopupProject, fgMessageEditIndex, text);
-                  } else {
-                    onAddForegroundMessage?.(fgMessagePopupProject, text);
-                  }
-                  setFgMessagePopupProject(null);
-                  setFgMessagePopupText('');
-                  setFgMessageEditIndex(null);
-                }
-                if (e.key === 'Escape') {
-                  setFgMessagePopupProject(null);
-                  setFgMessagePopupText('');
-                  setFgMessageEditIndex(null);
-                }
-              }}
-              style={{
-                width: '100%',
-                background: withAlpha(SURFACE_BG, 236),
-                border: `1px solid ${withAlpha('#5c5c5c', 230)}`,
-                color: '#ccc',
-                padding: '8px',
-                fontSize: 12,
-                borderRadius: 4,
-                outline: 'none',
-                resize: 'none',
-                minHeight: 80,
-                maxHeight: 160,
-                fontFamily: 'inherit',
-              }}
-              rows={3}
-            />
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-              <button
-                onClick={() => {
-                  setFgMessagePopupProject(null);
-                  setFgMessagePopupText('');
-                  setFgMessageEditIndex(null);
-                }}
-                style={{ padding: '6px 16px', fontSize: 12, background: 'transparent', border: `1px solid ${BORDER_COLOR}`, color: '#ccc', borderRadius: 4, cursor: 'pointer' }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  const text = fgMessagePopupText.trim();
-                  if (!text) return;
-                  if (fgMessageEditIndex !== null) {
-                    onUpdateForegroundMessage?.(fgMessagePopupProject, fgMessageEditIndex, text);
-                  } else {
-                    onAddForegroundMessage?.(fgMessagePopupProject, text);
-                  }
-                  setFgMessagePopupProject(null);
-                  setFgMessagePopupText('');
-                  setFgMessageEditIndex(null);
-                }}
-                disabled={!fgMessagePopupText.trim()}
-                style={{
-                  padding: '6px 16px',
-                  fontSize: 12,
-                  background: BTN_BLUE,
-                  border: `1px solid ${BTN_BLUE}`,
-                  color: '#ccc',
-                  borderRadius: 4,
-                  cursor: fgMessagePopupText.trim() ? 'pointer' : 'not-allowed',
-                  opacity: fgMessagePopupText.trim() ? 1 : 0.5,
-                }}
-              >
-                {fgMessageEditIndex !== null ? 'Save' : 'Add'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {feedback && (
         <div className="terminal-manager-feedback-toast" role="status">
@@ -729,8 +547,6 @@ interface ProjectGroupProps {
   onKill: (id: number) => void;
   showSavedMessages: number | null;
   setShowSavedMessages: (id: number | null) => void;
-  showFgMessages: number | null;
-  setShowFgMessages: (id: number | null) => void;
   showLauncherMenu: number | null;
   setShowLauncherMenu: (id: number | null) => void;
   sendSavedMessage: (projectId: number, message: string, kind: TerminalKind) => void;
@@ -739,18 +555,15 @@ interface ProjectGroupProps {
   allTerminals: TerminalInstance[];
   rootProject?: ProjectRecord;
   isWorktree?: boolean;
-  activeAcpChatByProject?: Map<number, string>;
-  activeAcpSessionByProject?: Map<number, AcpChatSession>;
-  activeAcpAttentionByProject?: Map<number, AcpTerminalManagerAttentionReason>;
+  activeAcpChatByProject?: Map<string, string>;
+  activeAcpSessionByProject?: Map<string, AcpChatSession>;
+  activeAcpAttentionByProject?: Map<string, AcpTerminalManagerAttentionReason>;
   activeAcpProjectId?: number | null;
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
   onOpenAcpChat?: (projectId: number, tool?: string) => void;
   onCreateWorktree?: (projectId: number) => void;
   onPathContextMenu?: (event: React.MouseEvent, project: ProjectRecord, kind: TerminalManagerPathContextKind) => void;
-  onRemoveForegroundMessage?: (projectId: number, message: string) => void;
-  onOpenFgMessagePopup?: (projectId: number, message: string, index: number) => void;
-  onOpenAddFgMessagePopup?: (projectId: number) => void;
   historyPopupTerminalId: number | null;
   setHistoryPopupTerminalId: (id: number | null) => void;
   setHistoryPopupJustOpened: (v: boolean) => void;
@@ -772,8 +585,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   onKill,
   showSavedMessages,
   setShowSavedMessages,
-  showFgMessages,
-  setShowFgMessages,
   showLauncherMenu,
   setShowLauncherMenu,
   sendSavedMessage,
@@ -791,9 +602,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   onOpenAcpChat,
   onCreateWorktree,
   onPathContextMenu,
-  onRemoveForegroundMessage,
-  onOpenFgMessagePopup,
-  onOpenAddFgMessagePopup,
   historyPopupTerminalId,
   setHistoryPopupTerminalId,
   setHistoryPopupJustOpened,
@@ -804,14 +612,14 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   const [hoveredAcpRow, setHoveredAcpRow] = useState(false);
   const effectiveSavedMessages = isWorktree && rootProject ? rootProject.savedMessages : project.savedMessages;
   const hasSavedMessages = effectiveSavedMessages.length > 0;
-  const hasFgMessages = project.foregroundSavedMessages.length > 0;
   const hasLiveTerminals = terminals.length > 0;
   const isSelected = activeTerminalId !== null && terminals.some((t) => t.id === activeTerminalId);
   const hasLiveTerminal = terminals.some((t) => !t.exited);
-  const hasActiveAcpChat = activeAcpChatByProject?.has(project.id) ?? false;
-  const activeAcpSession = activeAcpSessionByProject?.get(project.id);
+  const acpKeyPrefix = `${project.id}:`;
+  const hasActiveAcpChat = activeAcpChatByProject ? Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(acpKeyPrefix)) : false;
+  const activeAcpSession = activeAcpSessionByProject ? Array.from(activeAcpSessionByProject.entries()).find(([k]) => k.startsWith(acpKeyPrefix))?.[1] : undefined;
   const activeAcpStatus = hasActiveAcpChat ? (activeAcpSession?.status ?? 'starting') : undefined;
-  const activeAcpAttention = activeAcpAttentionByProject?.get(project.id);
+  const activeAcpAttention = activeAcpAttentionByProject ? Array.from(activeAcpAttentionByProject.entries()).find(([k]) => k.startsWith(acpKeyPrefix))?.[1] : undefined;
   const activeAcpBadge = acpTerminalManagerBadgeVisual(activeAcpStatus, activeAcpAttention);
   const activeAcpRow = activeAcpProjectId === project.id;
   const activeAcpRowChrome = terminalManagerRowChrome(activeAcpRow, hoveredAcpRow);
@@ -875,7 +683,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
         }}>
           {project.name}
         </span>
-        {showReadyDiff ? (
+        {hoveredProject && showReadyDiff ? (
           <span
             title={diffTooltip}
             style={{
@@ -893,7 +701,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             <span style={{ color: '#64c38c' }}>+{diffSummary!.addedLines}</span>
             <span style={{ color: '#d47a7a' }}>-{diffSummary!.removedLines}</span>
           </span>
-        ) : diffLabel ? (
+        ) : hoveredProject && diffLabel ? (
           <span
             title={diffTooltip}
             style={{
@@ -1084,96 +892,8 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             );
           })()}
 
-          {/* Foreground tasks popup - per terminal */}
-          {showFgMessages !== null && (() => {
-            const t = terminals.find((x) => x.id === showFgMessages);
-            if (!t) return null;
-            return (
-              <div data-fg-popup style={{
-                position: 'fixed',
-                zIndex: 20,
-                background: SURFACE_BG,
-                border: `1px solid ${BORDER_COLOR}`,
-                borderRadius: 4,
-                padding: '4px 8px',
-                width: 200,
-                maxHeight: 300,
-                overflow: 'auto',
-                boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
-              }}>
-                {project.foregroundSavedMessages.length === 0 && (
-                  <div style={{ fontSize: 11, color: TEXT_MUTED, padding: '2px 0' }}>No tasks in queue</div>
-                )}
-                {project.foregroundSavedMessages.map((msg, i) => (
-                  <div key={i} style={{ display: 'flex', gap: 4, marginBottom: 2, alignItems: 'center' }}>
-                    <button
-                      onClick={() => {
-                        sendSavedMessage(t.projectId, msg, TerminalKindEnum.Foreground);
-                        setShowFgMessages(null);
-                      }}
-                      style={{
-                        flex: 1,
-                        textAlign: 'left',
-                        padding: '3px 6px',
-                        fontSize: 11,
-                        background: 'transparent',
-                        border: `1px solid ${BORDER_COLOR}`,
-                        color: '#aaa',
-                        borderRadius: 3,
-                        cursor: 'pointer',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                      title={cappedHoverText(msg)}
-                    >
-                      {msg}
-                    </button>
-                    <button
-                      onClick={() => {
-                        onOpenFgMessagePopup?.(t.projectId, msg, i);
-                      }}
-                      style={{ background: 'transparent', border: 'none', color: TEXT_MUTED, cursor: 'pointer', fontSize: 10, padding: '2px 4px' }}
-                      title="Edit"
-                    >
-                      ✎
-                    </button>
-                    <button
-                      onClick={() => {
-                        onRemoveForegroundMessage?.(t.projectId, msg);
-                      }}
-                      style={{ background: 'transparent', border: 'none', color: TEXT_MUTED, cursor: 'pointer', fontSize: 10, padding: '2px 4px' }}
-                      title="Delete"
-                    >
-                      🗑
-                    </button>
-                  </div>
-                ))}
-                <button
-                  onClick={() => {
-                    onOpenAddFgMessagePopup?.(t.projectId);
-                  }}
-                  style={{
-                    marginTop: 4,
-                    padding: '3px 6px',
-                    fontSize: 11,
-                    background: 'transparent',
-                    border: `1px solid ${BORDER_COLOR}`,
-                    color: TEXT_MUTED,
-                    borderRadius: 3,
-                    cursor: 'pointer',
-                    width: '100%',
-                    textAlign: 'left',
-                  }}
-                >
-                  + Add New
-                </button>
-              </div>
-            );
-          })()}
-
-          {/* OpenCode ACP row */}
-          {hasActiveAcpChat && (
+          {/* OpenCode ACP row - only in Foreground filter */}
+          {hasActiveAcpChat && filter === TerminalManagerFilterEnum.Foreground && (
             <div
               style={{
                 display: 'flex',
@@ -1288,14 +1008,16 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   }} />
                 )}
                 {/* AI status badge */}
-                <span style={{
-                  width: 6,
-                  height: 6,
-                  borderRadius: '50%',
-                  background: displayAiStatus === 'running' ? '#64c864' : displayAiStatus === 'attention' ? '#e8a838' : '#666',
-                  flexShrink: 0,
-                  zIndex: 1,
-                }} />
+                <span
+                  className={`terminal-ai-badge terminal-ai-badge--${displayAiStatus === 'running' ? 'spinner' : displayAiStatus === 'attention' ? 'pulse' : 'solid'}`}
+                  style={
+                    displayAiStatus === 'running'
+                      ? { borderColor: 'rgba(100, 200, 100, 0.25)', borderTopColor: '#64c864' }
+                      : displayAiStatus === 'attention'
+                        ? { background: '#e8a838' }
+                        : { background: '#666' }
+                  }
+                />
                 <span style={{
                   fontSize: 11,
                   color: t.exited ? withAlpha(TEXT_MUTED, 160) : rowChrome.titleColor,
@@ -1406,32 +1128,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                           💬
                         </button>
                       )}
-                      {t.kind === 'foreground' && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setShowFgMessages(showFgMessages === t.id ? null : t.id);
-                          }}
-                          style={{
-                            padding: '1px 4px',
-                            fontSize: 10,
-                            background: 'transparent',
-                            border: '1px solid #444',
-                            color: hasFgMessages ? '#64c864' : TEXT_MUTED,
-                            borderRadius: 3,
-                            cursor: 'pointer',
-                            flexShrink: 0,
-                            width: TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH,
-                            height: CONTROL_ROW_HEIGHT - 4,
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                          }}
-                          title="Foreground tasks"
-                        >
-                          💬
-                        </button>
-                      )}
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
@@ -1520,7 +1216,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                 >
                   <span style={{ fontSize: 10, color: withAlpha(TEXT_MUTED, 120), flexShrink: 0, marginTop: 2 }}>{i + 1}.</span>
                   <div style={{ flex: 1, overflow: 'auto', maxHeight: TERMINAL_HISTORY_MESSAGE_MAX_HEIGHT }}>
-                    <pre style={{ margin: 0, fontSize: 11, color: '#ccc', fontFamily: 'Consolas, "Courier New", monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                    <pre style={{ margin: 0, fontSize: 11, color: '#ccc', fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                       {input}
                     </pre>
                   </div>

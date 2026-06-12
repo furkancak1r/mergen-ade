@@ -317,7 +317,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
                 }}>
                   {f.staged ? '✓' : '◷'}
                 </span>
-                <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace' }}>
+                <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace' }}>
                   {repairMojibakeDisplay(`${statusLabel(f.status)} ${f.path}`)}
                 </span>
               </div>

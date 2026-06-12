@@ -14,7 +14,6 @@ function project(partial: Partial<ProjectRecord>): ProjectRecord {
     name: partial.name ?? 'Project',
     path: partial.path ?? 'C:\\repo',
     savedMessages: [],
-    foregroundSavedMessages: [],
     aiConfig: {},
     checklist: partial.checklist ?? [],
     isWorktree: false,

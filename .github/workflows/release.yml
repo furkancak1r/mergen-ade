@@ -37,7 +37,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-windows
-          path: electron/out/mergen-ade-*-windows-x64-portable.zip
+          path: electron/out/mergen-ade-*-windows-x64-portable.exe
           if-no-files-found: error
 
   build-macos:

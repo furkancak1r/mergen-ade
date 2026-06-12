@@ -305,7 +305,7 @@ export const FileEditor: React.FC<FileEditorProps> = ({
               background: '#0c0c0c',
               border: 'none',
               color: '#ccc',
-              fontFamily: 'Consolas, "Courier New", monospace',
+              fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace',
               fontSize: 13,
               lineHeight: 1.5,
               resize: 'none',

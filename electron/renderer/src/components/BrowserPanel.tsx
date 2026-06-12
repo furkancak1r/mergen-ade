@@ -316,7 +316,7 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
   }, [scope]);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#0c0c0c' }}>
+    <div data-browser-panel style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#0c0c0c' }}>
       <div className="browser-tab-strip">
         {tabs.map((tab) => {
           const title = browserTabTitle(tab);
@@ -368,6 +368,7 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
           </button>
         </TooltipAbove>
         <input
+          data-browser-url
           value={urlDraft}
           onChange={(e) => setUrlDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') go(); }}

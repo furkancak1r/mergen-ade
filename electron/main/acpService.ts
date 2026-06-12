@@ -187,7 +187,27 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
   if (isClaudeCode) {
     session.sessionId = `claude-${Date.now()}`;
     session.status = 'idle';
+
+    // Populate configOptions with the current model so the UI selector is not empty
+    const currentModel = process.env.ANTHROPIC_MODEL || 'mimo-v2.5-pro';
+    session.currentModel = currentModel;
+    session.configOptions = [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        currentValue: currentModel,
+        options: [
+          { value: 'mimo-v2.5-pro', label: 'mimo-v2.5-pro' },
+          { value: 'claude-sonnet-4-6', label: 'claude-sonnet-4-6' },
+          { value: 'claude-opus-4-7', label: 'claude-opus-4-7' },
+          { value: 'claude-haiku-4-5-20251001', label: 'claude-haiku-4-5' },
+        ],
+      },
+    ];
+
     broadcast('acp:event', chatId, { type: 'sessionCreated', sessionId: session.sessionId });
+    broadcast('acp:event', chatId, { type: 'configOptions', options: session.configOptions });
     return chatId;
   }
 
