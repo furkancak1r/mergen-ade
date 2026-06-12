@@ -3,6 +3,7 @@ import { BrowserScopeKeyType } from '../../../shared/types';
 import type { BrowserScopeKey, ProjectRecord, BrowserTab } from '../../../shared/types';
 import { normalizeBrowserUrl } from '../lib/urlNormalize';
 import { browserAddTabTooltip, browserCanAddTab, browserScreenshotButtonMeta, browserTabTitle, browserToolbarButtonMeta, browserToolbarCanClearUrl, clearBrowserActiveTabUrl } from '../lib/browserToolbar';
+import { Tooltip } from './Tooltip';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
 
@@ -29,60 +30,6 @@ function scopeKeyString(scope: BrowserScopeKey): string {
     return `terminal:${scope.projectId}:${scope.terminalId}`;
   }
   return `project:${scope.projectId}`;
-}
-
-function TooltipAbove({ children, text, disabled }: { children: React.ReactElement; text: string; disabled?: boolean }) {
-  const [show, setShow] = React.useState(false);
-  const [visible, setVisible] = React.useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  React.useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
-  }, []);
-
-  if (disabled) return children;
-
-  return (
-    <div
-      ref={ref}
-      style={{ position: 'relative', display: 'inline-flex' }}
-      onMouseEnter={() => {
-        timerRef.current = setTimeout(() => setVisible(true), 1000);
-        setShow(true);
-      }}
-      onMouseLeave={() => {
-        if (timerRef.current) clearTimeout(timerRef.current);
-        setShow(false);
-        setVisible(false);
-      }}
-    >
-      {children}
-      {show && visible && (
-        <div
-          style={{
-            position: 'absolute',
-            bottom: 'calc(100% + 6px)',
-            left: '50%',
-            transform: 'translateX(-50%)',
-            background: '#1a1a1a',
-            border: '1px solid #333',
-            borderRadius: 4,
-            padding: '4px 8px',
-            fontSize: 11,
-            color: '#ccc',
-            whiteSpace: 'nowrap',
-            zIndex: 1000,
-            pointerEvents: 'none',
-          }}
-        >
-          {text}
-        </div>
-      )}
-    </div>
-  );
 }
 
 export const BrowserPanel: React.FC<BrowserPanelProps> = ({
@@ -321,7 +268,7 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
         {tabs.map((tab) => {
           const title = browserTabTitle(tab);
           return (
-            <TooltipAbove key={tab.id} text={title}>
+            <Tooltip key={tab.id} text={title}>
               <div
                 onClick={() => switchTab(tab.id)}
                 className={`browser-tab ${activeTabId === tab.id ? 'active' : ''}`}
@@ -345,10 +292,10 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
                   ✕
                 </button>
               </div>
-            </TooltipAbove>
+            </Tooltip>
           );
         })}
-        <TooltipAbove text={addTabTooltip}>
+        <Tooltip text={addTabTooltip}>
           <button
             onClick={addTab}
             className="browser-add-tab-btn"
@@ -358,15 +305,15 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
           >
             +
           </button>
-        </TooltipAbove>
+        </Tooltip>
       </div>
 
       <div style={{ display: 'flex', gap: 4, padding: '4px 8px', borderBottom: '1px solid #222', alignItems: 'center' }}>
-        <TooltipAbove text={refreshButton.tooltip}>
+        <Tooltip text={refreshButton.tooltip}>
           <button onClick={refresh} className="browser-toolbar-btn" type="button" aria-label={refreshButton.ariaLabel}>
             {refreshButton.icon}
           </button>
-        </TooltipAbove>
+        </Tooltip>
         <input
           data-browser-url
           value={urlDraft}
@@ -376,35 +323,35 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
           placeholder="Enter URL..."
           style={{ flex: 1, background: '#1a1a1a', border: '1px solid #333', borderRadius: 4, padding: '4px 8px', color: '#ccc', fontSize: 12, outline: 'none', minWidth: 100 }}
         />
-        <TooltipAbove text={clearButton.tooltip}>
+        <Tooltip text={clearButton.tooltip}>
           <button onClick={clearUrl} className="browser-toolbar-btn" type="button" disabled={!canClearUrl} aria-label={clearButton.ariaLabel}>
             {clearButton.icon}
           </button>
-        </TooltipAbove>
-        <TooltipAbove text={inspectButton.tooltip}>
+        </Tooltip>
+        <Tooltip text={inspectButton.tooltip}>
           <button onClick={toggleDesignInspect} className={`browser-toolbar-btn ${inspectButton.selected ? 'active' : ''}`} type="button" aria-label={inspectButton.ariaLabel}>
             {inspectButton.icon}
           </button>
-        </TooltipAbove>
+        </Tooltip>
         <div className="browser-screenshot-group" role="group" aria-label="Browser screenshot controls">
-          <TooltipAbove text={fullPageScreenshot.tooltip}>
+          <Tooltip text={fullPageScreenshot.tooltip}>
             <button onClick={() => takeScreenshot(fullPageScreenshot.fullPage)} className="browser-screenshot-btn" type="button" aria-label={fullPageScreenshot.ariaLabel}>
               {fullPageScreenshot.icon}
             </button>
-          </TooltipAbove>
+          </Tooltip>
           <span className="browser-screenshot-divider" aria-hidden="true" />
-          <TooltipAbove text={visibleAreaScreenshot.tooltip}>
+          <Tooltip text={visibleAreaScreenshot.tooltip}>
             <button onClick={() => takeScreenshot(visibleAreaScreenshot.fullPage)} className="browser-screenshot-btn" type="button" aria-label={visibleAreaScreenshot.ariaLabel}>
               {visibleAreaScreenshot.icon}
             </button>
-          </TooltipAbove>
+          </Tooltip>
         </div>
         {onClose && (
-          <TooltipAbove text="Close browser panel">
+          <Tooltip text="Close browser panel">
             <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 14 }}>
               ✕
             </button>
-          </TooltipAbove>
+          </Tooltip>
         )}
       </div>
 

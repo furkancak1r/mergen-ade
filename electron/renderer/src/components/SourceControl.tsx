@@ -175,7 +175,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
             <select
               className="source-control-project-select"
               value={selectedProjectId ?? project.id}
-              title={project.path}
+              data-tooltip={project.path}
               onChange={(event) => onSelectProject(Number(event.target.value))}
             >
               {projects.map((item) => (
@@ -185,7 +185,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
               ))}
             </select>
           ) : (
-            <span className="source-control-project-name" title={project.path}>
+            <span className="source-control-project-name" data-tooltip={project.path}>
               {repairMojibakeDisplay(project.name)}
             </span>
           )}
@@ -193,7 +193,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
             onClick={() => refresh(true)}
             className="source-control-toolbar-btn"
             type="button"
-            title={refreshButton.tooltip}
+            data-tooltip={refreshButton.tooltip}
             aria-label={refreshButton.ariaLabel}
           >
             {refreshButton.icon}
@@ -202,7 +202,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
             onClick={() => refresh(true, true)}
             className="source-control-toolbar-btn"
             type="button"
-            title={fetchButton.tooltip}
+            data-tooltip={fetchButton.tooltip}
             aria-label={fetchButton.ariaLabel}
           >
             {fetchButton.icon}
@@ -215,7 +215,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
             }}
             className="source-control-toolbar-btn"
             type="button"
-            title={folderButton.tooltip}
+            data-tooltip={folderButton.tooltip}
             aria-label={folderButton.ariaLabel}
           >
             {folderButton.icon}
@@ -224,7 +224,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
             onClick={openCreateWorktreeModal}
             className={`source-control-toolbar-btn ${createButton.accent ? 'accent' : ''}`}
             type="button"
-            title={createButton.tooltip}
+            data-tooltip={createButton.tooltip}
             aria-label={createButton.ariaLabel}
           >
             {createButton.icon}
@@ -262,7 +262,7 @@ export const SourceControl: React.FC<SourceControlProps> = ({ project, projects,
               <div
                 key={w.path}
                 className={`source-control-worktree-row ${worktreeRow.isCurrent ? 'current' : ''} ${worktreeRow.canAdd ? 'clickable' : ''}`}
-                title={worktreeRow.tooltip}
+                data-tooltip={worktreeRow.tooltip}
                 onClick={() => {
                   if (!worktreeRow.canAdd) return;
                   onAddWorktree?.(w);

@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import type { AcpChatSession, AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry } from '../../../shared/types';
 import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalManagerFilterEnum, BuiltinLauncherKind, activeBuildModel } from '../../../shared/types';
 import type { GitDiffSummary } from '../../../shared/gitDiffSummary';
@@ -121,7 +121,18 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onUpdateFilter,
   onToggleHideInactiveProjects,
 }) => {
-  const [expandedProjects, setExpandedProjects] = useState<Set<number>>(new Set(config.projects.map((p) => p.id)));
+  // Only expand projects that have active terminals or ACP chats
+  const initialExpanded = useMemo(() => {
+    const expanded = new Set<number>();
+    for (const p of config.projects) {
+      const hasTerminal = terminals.some((t) => t.projectId === p.id && !t.exited);
+      const prefix = `${p.id}:`;
+      const hasAcp = activeAcpChatByProject ? Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix)) : false;
+      if (hasTerminal || hasAcp) expanded.add(p.id);
+    }
+    return expanded;
+  }, [config.projects, terminals, activeAcpChatByProject]);
+  const [expandedProjects, setExpandedProjects] = useState<Set<number>>(initialExpanded);
   const [showSavedMessages, setShowSavedMessages] = useState<number | null>(null);
   const [showLauncherMenu, setShowLauncherMenu] = useState<number | null>(null);
   const [diffSummaries, setDiffSummaries] = useState<Map<number, GitDiffSummary>>(new Map());
@@ -363,7 +374,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
         })}
         <button
           onClick={onToggleHideInactiveProjects}
-          title={hideInactive ? 'Show projects without live terminals' : 'Hide projects without live terminals'}
+          data-tooltip={hideInactive ? 'Show projects without live terminals' : 'Hide projects without live terminals'}
           style={{
             width: 28,
             height: 24,
@@ -685,7 +696,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
         </span>
         {hoveredProject && showReadyDiff ? (
           <span
-            title={diffTooltip}
+            data-tooltip={diffTooltip}
             style={{
               display: 'inline-flex',
               gap: 4,
@@ -703,7 +714,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
           </span>
         ) : hoveredProject && diffLabel ? (
           <span
-            title={diffTooltip}
+            data-tooltip={diffTooltip}
             style={{
               fontSize: 10,
               color: withAlpha(TEXT_MUTED, 150),
@@ -834,7 +845,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                       color: '#ccc',
                       cursor: 'pointer',
                     }}
-                    title={l.displayName + (l.launchCommand ? ' — ' + l.launchCommand : '')}
+                    data-tooltip={l.displayName + (l.launchCommand ? ' — ' + l.launchCommand : '')}
                   >
                     {l.displayName}
                   </button>
@@ -883,7 +894,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
                     }}
-                    title={cappedHoverText(msg)}
+                    data-tooltip={cappedHoverText(msg)}
                   >
                     {msg}
                   </button>
@@ -923,7 +934,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
               {activeAcpBadge && (
                 <span
                   className="acp-terminal-manager-badge-slot"
-                  title={`${acpLabelForTool(activeAcpSession?.tool)}: ${acpStatusText(activeAcpStatus)}`}
+                  data-tooltip={`${acpLabelForTool(activeAcpSession?.tool)}: ${acpStatusText(activeAcpStatus)}`}
                 >
                   <span
                     className={`acp-terminal-manager-badge acp-terminal-manager-badge--${activeAcpBadge.kind}`}
@@ -965,7 +976,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   flexShrink: 0,
                   zIndex: 1,
                 }}
-                title={`Close ${acpLabelForTool(activeAcpSession?.tool)}`}
+                data-tooltip={`Close ${acpLabelForTool(activeAcpSession?.tool)}`}
               >
                 ✕
               </button>
@@ -1070,7 +1081,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                             alignItems: 'center',
                             justifyContent: 'center',
                           }}
-                          title={displayAiStatus === 'running' ? 'Interrupt' : 'Rerun'}
+                          data-tooltip={displayAiStatus === 'running' ? 'Interrupt' : 'Rerun'}
                         >
                           {displayAiStatus === 'running' ? '✕' : '↻'}
                         </button>
@@ -1097,7 +1108,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                             alignItems: 'center',
                             justifyContent: 'center',
                           }}
-                          title="Show input history"
+                          data-tooltip="Show input history"
                         >
                           🕒
                         </button>
@@ -1123,7 +1134,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                             alignItems: 'center',
                             justifyContent: 'center',
                           }}
-                          title="Send saved message"
+                          data-tooltip="Send saved message"
                         >
                           💬
                         </button>
@@ -1148,7 +1159,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                           alignItems: 'center',
                           justifyContent: 'center',
                         }}
-                        title="Kill"
+                        data-tooltip="Kill"
                       >
                         ✕
                       </button>
@@ -1243,7 +1254,7 @@ const IconButton: React.FC<IconButtonProps> = ({ icon, tooltip, onClick }) => {
       onClick={onClick}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
-      title={tooltip}
+      data-tooltip={tooltip}
       style={{
         width: CONTROL_ROW_HEIGHT,
         height: CONTROL_ROW_HEIGHT,

@@ -40,8 +40,6 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
   const [editRestoreIndex, setEditRestoreIndex] = useState<number | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
-  const [resizing, setResizing] = useState(false);
-  const footerRef = useRef<HTMLDivElement>(null);
   const customInputRef = useRef<HTMLInputElement>(null);
 
   const updateDraft = useCallback((text: string) => {
@@ -95,25 +93,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
     addTask();
   }, [addTask]);
 
-  // Footer resize handling
-  useEffect(() => {
-    if (!resizing) return;
-    function handleMove(e: MouseEvent) {
-      if (!footerRef.current) return;
-      const rect = footerRef.current.getBoundingClientRect();
-      const newHeight = Math.max(60, Math.min(400, rect.height - e.movementY));
-      onUpdateState({ ...state, userHeight: newHeight });
-    }
-    function handleUp() {
-      setResizing(false);
-    }
-    window.addEventListener('mousemove', handleMove);
-    window.addEventListener('mouseup', handleUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMove);
-      window.removeEventListener('mouseup', handleUp);
-    };
-  }, [resizing, onUpdateState, state]);
+  // Footer resize handling (removed - height is now fixed based on queue)
 
   // Question keyboard handling
   useEffect(() => {
@@ -199,13 +179,24 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
 
   const isQuestionActive = !!question;
 
-  // Compute safe minimum height based on visible content
-  const queueVisibleHeight = state.queue.length > 0 ? Math.min(state.queue.length * 20 + 8, 120) : 0;
-  const safeMinHeight = 32 + queueVisibleHeight + 40 + 8; // header + queue + draft + padding
-  const footerHeight = state.userHeight ? Math.max(safeMinHeight, Math.min(400, state.userHeight)) : undefined;
-  const footerStyle: React.CSSProperties = footerHeight
-    ? { height: footerHeight, minHeight: safeMinHeight, maxHeight: 400, display: 'flex', flexDirection: 'column', background: '#0c0c0c', borderTop: '1px solid #222' }
-    : { borderTop: '1px solid #222', padding: '6px 8px', background: '#0c0c0c' };
+  // Compute fixed height based on queue items (max 5 rows)
+  const maxVisibleRows = 5;
+  const rowHeight = 24;
+  const queueRowCount = Math.min(state.queue.length, maxVisibleRows);
+  const queueHeight = queueRowCount > 0 ? queueRowCount * rowHeight + 8 : 0;
+  const headerHeight = 32;
+  const draftHeight = 40;
+  const padding = 8;
+  const footerHeight = headerHeight + queueHeight + draftHeight + padding;
+  const footerStyle: React.CSSProperties = {
+    height: footerHeight,
+    minHeight: footerHeight,
+    maxHeight: footerHeight,
+    display: 'flex',
+    flexDirection: 'column',
+    background: '#0c0c0c',
+    borderTop: '1px solid #222',
+  };
 
   // Context menu selection preservation
   const draftRef = useRef<HTMLTextAreaElement>(null);
@@ -277,24 +268,9 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
   }, [contextMenu]);
 
   return (
-    <div ref={footerRef} style={footerStyle}>
+    <div style={footerStyle}>
       {/* Resize handle */}
-      {!isQuestionActive && (
-        <div
-          onMouseDown={() => setResizing(true)}
-          style={{
-            height: 4,
-            cursor: 'row-resize',
-            background: resizing ? '#0078d4' : 'transparent',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            flexShrink: 0,
-          }}
-        >
-          <div style={{ width: 24, height: 2, background: '#444', borderRadius: 1 }} />
-        </div>
-      )}
+      {/* Resize handle removed - height is fixed based on queue */}
       {/* Question Card */}
       {isQuestionActive && (
         <div style={{ marginBottom: 8, padding: '8px 10px', background: '#141414', border: '1px solid #333', borderRadius: 8 }}>

@@ -1253,7 +1253,7 @@ function App() {
         <button
           className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.Directory) ? 'active' : ''}`}
           onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.Directory)}
-          title={activityRailItem('directory').title}
+          data-tooltip={activityRailItem('directory').title}
           aria-label={activityRailItem('directory').title}
         >
           <span className="rail-icon">{activityRailItem('directory').icon}</span>
@@ -1261,7 +1261,7 @@ function App() {
         <button
           className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.TerminalManager) ? 'active' : ''}`}
           onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.TerminalManager)}
-          title={activityRailItem('terminalManager').title}
+          data-tooltip={activityRailItem('terminalManager').title}
           aria-label={activityRailItem('terminalManager').title}
         >
           <span className="rail-icon terminal">{activityRailItem('terminalManager').icon}</span>
@@ -1269,7 +1269,7 @@ function App() {
         <button
           className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.SourceControl) ? 'active' : ''}`}
           onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.SourceControl)}
-          title={activityRailItem('sourceControl').title}
+          data-tooltip={activityRailItem('sourceControl').title}
           aria-label={activityRailItem('sourceControl').title}
         >
           <span className="rail-icon">{activityRailItem('sourceControl').icon}</span>
@@ -1277,7 +1277,7 @@ function App() {
         <button
           className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.InputHistory) ? 'active' : ''}`}
           onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.InputHistory)}
-          title={activityRailItem('inputHistory').title}
+          data-tooltip={activityRailItem('inputHistory').title}
           aria-label={activityRailItem('inputHistory').title}
         >
           <span className="rail-icon">{activityRailItem('inputHistory').icon}</span>
@@ -1286,7 +1286,7 @@ function App() {
         <button
           className={`rail-btn ${isBrowserOpen ? 'active' : ''}`}
           onClick={toggleBrowser}
-          title={activityRailItem('browser').title}
+          data-tooltip={activityRailItem('browser').title}
           aria-label={activityRailItem('browser').title}
         >
           <span className="rail-icon">{activityRailItem('browser').icon}</span>
@@ -1294,7 +1294,7 @@ function App() {
         <button
           className={`rail-btn ${checklistVisible ? 'active' : ''}`}
           onClick={() => setChecklistVisible((v) => !v)}
-          title={activityRailItem('checklist').title}
+          data-tooltip={activityRailItem('checklist').title}
           aria-label={activityRailItem('checklist').title}
         >
           <span className="rail-icon">{activityRailItem('checklist').icon}</span>
@@ -1302,7 +1302,7 @@ function App() {
         <button
           className={`rail-btn ${settingsOpen ? 'active' : ''}`}
           onClick={() => setSettingsOpen(true)}
-          title={activityRailItem('settings').title}
+          data-tooltip={activityRailItem('settings').title}
           aria-label={activityRailItem('settings').title}
         >
           <span className="rail-icon">{activityRailItem('settings').icon}</span>
