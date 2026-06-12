@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { BrowserWindow } from 'electron';
 import type { AcpChatSession, AcpConfigOption, AcpAvailableCommand, AcpChatMessage, OpenCodeModelConfig, QueuedAcpPrompt } from '../shared/types';
 import { activeBuildModel, effectivePlanModel, effectivePlanEffort, mergeAcpKnownModels } from '../shared/types';
@@ -40,7 +41,7 @@ function acpChatTitleFromPrompt(promptText: string): string {
 }
 
 function updateAcpChatTitleFromPrompt(session: AcpSession, promptText: string): void {
-  if (!session.title || session.title === 'OpenCode ACP') {
+  if (!session.title || session.title === 'OpenCode ACP' || session.title === 'Claude Code ACP') {
     session.title = acpChatTitleFromPrompt(promptText);
   }
 }
@@ -72,6 +73,7 @@ interface AcpSession {
   cancelUnsupported?: boolean;
   pendingInteractions: Map<string, AcpPendingInteraction>;
   nextInteractionId: number;
+  tool?: 'opencode' | 'claude_acp';
 }
 
 const sessions = new Map<string, AcpSession>();
@@ -156,11 +158,9 @@ function applyModeModelBinding(session: AcpSession, modeId: string): void {
   }
 }
 
-export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpServers: string[] }): Promise<string> {
+export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpServers: string[]; tool?: string }): Promise<string> {
   const chatId = `acp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-  const opencodeBin = getOpencodeBinPath();
-  const initialModeId = startupModeToModeId(loadConfig().acpStartupMode);
+  const isClaudeCode = opts.tool === 'claude_acp';
 
   const session: AcpSession = {
     process: null as unknown as ChildProcess,
@@ -169,18 +169,30 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
     cwd: opts.cwd,
     mcpServers: opts.mcpServers,
     status: 'starting',
-    title: 'OpenCode ACP',
+    title: isClaudeCode ? 'Claude Code ACP' : 'OpenCode ACP',
     messages: [],
     promptInput: '',
     attachments: [],
     configOptions: [],
-    currentModeId: initialModeId,
+    currentModeId: isClaudeCode ? undefined : startupModeToModeId(loadConfig().acpStartupMode),
     queuedPrompts: [],
     pendingInteractions: new Map(),
     nextInteractionId: 1,
+    tool: isClaudeCode ? 'claude_acp' : 'opencode',
   };
 
   sessions.set(chatId, session);
+
+  // Claude Code: fake handshake, session ready immediately
+  if (isClaudeCode) {
+    session.sessionId = `claude-${Date.now()}`;
+    session.status = 'idle';
+    broadcast('acp:event', chatId, { type: 'sessionCreated', sessionId: session.sessionId });
+    return chatId;
+  }
+
+  // OpenCode: spawn acp process
+  const opencodeBin = getOpencodeBinPath();
 
   try {
     // Ensure cwd is valid and absolute on Windows
@@ -571,6 +583,12 @@ function flushNextQueuedPrompt(session: AcpSession): void {
     setSessionMode(session, next.modeId);
   }
 
+  // Claude Code: spawn new process for queued prompt
+  if (session.tool === 'claude_acp') {
+    sendClaudeCodePrompt(session, next.text, next.attachments);
+    return;
+  }
+
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
   const msg: AcpChatMessage = { role: 'user', text: fullText, timestamp: Date.now() };
@@ -578,6 +596,138 @@ function flushNextQueuedPrompt(session: AcpSession): void {
   session.messages.push(msg);
   sendRpc(session, 'session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: fullText }] });
   broadcast('acp:event', session.chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
+}
+
+function sendClaudeCodePrompt(session: AcpSession, promptText: string, attachments: string[]): void {
+  const fullText = buildAcpPromptText(promptText, attachments);
+
+  // Queue if already running
+  if (session.status === 'running') {
+    updateAcpChatTitleFromPrompt(session, fullText);
+    session.queuedPrompts.push({ text: promptText, attachments, modeId: 'build', finalPromptText: fullText });
+    broadcast('acp:event', session.chatId, { type: 'queued', count: session.queuedPrompts.length, queuedPrompts: session.queuedPrompts.length });
+    return;
+  }
+
+  session.status = 'running';
+  const msg: AcpChatMessage = { role: 'user', text: fullText, timestamp: Date.now() };
+  updateAcpChatTitleFromPrompt(session, fullText);
+  session.messages.push(msg);
+  broadcast('acp:event', session.chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
+
+  const args = ['--print', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions'];
+
+  try {
+    // On Windows, .cmd files require shell:true. Stdin piping through
+    // cmd.exe doesn't work, so pass prompt via temp file + shell redirect.
+    let proc: ReturnType<typeof spawn>;
+    if (process.platform === 'win32') {
+      const tmpFile = path.join(os.tmpdir(), `mergen-claude-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+      fs.writeFileSync(tmpFile, fullText, 'utf-8');
+      // Use shell:true with stdin redirect from temp file
+      proc = spawn(`claude.cmd ${args.join(' ')} < "${tmpFile}"`, [], {
+        cwd: session.cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        shell: true,
+      });
+      const cleanup = () => { try { fs.unlinkSync(tmpFile); } catch { /* ignore */ } };
+      proc.on('exit', cleanup);
+      proc.on('error', cleanup);
+    } else {
+      proc = spawn('claude', args, {
+        cwd: session.cwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      proc.stdin?.write(fullText);
+      proc.stdin?.end();
+    }
+
+    session.process = proc;
+
+    // Parse NDJSON output
+    let buffer = '';
+    proc.stdout?.on('data', (data) => {
+      buffer += data.toString();
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        if (line.trim()) {
+          handleClaudeCodeLine(session, line);
+        }
+      }
+    });
+
+    proc.stderr?.on('data', (data) => {
+      const text = stripAnsi(data.toString()).trim();
+      if (!text) return;
+      session.partialStderr = (session.partialStderr || '') + text + '\n';
+      broadcast('acp:event', session.chatId, { type: 'stderr', text });
+    });
+
+    proc.on('exit', (_code) => {
+      session.process = null;
+      session.status = 'idle';
+      clearPendingInteractions(session);
+      broadcast('acp:event', session.chatId, { type: 'promptResponse', stopReason: 'end_turn', queuedPrompts: session.queuedPrompts.length });
+      flushNextQueuedPrompt(session);
+    });
+
+    proc.on('error', (err) => {
+      session.process = null;
+      session.status = 'error';
+      clearPendingInteractions(session);
+      const text = err.message;
+      appendAcpSystemMessage(session, `Claude Code error: ${text}`);
+      broadcast('acp:event', session.chatId, { type: 'error', text: `Claude Code error: ${text}` });
+    });
+  } catch (err) {
+    session.status = 'error';
+    const text = err instanceof Error ? err.message : String(err);
+    appendAcpSystemMessage(session, `Claude Code spawn error: ${text}`);
+    broadcast('acp:event', session.chatId, { type: 'error', text: `Claude Code spawn error: ${text}` });
+  }
+}
+
+function handleClaudeCodeLine(session: AcpSession, line: string): void {
+  try {
+    const msg = JSON.parse(line) as Record<string, unknown>;
+
+    // System init message
+    if (msg.type === 'system' && msg.subtype === 'init') {
+      return;
+    }
+
+    // Assistant message with content blocks
+    if (msg.type === 'assistant' && msg.message) {
+      const message = msg.message as Record<string, unknown>;
+      const content = message.content as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'text' && typeof block.text === 'string') {
+            const lastMsg = session.messages[session.messages.length - 1];
+            if (lastMsg && lastMsg.role === 'assistant') {
+              lastMsg.text += block.text;
+            } else {
+              session.messages.push({ role: 'assistant', text: block.text, timestamp: Date.now() });
+            }
+            broadcast('acp:event', session.chatId, { type: 'messageChunk', text: block.text, role: 'assistant' });
+          }
+        }
+      }
+      return;
+    }
+
+    // Result message (final response)
+    if (msg.type === 'result') {
+      // The final result text is already streamed via messageChunk events
+      return;
+    }
+  } catch {
+    // Ignore unparseable lines
+  }
 }
 
 function isValidQueueIndex(session: AcpSession, index: number): boolean {
@@ -636,6 +786,12 @@ export function sendAcpPrompt(chatId: string, promptText: string, attachments: s
   const session = sessions.get(chatId);
   if (!session) return;
 
+  // Claude Code: spawn a new process per prompt
+  if (session.tool === 'claude_acp') {
+    sendClaudeCodePrompt(session, promptText, attachments);
+    return;
+  }
+
   const effectiveModeId = modeId || session.currentModeId || 'build';
   const fullText = buildAcpPromptText(promptText, attachments);
 
@@ -666,6 +822,24 @@ export function cancelAcpPrompt(chatId: string): void {
   const session = sessions.get(chatId);
   if (!session || !session.sessionId) return;
 
+  // Claude Code: kill the running process
+  if (session.tool === 'claude_acp') {
+    if (session.process) {
+      if (process.platform === 'win32' && session.process.pid) {
+        try {
+          spawn('taskkill', ['/pid', String(session.process.pid), '/T', '/F'], { windowsHide: true });
+        } catch { /* ignore */ }
+      } else {
+        session.process.kill();
+      }
+      session.process = null;
+    }
+    session.status = 'idle';
+    clearPendingInteractions(session);
+    broadcast('acp:event', chatId, { type: 'cancelled', queuedPrompts: session.queuedPrompts.length });
+    return;
+  }
+
   session.cancelGraceUntil = Date.now() + 2000;
   clearPendingInteractions(session);
   if (!session.cancelUnsupported) {
@@ -679,6 +853,9 @@ export function cancelAcpPrompt(chatId: string): void {
 export function setAcpConfigOption(chatId: string, configId: string, value: string): void {
   const session = sessions.get(chatId);
   if (!session) return;
+
+  // Claude Code: ignore config option changes (model is fixed, no mode concept)
+  if (session.tool === 'claude_acp') return;
 
   if (configId === 'mode') {
     setSessionMode(session, value, Boolean(session.sessionId));
@@ -762,6 +939,7 @@ export function getAcpSession(chatId: string): AcpChatSession | undefined {
     availableCommands: session.availableCommands,
     queuedPrompts: session.queuedPrompts,
     partialStderr: session.partialStderr,
+    tool: session.tool,
   };
 }
 

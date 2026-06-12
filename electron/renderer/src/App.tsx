@@ -830,23 +830,29 @@ function App() {
     return removedProjects;
   }, [config, selectedProjectId]);
 
-  const openAcpChat = useCallback(async (projectId: number) => {
+  const openAcpChat = useCallback(async (projectId: number, tool?: string) => {
     if (!config) return;
     const project = config.projects.find((p) => p.id === projectId);
     if (!project) return;
 
-    // Try to promote standby first
-    const standby = await api.invoke('acp:standby:get', projectId) as { chatId: string; sessionId?: string; status: string } | undefined;
     let chatId: string;
-    if (standby && standby.sessionId && (standby.status === 'idle' || standby.status === 'running' || standby.status === 'permission')) {
-      const promoted = await api.invoke('acp:standby:promote', projectId, '') as { chatId: string } | undefined;
-      if (promoted) {
-        chatId = promoted.chatId;
+
+    // Claude Code: bypass standby, spawn directly
+    if (tool === 'claude_acp') {
+      chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [], tool }) as string;
+    } else {
+      // OpenCode: try to promote standby first
+      const standby = await api.invoke('acp:standby:get', projectId) as { chatId: string; sessionId?: string; status: string } | undefined;
+      if (standby && standby.sessionId && (standby.status === 'idle' || standby.status === 'running' || standby.status === 'permission')) {
+        const promoted = await api.invoke('acp:standby:promote', projectId, '') as { chatId: string } | undefined;
+        if (promoted) {
+          chatId = promoted.chatId;
+        } else {
+          chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [] }) as string;
+        }
       } else {
         chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [] }) as string;
       }
-    } else {
-      chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [] }) as string;
     }
 
     setActiveAcpChatByProject((prev) => {

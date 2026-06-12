@@ -824,6 +824,7 @@ export interface AcpChatSession {
   availableCommands?: AcpAvailableCommand[];
   queuedPrompts: QueuedAcpPrompt[];
   partialStderr?: string;
+  tool?: 'opencode' | 'claude_acp';
 }
 
 export interface AcpChatMessage {

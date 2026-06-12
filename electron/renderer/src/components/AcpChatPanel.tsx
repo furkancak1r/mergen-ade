@@ -443,7 +443,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #222', flexShrink: 0 }}>
         <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
           <span style={{ fontSize: 16, fontWeight: 700, color: '#f4f4f4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {openCodeAcpPanelTitle(project.name)}
+            {openCodeAcpPanelTitle(project.name, session?.tool)}
           </span>
           <span style={{ fontSize: 12, color: headerStatusColor, flexShrink: 0 }}>
             {statusText}
@@ -461,7 +461,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         {isWelcome ? (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16 }}>
             <div style={{ color: '#666', fontSize: 13, textAlign: 'center' }}>
-              {openCodeAcpWelcomeText()}
+              {openCodeAcpWelcomeText(session?.tool)}
             </div>
           </div>
         ) : (

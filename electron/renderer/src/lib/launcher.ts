@@ -28,11 +28,19 @@ export const sanitizedClaudeLaunchCommand = (shell: ShellKind, configuredCommand
   }
 };
 
+const defaultClaudeCommand = (): string => {
+  try {
+    return process.platform === 'win32' ? 'claude.cmd' : 'claude';
+  } catch {
+    return 'claude.cmd';
+  }
+};
+
 export const claudeCommandWithBypassPermissions = (configuredCommand: string): string => {
   const trimmed = configuredCommand.trim();
   const command = normalizeClaudeLaunchCommand(
     trimmed.length === 0
-      ? BuiltinLauncherKindDefaultLaunchCommand(BuiltinLauncherKind.Claude)
+      ? defaultClaudeCommand()
       : trimmed,
   );
 

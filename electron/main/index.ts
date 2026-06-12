@@ -8,6 +8,9 @@ import { handleCodexNotifyMode, handleCodexHookMode } from './codex';
 import { startHookService, stopHookService } from './hookService';
 
 const isDev = !app.isPackaged;
+
+// Workaround for GPU state invalid errors on some Windows systems
+app.commandLine.appendSwitch('disable-gpu');
 let mainWindow: BrowserWindow | null = null;
 let pendingClose = false;
 

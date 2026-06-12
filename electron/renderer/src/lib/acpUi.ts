@@ -40,20 +40,25 @@ export const ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS = 2;
 export const ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS = 96;
 export const ACP_CHAT_TITLE_MAX_CHARS = 72;
 export const OPENCODE_ACP_LABEL = 'OpenCode ACP';
+export const CLAUDE_ACP_LABEL = 'Claude ACP';
 export const OPENCODE_ACP_OPEN_BUTTON_LABEL = '+ ACP';
 export const OPENCODE_ACP_CLOSE_TOOLTIP = `Close ${OPENCODE_ACP_LABEL}`;
 
-export function openCodeAcpPanelTitle(_projectName?: string): string {
-  return OPENCODE_ACP_LABEL;
+export function acpLabelForTool(tool?: string): string {
+  return tool === 'claude_acp' ? CLAUDE_ACP_LABEL : OPENCODE_ACP_LABEL;
 }
 
-export function openCodeAcpWelcomeText(): string {
-  return `Welcome to ${OPENCODE_ACP_LABEL}`;
+export function openCodeAcpPanelTitle(_projectName?: string, tool?: string): string {
+  return acpLabelForTool(tool);
 }
 
-export function acpChatTitleFromPrompt(promptText: string): string {
+export function openCodeAcpWelcomeText(tool?: string): string {
+  return `Welcome to ${acpLabelForTool(tool)}`;
+}
+
+export function acpChatTitleFromPrompt(promptText: string, tool?: string): string {
   const collapsed = promptText.split(/\s+/).filter(Boolean).join(' ').trim();
-  if (!collapsed) return OPENCODE_ACP_LABEL;
+  if (!collapsed) return acpLabelForTool(tool);
   const chars = Array.from(collapsed);
   if (chars.length <= ACP_CHAT_TITLE_MAX_CHARS) return collapsed;
   return `${chars.slice(0, ACP_CHAT_TITLE_MAX_CHARS).join('')}...`;
@@ -63,6 +68,7 @@ interface AcpChatTitleState {
   messages?: readonly { role?: string }[];
   queuedPrompts?: readonly unknown[];
   title?: string;
+  tool?: string;
 }
 
 export function acpChatHasStartedState(session: AcpChatTitleState | null | undefined): boolean {
@@ -74,14 +80,16 @@ export function acpChatHasStartedState(session: AcpChatTitleState | null | undef
 }
 
 export function acpChatDisplayTitle(session: AcpChatTitleState | null | undefined): string {
-  if (!acpChatHasStartedState(session)) return OPENCODE_ACP_LABEL;
+  const label = acpLabelForTool(session?.tool);
+  if (!acpChatHasStartedState(session)) return label;
   const title = session?.title?.trim();
-  return title || OPENCODE_ACP_LABEL;
+  return title || label;
 }
 
 export function acpTerminalManagerRowLabel(session: AcpChatTitleState | null | undefined): string {
+  const label = acpLabelForTool(session?.tool);
   const title = acpChatDisplayTitle(session);
-  return acpChatHasStartedState(session) ? `${OPENCODE_ACP_LABEL} - ${title}` : title;
+  return acpChatHasStartedState(session) ? `${label} - ${title}` : title;
 }
 
 export function isAcpRunningStatus(status: AcpChatSession['status'] | undefined): boolean {

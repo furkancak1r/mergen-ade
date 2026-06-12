@@ -5,9 +5,8 @@ import type { GitDiffSummary } from '../../../shared/gitDiffSummary';
 import { gitDiffSummaryLabel } from '../../../shared/gitDiffSummary';
 import type { TerminalInstance } from '../hooks/usePty';
 import {
-  OPENCODE_ACP_CLOSE_TOOLTIP,
-  OPENCODE_ACP_LABEL,
   OPENCODE_ACP_OPEN_BUTTON_LABEL,
+  acpLabelForTool,
   acpStatusText,
   acpTerminalManagerBadgeVisual,
   acpTerminalManagerRowLabel,
@@ -96,7 +95,7 @@ interface TerminalManagerProps {
   activeAcpProjectId?: number | null;
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
-  onOpenAcpChat?: (projectId: number) => void;
+  onOpenAcpChat?: (projectId: number, tool?: string) => void;
   onCreateWorktree?: (projectId: number) => void;
   onOverlayOpenChange?: (open: boolean) => void;
   onUpdateFilter?: (filter: TerminalManagerFilter) => void;
@@ -746,7 +745,7 @@ interface ProjectGroupProps {
   activeAcpProjectId?: number | null;
   onActivateAcpChat?: (projectId: number) => void;
   onRemoveAcpChat?: (projectId: number) => void;
-  onOpenAcpChat?: (projectId: number) => void;
+  onOpenAcpChat?: (projectId: number, tool?: string) => void;
   onCreateWorktree?: (projectId: number) => void;
   onPathContextMenu?: (event: React.MouseEvent, project: ProjectRecord, kind: TerminalManagerPathContextKind) => void;
   onRemoveForegroundMessage?: (projectId: number, message: string) => void;
@@ -976,35 +975,44 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   <button
                     key={l.id}
                     onClick={async () => {
-                      setShowLauncherMenu(null);
-                      if (l.builtin === BuiltinLauncherKind.OpenCodeAcp) {
-                        onOpenAcpChat?.(project.id);
-                        return;
-                      }
-                      const cmd = effectiveLauncherCommand(l, config.defaultShell);
-                      if (l.builtin === BuiltinLauncherKind.OpenCode) {
-                        const model = activeBuildModel(config.opencode);
-                        await api.invoke('opencode:generateTerminalConfig', {
-                          cwd: project.path,
-                          model,
-                          effort: config.opencode.planEffort,
-                          kimiStrictPermissions: config.opencode.kimiStrictPermissions,
-                        });
-                      }
-                      const targetId = await onSpawn(project.id, TerminalKindEnum.Foreground);
-                      if (targetId) {
-                        if (l.builtin === BuiltinLauncherKind.Claude || l.builtin === BuiltinLauncherKind.ClaudeAcp) {
-                          onMarkClaudeLaunchPending?.(targetId, l.launchCommand || cmd);
+                      try {
+                        setShowLauncherMenu(null);
+                        if (l.builtin === BuiltinLauncherKind.OpenCodeAcp) {
+                          onOpenAcpChat?.(project.id, 'opencode');
+                          return;
                         }
-                        const isSlash = cmd.startsWith('/');
-                        await api.invoke('pty:write', targetId, '\x1b[200~' + cmd + '\x1b[201~');
-                        await api.invoke('pty:write', targetId, '\r');
-                        if (isSlash) {
-                          setTimeout(() => api.invoke('pty:write', targetId, '\r'), 600);
-                          setTimeout(() => api.invoke('pty:write', targetId, '\r'), 1200);
-                        } else {
-                          setTimeout(() => api.invoke('pty:write', targetId, '\r'), 1200);
+                        if (l.builtin === BuiltinLauncherKind.ClaudeAcp) {
+                          onOpenAcpChat?.(project.id, 'claude_acp');
+                          return;
                         }
+                        const cmd = effectiveLauncherCommand(l, config.defaultShell);
+                        if (l.builtin === BuiltinLauncherKind.OpenCode) {
+                          const model = activeBuildModel(config.opencode);
+                          await api.invoke('opencode:generateTerminalConfig', {
+                            cwd: project.path,
+                            model,
+                            effort: config.opencode.planEffort,
+                            kimiStrictPermissions: config.opencode.kimiStrictPermissions,
+                          });
+                        }
+                        const targetId = await onSpawn(project.id, TerminalKindEnum.Foreground);
+                        if (targetId) {
+                          if (l.builtin === BuiltinLauncherKind.Claude) {
+                            onMarkClaudeLaunchPending?.(targetId, l.launchCommand || cmd);
+                          }
+                          const isSlash = cmd.startsWith('/');
+                          await api.invoke('pty:write', targetId, '\x1b[200~' + cmd + '\x1b[201~');
+                          await api.invoke('pty:write', targetId, '\r');
+                          if (isSlash) {
+                            setTimeout(() => api.invoke('pty:write', targetId, '\r'), 600);
+                            setTimeout(() => api.invoke('pty:write', targetId, '\r'), 1200);
+                          } else {
+                            setTimeout(() => api.invoke('pty:write', targetId, '\r'), 1200);
+                          }
+                        }
+                      } catch (err) {
+                        console.error('Launcher click failed:', err);
+                        alert('Launcher error: ' + (err instanceof Error ? err.message : String(err)));
                       }
                     }}
                     style={{
@@ -1195,7 +1203,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
               {activeAcpBadge && (
                 <span
                   className="acp-terminal-manager-badge-slot"
-                  title={`OpenCode ACP: ${acpStatusText(activeAcpStatus)}`}
+                  title={`${acpLabelForTool(activeAcpSession?.tool)}: ${acpStatusText(activeAcpStatus)}`}
                 >
                   <span
                     className={`acp-terminal-manager-badge acp-terminal-manager-badge--${activeAcpBadge.kind}`}
@@ -1237,7 +1245,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   flexShrink: 0,
                   zIndex: 1,
                 }}
-                title={OPENCODE_ACP_CLOSE_TOOLTIP}
+                title={`Close ${acpLabelForTool(activeAcpSession?.tool)}`}
               >
                 ✕
               </button>
