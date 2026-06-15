@@ -33,11 +33,23 @@ jobs:
         working-directory: electron
         run: npm run build
 
+      - name: Package Windows portable ZIP
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $asset = "mergen-ade-$version-windows-x64-portable.zip"
+          New-Item -ItemType Directory -Force release-windows/scripts | Out-Null
+          Copy-Item "electron/out/Mergen ADE.exe" "release-windows/mergen-ade.exe" -Force
+          Copy-Item "scripts/install-factory-droid-hooks.ps1" "release-windows/scripts/" -Force
+          Copy-Item "scripts/factory-droid-status-hook.ps1" "release-windows/scripts/" -Force
+          Copy-Item "README.md" "release-windows/" -Force
+          Compress-Archive -Path "release-windows/*" -DestinationPath $asset -Force
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-windows
-          path: electron/out/Mergen ADE.exe
+          path: mergen-ade-*-windows-x64-portable.zip
           if-no-files-found: error
 
   build-macos:

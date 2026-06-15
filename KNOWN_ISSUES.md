@@ -1,5 +1,32 @@
 ---
 
+#### Electron portable release Factory Droid hook context eksikti {#electron-portable-factory-droid-hook-context}
+- Date: 2026-06-15
+- Context: User wanted Mergen ADE to work cleanly when installed on another PC, including hook setup.
+- Error signature:
+  1. The Electron PTY only injected `MERGEN_TERMINAL_ID`; the Factory Droid hook script expected `MERGEN_ADE_TERMINAL_ID` and `MERGEN_ADE_FACTORY_DROID_HOOKS_DIR`.
+  2. Factory Droid hook records were written to JSONL, but the live hook bridge path was not contacted from the PowerShell hook script.
+  3. The hook service did not accept generic HTTP `POST /` status events.
+  4. The Windows release artifact uploaded only the EXE, leaving the Factory hook installer scripts out of the portable ZIP.
+- Symptoms/Impact:
+  - A fresh PC could run `mergen-ade.exe`, but Factory Droid status badges could stay inactive even after hook installation.
+  - Release users needed a repo checkout just to install the hook scripts.
+- Root cause:
+  - The Electron port kept older hook environment names and release packaging did not include the machine-local hook installer path.
+- Resolution:
+  - Injected Factory Droid hook env vars into every Electron PTY.
+  - Made the Factory hook script send live status events to `MERGEN_HOOK_PORT` while keeping JSONL fallback records.
+  - Accepted `POST /` hook status requests in the Electron hook service and normalized string terminal ids.
+  - Packaged Windows releases as a portable ZIP containing `mergen-ade.exe`, `README.md`, and `scripts/`.
+  - Removed a stale missing `electron/assets/**/*` package glob.
+- Prevent recurrence:
+  - Added regression tests for hook status parsing and PTY hook env injection.
+  - Kept the PowerShell Factory hook installer test passing.
+- Files/Commands touched: `electron/main/pty.ts`, `electron/main/hookService.ts`, `scripts/factory-droid-status-hook.ps1`, `.github/workflows/release.yml`, `electron/package.json`, `README.md`, `electron/renderer/src/lib/hookService.test.ts`, `electron/renderer/src/lib/ptyEnv.test.ts`, `npx vitest run`, `npx tsc --noEmit`, `scripts/__tests__/factory-droid-hooks.tests.ps1`
+- References: User request 2026-06-15
+
+---
+
 #### Electron OpenCode ACP question cevabi unknown request hatasina dusuyordu {#electron-acp-question-unknown-request}
 - Date: 2026-06-10
 - Context: User reported that answering an ACP question/permission card after a `bash (execute)` tool call showed raw `ACP stderr: Got response to unknown request 0` in the chat UI.

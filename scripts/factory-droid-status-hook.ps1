@@ -154,6 +154,80 @@ function Write-FactoryDroidHookRecord {
     }
 }
 
+function Get-FactoryDroidHookAttentionKind {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record
+    )
+
+    if ([string]$Record.notification_kind -eq "permission_prompt") {
+        return "permission"
+    }
+
+    if ([string]$Record.notification_kind -eq "idle_prompt") {
+        return "user_input_requested"
+    }
+
+    if ([string]$Record.hook_event_name -eq "Stop") {
+        return "turn_complete"
+    }
+
+    return $null
+}
+
+function Send-FactoryDroidHookStatus {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$HookInput,
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record
+    )
+
+    $port = 0
+    if (-not [int]::TryParse([string]$env:MERGEN_HOOK_PORT, [ref]$port) -or $port -le 0) {
+        return
+    }
+
+    $terminalId = 0
+    if (-not [int]::TryParse([string]$Record.terminal_id, [ref]$terminalId)) {
+        return
+    }
+
+    $eventName = [string]$Record.hook_event_name
+    $payload = [pscustomobject]([ordered]@{
+            terminalId    = $terminalId
+            tool          = "droid"
+            status        = [string]$Record.status
+            reason        = [string]$Record.message
+            attentionKind = Get-FactoryDroidHookAttentionKind -Record $Record
+            rawJson       = ($HookInput | ConvertTo-Json -Compress -Depth 20)
+            eventKind     = "factory-droid-hook:$eventName"
+        })
+
+    $client = $null
+    $writer = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $client.Connect("127.0.0.1", $port)
+        $stream = $client.GetStream()
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $writer = New-Object System.IO.StreamWriter($stream, $utf8NoBom)
+        $writer.WriteLine(($payload | ConvertTo-Json -Compress -Depth 20))
+        $writer.Flush()
+    }
+    catch {
+        return
+    }
+    finally {
+        if ($null -ne $writer) {
+            $writer.Dispose()
+        }
+        if ($null -ne $client) {
+            $client.Close()
+        }
+    }
+}
+
 function Invoke-FactoryDroidHookSignal {
     param(
         [Parameter(Mandatory = $true)]
@@ -171,6 +245,7 @@ function Invoke-FactoryDroidHookSignal {
     }
 
     Write-FactoryDroidHookRecord -InboxContext $inboxContext -Record $record
+    Send-FactoryDroidHookStatus -HookInput $HookInput -Record $record
 }
 
 if ($MyInvocation.InvocationName -ne ".") {

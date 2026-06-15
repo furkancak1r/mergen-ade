@@ -4,7 +4,7 @@ import type { AiHookEvent, TerminalKind, ShellKind } from '../shared/types';
 import { AiCliStatus, AiCliTool, ANTHROPIC_ENV_VARS_TO_REMOVE, ShellKindCommand } from '../shared/types';
 import { claudeTitleHookEvent } from '../shared/claudeTitle';
 import { normalizeWindowsVerbatimPath } from './config';
-import { getBrowserMcpToken, getHookServicePort } from './hookService';
+import { getBrowserMcpToken, getHookInboxDir, getHookServicePort } from './hookService';
 import {
   MERGEN_BROWSER_MCP_PORT_ENV_VAR,
   MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR,
@@ -78,6 +78,8 @@ export function createTerminal(opts: PtyCreateOptions): number {
   }
   // Set Mergen-specific env vars for hook plugin integration
   env['MERGEN_TERMINAL_ID'] = String(id);
+  env['MERGEN_ADE_TERMINAL_ID'] = String(id);
+  env['MERGEN_ADE_FACTORY_DROID_HOOKS_DIR'] = getHookInboxDir();
   const hookPort = getHookServicePort();
   if (hookPort) {
     env['MERGEN_HOOK_PORT'] = String(hookPort);

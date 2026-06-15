@@ -41,10 +41,10 @@ The canonical download location is the GitHub Releases page:
 
 Published assets currently target:
 
-- Windows: portable ZIP containing `mergen-ade.exe`
+- Windows: portable ZIP containing `mergen-ade.exe` and `scripts/`
 - macOS: signed and notarized ARM64 DMG
 
-> The Windows release ZIP currently contains only `mergen-ade.exe`. Factory Droid status badges are a separate one-time setup because Factory hooks and permissions still need to be configured on the machine that runs Mergen ADE.
+> Factory Droid status badges are a separate one-time setup because Factory hooks and permissions still need to be configured on the machine that runs Mergen ADE.
 
 ### Local build
 
@@ -82,7 +82,7 @@ Use the installer-based path below. Manual `settings.json` editing should be tre
    Repo checkout already on disk:
    Use the existing repo checkout and run the installer from the repository root.
    Release ZIP only:
-   Keep using the downloaded `mergen-ade.exe`, but clone or download this repository once so you also have the `scripts/` folder. The release ZIP does not ship the installer or hook source files.
+   Extract the ZIP and run the installer from the extracted folder so the bundled `scripts/` folder is available.
 2. Run the supported installer from the repo root.
 
 ```powershell

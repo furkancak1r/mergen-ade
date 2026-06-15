@@ -136,6 +136,14 @@ async function handleHttpRequest(socket: Socket, data: string): Promise<void> {
       } else {
         writeJsonResponse(socket, 200, {});
       }
+    } else if (method === 'POST' && path === '/') {
+      const event = parseStatusRequest(httpRequestBody(data));
+      if (event) {
+        processHookEvent(event);
+        writeJsonResponse(socket, 200, { ok: true });
+      } else {
+        writeJsonResponse(socket, 400, { ok: false, error: 'Invalid hook status request' });
+      }
     } else if (method === 'POST' && path === '/answer/ack') {
       ackAnswer();
       writeJsonResponse(socket, 200, { ok: true });
@@ -197,7 +205,7 @@ export function parseStatusRequest(body: string): AiHookEvent | null {
     }
 
     return {
-      terminalId: (parsed.terminalId as number) || 0,
+      terminalId: parseTerminalId(parsed.terminalId),
       tool,
       status,
       reason: (parsed.reason as string) || undefined,
@@ -209,6 +217,15 @@ export function parseStatusRequest(body: string): AiHookEvent | null {
   } catch {
     return null;
   }
+}
+
+function parseTerminalId(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
 }
 
 function parseTool(eventType: string): AiCliTool | null {
@@ -226,6 +243,9 @@ function parseStatus(eventType: string, parsed: Record<string, unknown>): AiCliS
   if (eventType.includes('PermissionRequest') || eventType.includes('QuestionAsked') || eventType.includes('UserInputRequested') || eventType.includes('permission.asked') || eventType.includes('plan_mode_prompt')) {
     return AiCliStatusEnum.Attention;
   }
+  if (eventType.includes('Notification')) {
+    return AiCliStatusEnum.Attention;
+  }
   // Codex/OpenCode Stop uses debounce-to-turn-complete; map to Attention with TurnComplete kind
   if (eventType.includes('Stop')) {
     return AiCliStatusEnum.Attention;
@@ -241,6 +261,8 @@ function parseStatus(eventType: string, parsed: Record<string, unknown>): AiCliS
 
 function parseAttentionKind(eventType: string, parsed: Record<string, unknown>): AiCliAttentionKind | undefined {
   if (eventType.includes('PermissionRequest') || eventType.includes('permission.asked')) return AiCliAttentionKindEnum.Permission;
+  if (eventType.includes('Notification') && parsed.reason === 'permission_prompt') return AiCliAttentionKindEnum.Permission;
+  if (eventType.includes('Notification') && parsed.reason === 'idle_prompt') return AiCliAttentionKindEnum.UserInputRequested;
   if (eventType.includes('TurnComplete')) return AiCliAttentionKindEnum.TurnComplete;
   if (eventType.includes('SessionError')) return AiCliAttentionKindEnum.SessionError;
   if (eventType.includes('QuestionAsked') || eventType.includes('UserInputRequested') || eventType.includes('question.asked')) return AiCliAttentionKindEnum.UserInputRequested;
