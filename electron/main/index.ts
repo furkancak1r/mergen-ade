@@ -14,7 +14,15 @@ app.commandLine.appendSwitch('disable-gpu');
 let mainWindow: BrowserWindow | null = null;
 let pendingClose = false;
 
+function appIconPath(): string | undefined {
+  if (process.platform !== 'win32') return undefined;
+  const iconName = app.isPackaged ? 'icon.ico' : 'icon.png';
+  const iconPath = path.join(__dirname, '../../build', iconName);
+  return fs.existsSync(iconPath) ? iconPath : undefined;
+}
+
 function createWindow() {
+  const icon = appIconPath();
   mainWindow = new BrowserWindow({
     width: 1600,
     height: 980,
@@ -22,6 +30,7 @@ function createWindow() {
     minHeight: 620,
     title: '',
     show: false,
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
