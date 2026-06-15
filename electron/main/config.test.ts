@@ -70,6 +70,20 @@ describe('config normalization', () => {
     expect(loadedClaude?.launchCommand).toBe(BuiltinLauncherKindDefaultLaunchCommand(BuiltinLauncherKind.Claude));
   });
 
+  it('adds the Codex ACP launcher to older launcher configs', () => {
+    const config = defaultAppConfig();
+    config.launchers = config.launchers.filter((entry) => entry.builtin !== BuiltinLauncherKind.CodexAcp);
+    writeConfigJson(config as unknown as Record<string, unknown>);
+
+    const loadedCodexAcp = loadConfig().launchers.find((entry) => entry.builtin === BuiltinLauncherKind.CodexAcp);
+    expect(loadedCodexAcp).toMatchObject({
+      id: BuiltinLauncherKind.CodexAcp,
+      displayName: 'Codex ACP',
+      launchCommand: '',
+      enabled: true,
+    });
+  });
+
   it('migrates the old Kimi K2.5 OpenCode build default to Mimo', () => {
     const config = defaultAppConfig();
     config.opencode.buildModelSlotA = 'fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo';

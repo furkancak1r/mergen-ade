@@ -6065,3 +6065,19 @@
   - Keep worktree row launcher visibility tied to the Terminal Manager filter, not the project type.
 - Files/Commands touched: `electron/main/acpService.ts`, `electron/shared/acpTimeline.ts`, `electron/shared/types.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/components/AcpTimeline.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/acpChanges.ts`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/terminalManagerState.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
 - References: User request 2026-06-15
+
+---
+
+#### Claude Code ACP plan mode custom prompt kullaniyordu {#electron-claude-acp-native-plan-mode}
+- Date: 2026-06-15
+- Context: User reported that Claude Code ACP plan mode should match original Claude Code plan mode, but Mergen was sending a custom "you are in plan mode" prompt.
+- Symptoms/Impact:
+  - Claude Code ACP plan requests included Mergen-authored plan instructions instead of relying on Claude Code's native plan behavior.
+- Root cause:
+  - `sendClaudeCodePrompt` prepended `PLAN_SYSTEM_INSTRUCTION` while still launching Claude Code with `--permission-mode bypassPermissions`.
+- Resolution:
+  - Send Claude Code ACP plan prompts unchanged and launch Claude Code with `--permission-mode plan`.
+- Prevent recurrence:
+  - Added a regression test for Claude Code ACP plan args and prompt text.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/main/acpService.test.ts`, `.agents/claude-code.md`, `KNOWN_ISSUES.md`
+- References: User request 2026-06-15

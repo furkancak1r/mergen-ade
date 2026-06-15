@@ -872,8 +872,8 @@ function App() {
     const projectKey = `${projectId}:${effectiveTool}`;
     let chatId: string;
 
-    // Claude Code: bypass standby, spawn directly
-    if (tool === 'claude_acp') {
+    // CLI-backed adapters bypass OpenCode's standby pool.
+    if (tool === 'claude_acp' || tool === 'codex_acp') {
       chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [], tool }) as string;
     } else {
       // OpenCode: try to promote standby first

@@ -14,6 +14,8 @@ describe('launcher helpers', () => {
     const launchers = defaultLaunchers();
     expect(launchers.find((launcher) => launcher.builtin === BuiltinLauncherKind.Claude)?.bypassPermissions).toBe(true);
     expect(launchers.find((launcher) => launcher.builtin === BuiltinLauncherKind.Codex)?.bypassPermissions).toBe(false);
+    expect(launchers.find((launcher) => launcher.builtin === BuiltinLauncherKind.CodexAcp)?.displayName).toBe('Codex ACP');
+    expect(launchers.find((launcher) => launcher.builtin === BuiltinLauncherKind.CodexAcp)?.launchCommand).toBe('');
   });
 
   it('treats Claude bypass as effective even when config stores explicit false', () => {

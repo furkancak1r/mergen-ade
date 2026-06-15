@@ -3,6 +3,7 @@ import {
   ACP_CHAT_TITLE_MAX_CHARS,
   ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS,
   ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS,
+  CODEX_ACP_LABEL,
   OPENCODE_ACP_CLOSE_TOOLTIP,
   OPENCODE_ACP_LABEL,
   OPENCODE_ACP_OPEN_BUTTON_LABEL,
@@ -42,10 +43,13 @@ import {
 describe('acpUi', () => {
   it('uses OpenCode ACP as the canonical user-facing label', () => {
     expect(OPENCODE_ACP_LABEL).toBe('OpenCode ACP');
+    expect(CODEX_ACP_LABEL).toBe('Codex ACP');
     expect(OPENCODE_ACP_OPEN_BUTTON_LABEL).toBe('+ ACP');
     expect(OPENCODE_ACP_CLOSE_TOOLTIP).toBe('Close OpenCode ACP');
     expect(openCodeAcpPanelTitle('Mergen')).toBe('OpenCode ACP');
+    expect(openCodeAcpPanelTitle('Mergen', 'codex_acp')).toBe('Codex ACP');
     expect(openCodeAcpWelcomeText()).toBe('Welcome to OpenCode ACP');
+    expect(openCodeAcpWelcomeText('codex_acp')).toBe('Welcome to Codex ACP');
   });
 
   it('derives ACP chat titles from prompts like Rust', () => {
@@ -69,6 +73,7 @@ describe('acpUi', () => {
     expect(acpChatDisplayTitle(startedSession)).toBe('first prompt');
     expect(acpTerminalManagerRowLabel(startedSession)).toBe('OpenCode ACP - first prompt');
     expect(acpTerminalManagerRowLabel(queuedSession)).toBe('OpenCode ACP - queued prompt');
+    expect(acpTerminalManagerRowLabel({ ...startedSession, tool: 'codex_acp' })).toBe('Codex ACP - first prompt');
   });
 
   it('keeps ACP running true after promptSent events without a status field', () => {

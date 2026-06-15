@@ -41,6 +41,7 @@ export const ACP_QUEUED_PROMPT_PREVIEW_MAX_CHARS = 96;
 export const ACP_CHAT_TITLE_MAX_CHARS = 72;
 export const OPENCODE_ACP_LABEL = 'OpenCode ACP';
 export const CLAUDE_ACP_LABEL = 'Claude ACP';
+export const CODEX_ACP_LABEL = 'Codex ACP';
 export const OPENCODE_ACP_OPEN_BUTTON_LABEL = '+ ACP';
 export const OPENCODE_ACP_CLOSE_TOOLTIP = `Close ${OPENCODE_ACP_LABEL}`;
 export const ACP_FALLBACK_SLASH_COMMANDS: AcpCommandLike[] = [
@@ -51,6 +52,7 @@ export const ACP_FALLBACK_SLASH_COMMANDS: AcpCommandLike[] = [
 ];
 
 export function acpLabelForTool(tool?: string): string {
+  if (tool === 'codex_acp') return CODEX_ACP_LABEL;
   return tool === 'claude_acp' ? CLAUDE_ACP_LABEL : OPENCODE_ACP_LABEL;
 }
 

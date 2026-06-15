@@ -36,6 +36,7 @@ export const supportedShellsForPlatform = (): ShellKind[] => {
 export enum BuiltinLauncherKind {
   Droid = 'droid',
   Codex = 'codex',
+  CodexAcp = 'codex_acp',
   OpenCode = 'opencode',
   Claude = 'claude',
   OpenCodeAcp = 'opencode_acp',
@@ -46,6 +47,7 @@ export const BuiltinLauncherKindAll: BuiltinLauncherKind[] = [
   BuiltinLauncherKind.OpenCode,
   BuiltinLauncherKind.OpenCodeAcp,
   BuiltinLauncherKind.Codex,
+  BuiltinLauncherKind.CodexAcp,
   BuiltinLauncherKind.Droid,
   BuiltinLauncherKind.Claude,
   BuiltinLauncherKind.ClaudeAcp,
@@ -54,6 +56,7 @@ export const BuiltinLauncherKindAll: BuiltinLauncherKind[] = [
 export const BuiltinLauncherKindId = (kind: BuiltinLauncherKind): string => {
   switch (kind) {
     case BuiltinLauncherKind.Codex: return 'codex';
+    case BuiltinLauncherKind.CodexAcp: return 'codex_acp';
     case BuiltinLauncherKind.Claude: return 'claude';
     case BuiltinLauncherKind.Droid: return 'droid';
     case BuiltinLauncherKind.OpenCode: return 'opencode';
@@ -65,6 +68,7 @@ export const BuiltinLauncherKindId = (kind: BuiltinLauncherKind): string => {
 export const BuiltinLauncherKindDefaultDisplayName = (kind: BuiltinLauncherKind): string => {
   switch (kind) {
     case BuiltinLauncherKind.Codex: return 'Codex';
+    case BuiltinLauncherKind.CodexAcp: return 'Codex ACP';
     case BuiltinLauncherKind.Claude: return 'Claude';
     case BuiltinLauncherKind.Droid: return 'Droid';
     case BuiltinLauncherKind.OpenCode: return 'OpenCode';
@@ -76,6 +80,7 @@ export const BuiltinLauncherKindDefaultDisplayName = (kind: BuiltinLauncherKind)
 export const BuiltinLauncherKindDefaultLaunchCommand = (kind: BuiltinLauncherKind): string => {
   switch (kind) {
     case BuiltinLauncherKind.Codex: return 'codex';
+    case BuiltinLauncherKind.CodexAcp: return '';
     case BuiltinLauncherKind.Claude: return defaultClaudeLaunchCommand();
     case BuiltinLauncherKind.Droid: return 'droid';
     case BuiltinLauncherKind.OpenCode: return 'opencode';
@@ -190,6 +195,7 @@ export const defaultLaunchers = (): LauncherEntry[] =>
     iconKey: (() => {
       switch (kind) {
         case BuiltinLauncherKind.Codex: return LauncherIconKey.Codex;
+        case BuiltinLauncherKind.CodexAcp: return LauncherIconKey.Codex;
         case BuiltinLauncherKind.Claude: return LauncherIconKey.Claude;
         case BuiltinLauncherKind.Droid: return LauncherIconKey.Droid;
         case BuiltinLauncherKind.OpenCode: return LauncherIconKey.OpenCode;
@@ -596,7 +602,7 @@ export interface AppConfig {
 export const defaultAppConfig = (): AppConfig => ({
   version: APP_CONFIG_VERSION,
   defaultShell: defaultShellForPlatform(),
-  claudeCodeCodexHookEnabled: false,
+  claudeCodeCodexHookEnabled: true,
   ui: defaultUiConfig(),
   launchers: defaultLaunchers(),
   terminalShortcuts: defaultTerminalShortcuts(),
@@ -829,7 +835,7 @@ export interface AcpChatSession {
   availableCommands?: AcpAvailableCommand[];
   queuedPrompts: QueuedAcpPrompt[];
   partialStderr?: string;
-  tool?: 'opencode' | 'claude_acp';
+  tool?: 'opencode' | 'claude_acp' | 'codex_acp';
 }
 
 export interface AcpChatMessage {
@@ -1048,7 +1054,7 @@ export interface IpcChannels {
   'claudeCodex:updateUiVerification': (opts: { planPath: string; note: string }) => Promise<boolean>;
 
   // ACP
-  'acp:spawn': (opts: { projectId: number; cwd: string; mcpServers: string[] }) => Promise<string>;
+  'acp:spawn': (opts: { projectId: number; cwd: string; mcpServers: string[]; tool?: string }) => Promise<string>;
   'acp:send': (opts: { chatId: string; promptText: string; attachments: string[]; modeId?: string }) => Promise<void>;
   'acp:cancel': (chatId: string) => Promise<void>;
   'acp:setConfigOption': (opts: { chatId: string; configId: string; value: string }) => Promise<void>;

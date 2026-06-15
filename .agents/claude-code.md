@@ -26,7 +26,7 @@
 ## Claude Code ACP Plan Mode
 
 - **Plan mode is supported in Claude Code ACP sessions.** The Tab key toggles between `plan` and `build` modes, identical to OpenCode ACP. The Plan pill appears when plan mode is active.
-- **Plan mode injects planning instructions.** When a prompt is sent in plan mode, a system instruction is prepended that tells Claude Code to analyze the codebase and create a structured implementation plan without making changes.
+- **Plan mode uses Claude Code's native plan mode.** When a prompt is sent in plan mode, send the user's prompt unchanged and launch Claude Code with `--permission-mode plan`; do not prepend custom "you are in plan mode" instructions.
 - **Plan-complete question card.** After Claude Code finishes generating a plan, a question card appears with three options:
   - **Accept & Implement**: Switches to build mode and sends a new prompt with the plan as context, asking Claude to implement it.
   - **Accept Plan**: Stays in plan mode, allowing the user to refine the plan.

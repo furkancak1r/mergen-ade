@@ -702,6 +702,10 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                           onOpenAcpChat?.(project.id, 'opencode');
                           return;
                         }
+                        if (l.builtin === BuiltinLauncherKind.CodexAcp) {
+                          onOpenAcpChat?.(project.id, 'codex_acp');
+                          return;
+                        }
                         if (l.builtin === BuiltinLauncherKind.ClaudeAcp) {
                           onOpenAcpChat?.(project.id, 'claude_acp');
                           return;
