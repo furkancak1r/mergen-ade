@@ -157,7 +157,9 @@ describe('acpUi', () => {
   });
 
   it('matches Rust ACP mode labels for composer and queued rows', () => {
+    expect(acpModeUiLabel('auto')).toBe('Auto');
     expect(acpModeUiLabel('plan')).toBe('Plan');
+    expect(acpModeUiLabel('codex_plan')).toBe('Codex Plan');
     expect(acpModeUiLabel('build')).toBeUndefined();
     expect(acpModeUiLabel(undefined)).toBeUndefined();
     expect(acpModeUiLabel('custom')).toBe('custom');
@@ -227,7 +229,7 @@ describe('acpUi', () => {
     const prompts = [
       { modeId: 'build' },
       { modeId: 'plan' },
-      { modeId: 'plan' },
+      { modeId: 'codex_plan' },
     ];
 
     expect(ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS).toBe(4);

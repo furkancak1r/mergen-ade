@@ -220,6 +220,8 @@ export function actionControlsEnabled(session: Pick<AcpChatSession, 'sessionId'>
 }
 
 export function acpModeUiLabel(modeId: string | undefined): string | undefined {
+  if (modeId === 'codex_plan') return 'Codex Plan';
+  if (modeId === 'auto') return 'Auto';
   if (modeId === 'plan') return 'Plan';
   if (!modeId || modeId === 'build') return undefined;
   return modeId;
@@ -291,7 +293,7 @@ export function acpQueuedPromptDraftEditBlockedMessage(options: {
 }
 
 export function acpQueuedPromptPlanCount(prompts: readonly { modeId?: string }[]): number {
-  return prompts.filter((prompt) => prompt.modeId === 'plan').length;
+  return prompts.filter((prompt) => prompt.modeId === 'plan' || prompt.modeId === 'codex_plan').length;
 }
 
 export function acpQueuedPromptHeaderLabel(queueCount: number, editingIndex?: number): string {

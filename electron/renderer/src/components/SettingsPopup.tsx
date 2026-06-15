@@ -379,10 +379,10 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
                     onChange={(e) => setDraft((prev) => ({ ...prev, claudeCodeCodexHookEnabled: e.target.checked }))}
                     id="claudeCodeCodexHookEnabled"
                   />
-                  <label htmlFor="claudeCodeCodexHookEnabled" style={{ fontSize: 12, color: '#ccc', fontWeight: 600 }}>Enable Claude Code Codex hook</label>
+                  <label htmlFor="claudeCodeCodexHookEnabled" style={{ fontSize: 12, color: '#ccc', fontWeight: 600 }}>Allow Claude Code Codex Plan route</label>
                 </div>
                 <div style={{ fontSize: 11, color: '#888', marginTop: 6, lineHeight: 1.4 }}>
-                  Runs Codex planning and review around Mergen-submitted Claude Code prompts.
+                  Lets Auto or the Codex mode run Codex planning before Mergen-submitted Claude Code prompts.
                 </div>
               </div>
               <div>

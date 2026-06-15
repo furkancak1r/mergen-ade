@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import type { AcpChatSession, AppConfig, ShellKind, TerminalKind, ProjectRecord, LeftSidebarTab, BrowserScopeKey, SmartInputState, SmartInputAttachment, AiHookEvent, AiCliAttentionKind, TerminalShortcutEntry, BrowserTab, InputHistoryFilter, TerminalManagerFilter, AppHistory } from '../../shared/types';
 import type { ClaudeCodexPlanResult, ClaudeCodexReviewResult } from '../../shared/claudeCodexHook';
+import { resolveAcpRoute } from '../../shared/acpRoute';
 import { BrowserScopeKeyType, AiCliTool as AiCliToolEnum } from '../../shared/types';
 import { LeftSidebarTab as LeftSidebarTabEnum, defaultAppConfig, defaultAppHistory } from '../../shared/types';
 import { MainArea } from './components/MainArea';
@@ -103,7 +104,7 @@ function App() {
   const [browserUrlDraftByScope, setBrowserUrlDraftByScope] = useState<Map<string, string>>(new Map());
   const [browserDesignInspectByScope, setBrowserDesignInspectByScope] = useState<Map<string, boolean>>(new Map());
 
-  const pty = usePty();
+  const pty = usePty({ allowClaudeCodexPlan: Boolean(config?.claudeCodeCodexHookEnabled) });
   const suppressAcpRestoreRef = useRef(false);
   const historyLoadedRef = useRef(false);
   const terminalHistorySignatureRef = useRef<Map<number, string>>(new Map());
@@ -1041,10 +1042,25 @@ function App() {
     const terminal = terminals.find((candidate) => candidate.id === terminalId);
     const trimmed = text.trim();
     const project = terminal ? config?.projects.find((candidate) => candidate.id === terminal.projectId) : undefined;
+    const route = resolveAcpRoute(trimmed, {
+      selectedRoute: modeId,
+      allowCodexPlan: config?.claudeCodeCodexHookEnabled,
+      attachmentCount: attachments.length,
+    });
+    const runtimeMode: SmartInputModeId = route.route === 'plan' ? 'plan' : 'build';
+    if (route.question && terminal?.aiTool === AiCliToolEnum.Claude) {
+      pty.updateClaudeCodexHookProgress(terminalId, {
+        phase: 'blocked',
+        sessionId: 'auto-route',
+        error: route.question,
+      });
+      return;
+    }
     const shouldRunClaudeCodexHook = Boolean(
       config?.claudeCodeCodexHookEnabled
       && terminal?.aiTool === AiCliToolEnum.Claude
       && terminal.kind === 'foreground'
+      && route.route === 'codex_plan'
       && trimmed
       && attachments.length === 0
       && project?.path
@@ -1079,12 +1095,12 @@ function App() {
           sessionId: 'failed',
           error: error instanceof Error ? error.message : String(error),
         });
-        pty.sendSmartInputToTerminal(terminalId, text, attachments, modeId);
+        pty.sendSmartInputToTerminal(terminalId, text, attachments, runtimeMode);
       });
       return;
     }
 
-    pty.sendSmartInputToTerminal(terminalId, text, attachments, modeId);
+    pty.sendSmartInputToTerminal(terminalId, text, attachments, runtimeMode);
   }, [config, pty, terminals]);
 
   const browserUrlForProject = useCallback((project: ProjectRecord): string | undefined => {

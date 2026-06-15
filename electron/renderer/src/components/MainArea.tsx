@@ -94,7 +94,7 @@ export const MainArea: React.FC<MainAreaProps> = ({ terminals, activeTerminalId,
       {terminals.map((t) => {
         const isActive = t.id === activeTerminalId;
         const showSmartInput = shouldShowSmartInputFooter(t.kind, t.aiTool, t.aiStatus, t.opencodeSessionActive, t.claudeLaunchPending);
-        const modeControlsVisible = t.aiTool === AiCliToolEnum.OpenCode;
+        const modeControlsVisible = t.aiTool === AiCliToolEnum.OpenCode || t.aiTool === AiCliToolEnum.Claude;
         return (
           <div key={t.id} className="tile-cell" style={{ minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
             <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>

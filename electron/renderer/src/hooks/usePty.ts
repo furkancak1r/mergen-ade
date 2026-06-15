@@ -2,6 +2,8 @@ import { useEffect, useRef, useCallback } from 'react';
 import { AiCliTool as AiCliToolEnum } from '../../../shared/types';
 import type { TerminalKind, ShellKind, AiHookEvent, AiCliTool, AiCliAttentionKind, SmartInputState, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
 import type { ClaudeCodexHookProgress } from '../../../shared/claudeCodexHook';
+import type { ClaudeCodexPlanResult } from '../../../shared/claudeCodexHook';
+import { resolveAcpRoute } from '../../../shared/acpRoute';
 import type { SmartInputModeId } from '../lib/smartInputMode';
 import { normalizeSmartInputModeId, shouldSendOpenCodeModeToggle } from '../lib/smartInputMode';
 import { canAutoDispatchClaude } from '../lib/smartInput';
@@ -72,7 +74,8 @@ function clearOpenCodeSessionState(t: TerminalInstance) {
   t.opencodeLastHookEventSince = undefined;
 }
 
-export function usePty() {
+export function usePty(options: { allowClaudeCodexPlan?: boolean } = {}) {
+  const allowClaudeCodexPlan = options.allowClaudeCodexPlan === true;
   const terminalsRef = useRef<Map<number, TerminalInstance>>(new Map());
   const listenersRef = useRef<Set<() => void>>(new Set());
 
@@ -525,13 +528,28 @@ export function usePty() {
           continue;
         }
 
-        // Auto-dispatch the next task
         const task = t.smartInputState.queue[0];
+        const route = resolveAcpRoute(task.text, {
+          selectedRoute: task.modeId,
+          allowCodexPlan: isClaudeSmartInput && allowClaudeCodexPlan && task.attachments.length === 0,
+          attachmentCount: task.attachments.length,
+        });
         const nextQueue = t.smartInputState.queue.slice(1);
         t.smartInputState = {
           ...t.smartInputState,
           queue: nextQueue,
         };
+
+        if (route.question && isClaudeSmartInput) {
+          t.claudeCodexHookProgress = {
+            phase: 'blocked',
+            sessionId: 'auto-route',
+            error: route.question,
+          };
+          notify();
+          continue;
+        }
+
         t.opencodePromptSubmitSince = now;
         if (isOpenCodeSmartInput) {
           t.opencodeTransportStatus = 'Working';
@@ -543,7 +561,78 @@ export function usePty() {
         // Clear previous delayed enters
         t.pendingDelayedEnters = [];
 
-        const payloadDelay = writeSmartInputPayload(t, task.text, task.attachments, task.modeId);
+        if (isClaudeSmartInput && route.route === 'codex_plan') {
+          t.claudeCodexHookProgress = {
+            phase: 'planning',
+            sessionId: 'pending',
+          };
+          if (task.text.trim()) {
+            pushRecentInput(t.id, task.text);
+          }
+          api.invoke('claudeCodex:runPlan', {
+            terminalId: t.id,
+            projectPath: t.cwd,
+            originalPrompt: task.text.trim(),
+          }).then((value) => {
+            const current = terminalsRef.current.get(t.id);
+            if (!current) return;
+            const result = value as ClaudeCodexPlanResult;
+            current.claudeCodexHookProgress = {
+              phase: 'awaiting_implementation',
+              sessionId: result.sessionId,
+              planPath: result.planPath,
+              error: result.planError,
+              originalPrompt: task.text.trim(),
+              plan: result.plan,
+              planError: result.planError,
+              reviewRound: 0,
+            };
+            const sendAt = Date.now();
+            current.opencodePromptSubmitSince = sendAt;
+            current.aiStatus = 'running';
+            current.aiAttentionKind = undefined;
+            current.claudeLaunchPending = false;
+            current.pendingDelayedEnters = [];
+            const payloadDelay = writeSmartInputPayload(current, result.implementationPrompt, [], 'build');
+            if (result.implementationPrompt.trim()) {
+              pushRecentInput(current.id, result.implementationPrompt);
+            }
+            current.pendingDelayedEnters.push(sendAt + payloadDelay + 600);
+            current.pendingDelayedEnters.push(sendAt + payloadDelay + 1200);
+            notify();
+          }).catch((error) => {
+            const current = terminalsRef.current.get(t.id);
+            if (!current) return;
+            const message = error instanceof Error ? error.message : String(error);
+            current.claudeCodexHookProgress = {
+              phase: 'awaiting_implementation',
+              sessionId: 'failed',
+              error: message,
+              originalPrompt: task.text.trim(),
+              planError: message,
+              reviewRound: 0,
+            };
+            const fallback = `${task.text.trim()}\n\nCodex pre-implementation step failed; continue with the original prompt using normal implementation flow.\n\nPre-step error:\n${message}`;
+            const sendAt = Date.now();
+            current.opencodePromptSubmitSince = sendAt;
+            current.aiStatus = 'running';
+            current.aiAttentionKind = undefined;
+            current.claudeLaunchPending = false;
+            current.pendingDelayedEnters = [];
+            const payloadDelay = writeSmartInputPayload(current, fallback, [], 'build');
+            if (fallback.trim()) {
+              pushRecentInput(current.id, fallback);
+            }
+            current.pendingDelayedEnters.push(sendAt + payloadDelay + 600);
+            current.pendingDelayedEnters.push(sendAt + payloadDelay + 1200);
+            notify();
+          });
+          notify();
+          continue;
+        }
+
+        const runtimeMode = route.route === 'plan' ? 'plan' : 'build';
+        const payloadDelay = writeSmartInputPayload(t, task.text, task.attachments, runtimeMode);
 
         // Record recent input directly (bracketed paste is filtered from PTY history tracking)
         if (task.text.trim()) {
@@ -557,7 +646,7 @@ export function usePty() {
       }
     }, 100);
     return () => clearInterval(interval);
-  }, [notify, pushRecentInput, writeSmartInputPayload]);
+  }, [allowClaudeCodexPlan, notify, pushRecentInput, writeSmartInputPayload]);
 
   const getTerminals = useCallback(() => {
     return Array.from(terminalsRef.current.values());

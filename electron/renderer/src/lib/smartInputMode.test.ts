@@ -10,6 +10,8 @@ describe('smartInputMode', () => {
   it('normalizes unknown modes to build', () => {
     expect(normalizeSmartInputModeId(undefined)).toBe('build');
     expect(normalizeSmartInputModeId('build')).toBe('build');
+    expect(normalizeSmartInputModeId('auto')).toBe('build');
+    expect(normalizeSmartInputModeId('codex_plan')).toBe('build');
     expect(normalizeSmartInputModeId('default')).toBe('build');
     expect(normalizeSmartInputModeId('plan')).toBe('plan');
   });
@@ -20,7 +22,9 @@ describe('smartInputMode', () => {
   });
 
   it('shows a compact label only for plan queued tasks', () => {
+    expect(smartInputModeLabel('auto')).toBe('Auto');
     expect(smartInputModeLabel('plan')).toBe('Plan');
+    expect(smartInputModeLabel('codex_plan')).toBe('Codex Plan');
     expect(smartInputModeLabel('build')).toBeUndefined();
   });
 

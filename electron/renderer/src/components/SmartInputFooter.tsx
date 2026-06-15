@@ -36,7 +36,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
   modeControlsVisible = true,
   disabled = false,
 }) => {
-  const [draftMode, setDraftMode] = useState<SmartInputModeId>('build');
+  const [draftMode, setDraftMode] = useState<SmartInputModeId>('auto');
   const [editRestoreIndex, setEditRestoreIndex] = useState<number | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
@@ -66,6 +66,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
       draftText: '',
       draftAttachments: [],
     });
+    setDraftMode('auto');
     setEditRestoreIndex(null);
   }, [state, draftMode, modeControlsVisible, editRestoreIndex, onUpdateState]);
 
@@ -456,12 +457,12 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
           <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
             {modeControlsVisible && (
               <div
-                title="Tab toggles Build/Plan"
+                title="Auto decides per message; manual choices apply once"
                 style={{
-                  width: 58,
+                  width: 152,
                   height: 24,
                   display: 'grid',
-                  gridTemplateColumns: '1fr 1fr',
+                  gridTemplateColumns: 'repeat(4, 1fr)',
                   border: '1px solid #333',
                   borderRadius: 6,
                   overflow: 'hidden',
@@ -470,24 +471,25 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
                   marginBottom: 4,
                 }}
               >
-                {(['build', 'plan'] as SmartInputModeId[]).map((candidate) => {
+                {(['auto', 'build', 'plan', 'codex_plan'] as SmartInputModeId[]).map((candidate) => {
                   const active = draftMode === candidate;
                   const plan = candidate === 'plan';
+                  const codex = candidate === 'codex_plan';
                   return (
                     <button
                       key={candidate}
                       onClick={() => setDraftMode(candidate)}
                       style={{
                         border: 'none',
-                        borderRight: candidate === 'build' ? '1px solid #333' : 'none',
-                        background: active ? (plan ? '#281c10' : '#222') : '#141414',
-                        color: active ? (plan ? '#dcb43c' : '#d6d6d6') : '#777',
+                        borderRight: candidate === 'codex_plan' ? 'none' : '1px solid #333',
+                        background: active ? (plan || codex ? '#281c10' : '#222') : '#141414',
+                        color: active ? (plan || codex ? '#dcb43c' : '#d6d6d6') : '#777',
                         fontSize: 9,
                         padding: 0,
                         cursor: 'pointer',
                       }}
                     >
-                      {plan ? 'Plan' : 'Build'}
+                      {candidate === 'codex_plan' ? 'Codex' : candidate === 'auto' ? 'Auto' : plan ? 'Plan' : 'Build'}
                     </button>
                   );
                 })}

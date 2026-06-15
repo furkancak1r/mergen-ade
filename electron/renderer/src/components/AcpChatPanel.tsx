@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import type { AcpChatSession, AcpTimelineItem, ProjectRecord, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
 import { activeBuildModel, defaultAppConfig, effectivePlanModel } from '../../../shared/types';
+import { acpRouteLabel, resetAcpRouteAfterSend, type AcpRouteMode } from '../../../shared/acpRoute';
 import { fallbackTimelineFromMessages, normalizeAcpTimelineToolStatus } from '../../../shared/acpTimeline';
 import { appendMentionsToInput, pathToMention, removeMentionFromInput } from '../lib/acpParser';
 import {
@@ -170,6 +171,8 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     });
   }, [chatId, onDraftChange]);
   const [attachments, setAttachments] = useState<string[]>([]);
+  const [draftRoute, setDraftRoute] = useState<AcpRouteMode>('auto');
+  const [routeStatus, setRouteStatus] = useState('');
   const [modeDropdownOpen, setModeDropdownOpen] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState<OpenCodeQuestion | null>(null);
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
@@ -185,6 +188,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [queueDragTarget, setQueueDragTarget] = useState<number | null>(null);
   const [copyToastVisible, setCopyToastVisible] = useState(false);
   const copyToastTimerRef = useRef<number | null>(null);
+  const routeStatusTimerRef = useRef<number | null>(null);
   const [changesRefreshKey, setChangesRefreshKey] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -317,6 +321,11 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       if (event.type === 'promptResponse' || event.type === 'cancelled' || event.type === 'permissionResponse' || event.type === 'questionResponse') {
         clearPendingInteraction();
       }
+      if (event.type === 'routeResolved' && event.text) {
+        setRouteStatus(event.text);
+        if (routeStatusTimerRef.current !== null) window.clearTimeout(routeStatusTimerRef.current);
+        routeStatusTimerRef.current = window.setTimeout(() => { setRouteStatus(''); routeStatusTimerRef.current = null; }, 1800);
+      }
       if (event.type === 'commands' && event.commands) {
         setSlashCommandItemsState((prev) => {
           const next = slashCommandItemsForComposer(event.commands, inputRef.current?.value ?? '', controlsReady);
@@ -337,9 +346,14 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     setQueuedPromptEditReturn(null);
     setQueueStatusMessage(null);
     setQueueExpanded(true);
+    setDraftRoute('auto');
+    setRouteStatus('');
   }, [chatId, clearPendingInteraction]);
 
-  useEffect(() => () => { if (copyToastTimerRef.current !== null) window.clearTimeout(copyToastTimerRef.current); }, []);
+  useEffect(() => () => {
+    if (copyToastTimerRef.current !== null) window.clearTimeout(copyToastTimerRef.current);
+    if (routeStatusTimerRef.current !== null) window.clearTimeout(routeStatusTimerRef.current);
+  }, []);
 
   // Update slash hints when input changes
   useEffect(() => {
@@ -452,7 +466,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               setSlashCommandSelectedIndex(0);
             }
           } else {
-            toggleMode();
+            setDraftRoute((current) => current === 'plan' ? 'build' : 'plan');
           }
         }
       }
@@ -475,12 +489,13 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     if (!input.trim() && attachments.length === 0) return;
     const text = input.trim();
     const returnIndex = queuedPromptEditReturn?.index;
-    await api.invoke('acp:send', { chatId, promptText: text, attachments, modeId: session?.currentModeId, returnIndex });
+    await api.invoke('acp:send', { chatId, promptText: text, attachments, modeId: draftRoute, returnIndex });
     setInput('');
     setAttachments([]);
     setQueuedPromptEditReturn(null);
     setQueueStatusMessage(null);
-  }, [chatId, input, attachments, session?.currentModeId, queuedPromptEditReturn]);
+    setDraftRoute(resetAcpRouteAfterSend(draftRoute));
+  }, [chatId, input, attachments, draftRoute, queuedPromptEditReturn]);
 
   const cancelAcp = useCallback(async () => {
     await api.invoke('acp:cancel', chatId);
@@ -492,12 +507,6 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     setAttachments((prev) => prev.filter((_, idx) => idx !== index));
     setInput((prev) => removeMentionFromInput(prev, mention));
   }, [attachments]);
-
-  const toggleMode = useCallback(() => {
-    const currentMode = session?.currentModeId || 'build';
-    const nextMode = currentMode === 'plan' ? 'build' : 'plan';
-    api.invoke('acp:setConfigOption', { chatId, configId: 'mode', value: nextMode });
-  }, [chatId, session?.currentModeId]);
 
   const isRunning = session?.status === 'running' || session?.status === 'permission';
   const hasDraft = input.trim().length > 0 || attachments.length > 0;
@@ -650,14 +659,12 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
     setInput(prompt.text);
     setAttachments([...prompt.attachments]);
+    setDraftRoute((prompt.modeId as AcpRouteMode) || 'auto');
     setQueuedPromptEditReturn({ index, prompt: { ...prompt, attachments: [...prompt.attachments] } });
     setQueueStatusMessage(null);
-    if (prompt.modeId && prompt.modeId !== session?.currentModeId) {
-      await api.invoke('acp:setConfigOption', { chatId, configId: 'mode', value: prompt.modeId });
-    }
     await refreshSession();
     inputRef.current?.focus();
-  }, [attachments, chatId, input, queuedPromptEditReturn, refreshSession, session?.currentModeId]);
+  }, [attachments, chatId, input, queuedPromptEditReturn, refreshSession]);
 
   const cancelQueuedPromptEdit = useCallback(async () => {
     if (!queuedPromptEditReturn) return;
@@ -843,14 +850,47 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
             +
           </button>
 
-          {/* Mode pill */}
-          {currentMode === 'plan' && (
-            <button
-              onClick={toggleMode}
-              style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: '1px solid #333', background: '#1f3a4c', color: '#ccc', cursor: 'pointer', flexShrink: 0, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-            >
-              Plan
-            </button>
+          <div
+            title="Auto decides per message; manual choices apply once"
+            style={{
+              width: session?.tool === 'claude_acp' && resolvedConfig.claudeCodeCodexHookEnabled ? 168 : 126,
+              height: 28,
+              display: 'grid',
+              gridTemplateColumns: session?.tool === 'claude_acp' && resolvedConfig.claudeCodeCodexHookEnabled ? 'repeat(4, 1fr)' : 'repeat(3, 1fr)',
+              border: '1px solid #333',
+              borderRadius: 6,
+              overflow: 'hidden',
+              background: '#141414',
+              flexShrink: 0,
+            }}
+          >
+            {(['auto', 'build', 'plan', ...(session?.tool === 'claude_acp' && resolvedConfig.claudeCodeCodexHookEnabled ? ['codex_plan'] : [])] as AcpRouteMode[]).map((route, index, routes) => {
+              const active = draftRoute === route;
+              const accent = route === 'plan' || route === 'codex_plan';
+              return (
+                <button
+                  key={route}
+                  onClick={() => setDraftRoute(route)}
+                  style={{
+                    border: 'none',
+                    borderRight: index === routes.length - 1 ? 'none' : '1px solid #333',
+                    background: active ? (accent ? '#281c10' : '#222') : '#141414',
+                    color: active ? (accent ? '#dcb43c' : '#d6d6d6') : '#777',
+                    fontSize: 10,
+                    padding: 0,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {route === 'codex_plan' ? 'Codex' : acpRouteLabel(route)}
+                </button>
+              );
+            })}
+          </div>
+
+          {routeStatus && (
+            <span style={{ fontSize: 11, color: '#dca046', flexShrink: 0, maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {routeStatus}
+            </span>
           )}
 
           {/* Model + effort selector */}

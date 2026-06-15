@@ -21,6 +21,7 @@ import type {
 } from '../shared/types';
 import { activeBuildModel, effectivePlanModel, effectivePlanEffort, mergeAcpKnownModels } from '../shared/types';
 import { normalizeAcpTimelineToolStatus } from '../shared/acpTimeline';
+import { acpRouteLabel, resolveAcpRoute, type ResolvedAcpRouteMode } from '../shared/acpRoute';
 import {
   acpUnknownResponseWarningText,
   buildAcpCancelNotification,
@@ -41,6 +42,7 @@ import {
 import { loadConfig, saveConfig } from './config';
 import { getOpencodeBinPath } from './opencode';
 import { codexExecJsonArgs, getCodexBinPath, parseCodexExecJsonLine } from './codex';
+import { runClaudeCodexPlan } from './claudeCodexHook';
 import { getGitFileDiff, getGitStatus } from './worktree';
 
 /**
@@ -155,6 +157,12 @@ type AcpPendingInteraction =
   | { kind: 'permission'; rpcId: JsonRpcId; optionIds: Set<string> }
   | { kind: 'question'; rpcId: JsonRpcId; questionCount: number };
 
+interface AutoRouteQuestion {
+  promptText: string;
+  attachments: string[];
+  route: ResolvedAcpRouteMode;
+}
+
 interface AcpSession {
   process: ChildProcess | null;
   sessionId?: string;
@@ -178,6 +186,7 @@ interface AcpSession {
   cancelGraceUntil?: number;
   cancelUnsupported?: boolean;
   pendingInteractions: Map<string, AcpPendingInteraction>;
+  autoRouteQuestions: Map<string, AutoRouteQuestion>;
   nextInteractionId: number;
   tool?: 'opencode' | 'claude_acp' | 'codex_acp';
   nextTimelineId: number;
@@ -565,6 +574,7 @@ function createPendingInteraction(session: AcpSession, interaction: AcpPendingIn
 
 function clearPendingInteractions(session: AcpSession): void {
   session.pendingInteractions.clear();
+  session.autoRouteQuestions.clear();
 }
 
 function setSessionMode(session: AcpSession, modeId: string, forceRpc = false): void {
@@ -618,6 +628,7 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
     currentModeId: startupModeToModeId(loadConfig().acpStartupMode),
     queuedPrompts: [],
     pendingInteractions: new Map(),
+    autoRouteQuestions: new Map(),
     nextInteractionId: 1,
     tool,
     nextTimelineId: 1,
@@ -1101,19 +1112,21 @@ function flushNextQueuedPrompt(session: AcpSession): void {
   const next = session.queuedPrompts.shift()!;
   const fullText = buildAcpPromptText(next.text, next.attachments);
 
-  // Apply queued prompt's mode before sending, if different from current
-  if (next.modeId && next.modeId !== session.currentModeId) {
-    setSessionMode(session, next.modeId);
-  }
-
   // CLI adapters spawn one process per queued prompt.
   if (session.tool === 'claude_acp') {
-    sendClaudeCodePrompt(session, next.text, next.attachments);
+    sendClaudeRoute(session, next.modeId === 'codex_plan' ? 'codex_plan' : runtimeModeForRoute(next.modeId === 'plan' ? 'plan' : 'build'), next.text, next.attachments);
     return;
   }
   if (session.tool === 'codex_acp') {
+    if (next.modeId === 'plan') setSessionMode(session, 'plan');
+    else setSessionMode(session, 'build');
     sendCodexPrompt(session, next.text, next.attachments);
     return;
+  }
+
+  const runtimeMode = runtimeModeForRoute(next.modeId === 'plan' ? 'plan' : 'build');
+  if (runtimeMode !== session.currentModeId) {
+    setSessionMode(session, runtimeMode);
   }
 
   session.status = 'running';
@@ -1139,12 +1152,83 @@ export function claudeCodePromptTextForMode(promptText: string, _modeId?: string
   return promptText;
 }
 
-function queueAdapterPromptIfRunning(session: AcpSession, promptText: string, attachments: string[], fullText: string): boolean {
+function queueAdapterPromptIfRunning(session: AcpSession, promptText: string, attachments: string[], fullText: string, modeId = session.currentModeId || 'build'): boolean {
   if (session.status !== 'running') return false;
   updateAcpChatTitleFromPrompt(session, fullText);
-  session.queuedPrompts.push({ text: promptText, attachments, modeId: session.currentModeId || 'build', finalPromptText: fullText });
+  session.queuedPrompts.push({ text: promptText, attachments, modeId, finalPromptText: fullText });
   broadcast('acp:event', session.chatId, { type: 'queued', count: session.queuedPrompts.length, queuedPrompts: session.queuedPrompts.length });
   return true;
+}
+
+function askAutoRouteQuestion(session: AcpSession, question: string, promptText: string, attachments: string[], route: ResolvedAcpRouteMode): void {
+  const requestId = `auto-route-${Date.now()}-${session.nextInteractionId++}`;
+  const item: OpenCodeQuestion = {
+    kind: 'question',
+    header: 'Clarify Before Running',
+    question,
+    options: [],
+    multiple: false,
+    custom: true,
+    requestId,
+    sessionId: session.sessionId || '',
+  };
+  session.status = 'permission';
+  session.pendingInteractions.set(requestId, { kind: 'question', rpcId: requestId, questionCount: 1 });
+  session.autoRouteQuestions.set(requestId, { promptText, attachments, route });
+  appendAcpTimelinePermission(session, { interactionKind: 'question', requestId, header: item.header, question: item.question, options: item.options });
+  broadcast('acp:event', session.chatId, { type: 'question', ...item });
+}
+
+function broadcastRouteDecision(session: AcpSession, route: ResolvedAcpRouteMode, auto: boolean): void {
+  if (!auto) return;
+  broadcast('acp:event', session.chatId, { type: 'routeResolved', text: `Auto -> ${acpRouteLabel(route)}` });
+}
+
+function runtimeModeForRoute(route: ResolvedAcpRouteMode): 'build' | 'plan' {
+  return route === 'plan' ? 'plan' : 'build';
+}
+
+function sendClaudeRoute(session: AcpSession, route: ResolvedAcpRouteMode, promptText: string, attachments: string[]): void {
+  if (route === 'codex_plan') {
+    sendClaudeCodexPlanPrompt(session, promptText, attachments);
+    return;
+  }
+  setSessionMode(session, runtimeModeForRoute(route));
+  sendClaudeCodePrompt(session, promptText, attachments);
+}
+
+function sendClaudeCodexPlanPrompt(session: AcpSession, promptText: string, attachments: string[]): void {
+  const originalPrompt = buildAcpPromptText(promptText, attachments);
+  if (queueAdapterPromptIfRunning(session, promptText, attachments, originalPrompt, 'codex_plan')) return;
+
+  session.status = 'running';
+  updateAcpStandbyStatus(session.chatId, 'running');
+  updateAcpChatTitleFromPrompt(session, originalPrompt);
+  appendAcpTimelineMessage(session, 'user', originalPrompt);
+  appendAcpSystemMessage(session, 'Codex planning before Claude Code implementation.');
+  broadcast('acp:event', session.chatId, { type: 'promptSent', text: originalPrompt, queuedPrompts: session.queuedPrompts.length });
+
+  runClaudeCodexPlan({ terminalId: 0, projectPath: session.cwd, originalPrompt })
+    .then((result) => {
+      if (sessions.get(session.chatId) !== session) return;
+      session.status = 'idle';
+      setSessionMode(session, 'build');
+      if (result.planError) {
+        appendAcpTimelineNotice(session, 'stderr', 'Codex planning failed; Claude Code will continue with the original prompt.');
+      } else {
+        appendAcpSystemMessage(session, 'Codex plan ready; handing off to Claude Code.');
+      }
+      sendClaudeCodePrompt(session, result.implementationPrompt, []);
+    })
+    .catch((error) => {
+      if (sessions.get(session.chatId) !== session) return;
+      session.status = 'idle';
+      setSessionMode(session, 'build');
+      const message = error instanceof Error ? error.message : String(error);
+      const fallback = `${originalPrompt}\n\nCodex pre-implementation step failed; continue with the original prompt using normal implementation flow.\n\nPre-step error:\n${message}`;
+      appendAcpTimelineNotice(session, 'stderr', 'Codex planning failed; Claude Code will continue with the original prompt.');
+      sendClaudeCodePrompt(session, fallback, []);
+    });
 }
 
 function completeAdapterPlanTurn(session: AcpSession): void {
@@ -1578,17 +1662,28 @@ export function sendAcpPrompt(chatId: string, promptText: string, attachments: s
   const session = sessions.get(chatId);
   if (!session) return;
 
-  // Claude Code: spawn a new process per prompt
+  const route = resolveAcpRoute(promptText, {
+    selectedRoute: modeId,
+    allowCodexPlan: session.tool === 'claude_acp' ? loadConfig().claudeCodeCodexHookEnabled : false,
+    attachmentCount: attachments.length,
+  });
+  broadcastRouteDecision(session, route.route, route.auto);
+  if (route.question && (session.status === 'idle' || session.status === 'session_created')) {
+    askAutoRouteQuestion(session, route.question, promptText, attachments, route.route);
+    return;
+  }
+
   if (session.tool === 'claude_acp') {
-    sendClaudeCodePrompt(session, promptText, attachments);
+    sendClaudeRoute(session, route.route, promptText, attachments);
     return;
   }
   if (session.tool === 'codex_acp') {
+    setSessionMode(session, runtimeModeForRoute(route.route));
     sendCodexPrompt(session, promptText, attachments);
     return;
   }
 
-  const effectiveModeId = modeId || session.currentModeId || 'build';
+  const effectiveModeId = runtimeModeForRoute(route.route);
   const fullText = buildAcpPromptText(promptText, attachments);
 
   // Queue when session is not ready or a turn is active
@@ -1606,9 +1701,8 @@ export function sendAcpPrompt(chatId: string, promptText: string, attachments: s
     return;
   }
 
-  // Apply mode if explicitly provided and different
-  if (modeId && modeId !== session.currentModeId) {
-    setSessionMode(session, modeId);
+  if (effectiveModeId !== session.currentModeId) {
+    setSessionMode(session, effectiveModeId);
   }
 
   session.status = 'running';
@@ -1732,11 +1826,50 @@ export function sendAcpQuestionResponse(chatId: string, requestId: string, answe
     return true;
   }
 
+  if (requestId.startsWith('auto-route-')) {
+    handleAutoRouteQuestionAnswer(session, requestId, normalizedAnswers, rejected);
+    return true;
+  }
+
   sendRawRpc(session, buildAcpQuestionResponse(interaction.rpcId, normalizedAnswers, rejected));
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
   broadcast('acp:event', chatId, { type: 'questionResponse', requestId, rejected, status: 'running', queuedPrompts: session.queuedPrompts.length });
   return true;
+}
+
+function handleAutoRouteQuestionAnswer(session: AcpSession, requestId: string, answers: string[][], rejected: boolean): void {
+  const pending = session.autoRouteQuestions.get(requestId);
+  session.autoRouteQuestions.delete(requestId);
+  if (!pending || rejected) {
+    session.status = 'idle';
+    broadcast('acp:event', session.chatId, { type: 'questionResponse', requestId, rejected: true, status: 'idle', queuedPrompts: session.queuedPrompts.length });
+    return;
+  }
+
+  const clarification = answers.flat().join('\n').trim();
+  const prompt = clarification
+    ? `${pending.promptText}\n\nUser clarification:\n${clarification}`
+    : pending.promptText;
+  session.status = 'idle';
+  broadcast('acp:event', session.chatId, { type: 'questionResponse', requestId, rejected: false, status: 'running', queuedPrompts: session.queuedPrompts.length });
+
+  if (session.tool === 'claude_acp') {
+    sendClaudeRoute(session, pending.route, prompt, pending.attachments);
+    return;
+  }
+  setSessionMode(session, runtimeModeForRoute(pending.route));
+  if (session.tool === 'codex_acp') {
+    sendCodexPrompt(session, prompt, pending.attachments);
+    return;
+  }
+  const fullText = buildAcpPromptText(prompt, pending.attachments);
+  session.status = 'running';
+  updateAcpStandbyStatus(session.chatId, 'running');
+  updateAcpChatTitleFromPrompt(session, fullText);
+  appendAcpTimelineMessage(session, 'user', fullText);
+  sendRpc(session, 'session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: fullText }] });
+  broadcast('acp:event', session.chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
 }
 
 function handlePlanCompleteAnswer(session: AcpSession, answers: string[][], rejected: boolean): void {
