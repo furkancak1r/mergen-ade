@@ -6041,3 +6041,27 @@
   - Keep terminal typing paths low-latency by batching ordinary text and immediately flushing control/submit input.
 - Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/components/TerminalPane.tsx`, `electron/renderer/src/components/AcpChangesPanel.tsx`, `electron/renderer/src/components/Tooltip.tsx`, `electron/renderer/src/App.tsx`, `electron/renderer/src/styles/global.css`, `electron/renderer/src/hooks/usePty.ts`, `KNOWN_ISSUES.md`
 - References: User request 2026-06-12
+
+---
+
+#### ACP chat timeline controls and worktree foreground launcher parity {#electron-acp-timeline-worktree-launcher-parity}
+- Date: 2026-06-15
+- Context: User reported ACP chat missing visible todo/status/change details, showing an inappropriate move handle on AI responses, lacking user-message copy controls, and worktree project rows missing the foreground launcher icon.
+- Symptoms/Impact:
+  - ACP user messages required manual selection to copy.
+  - ACP timeline rows exposed a drag/reorder handle where assistant responses should be read-only.
+  - Todo tool calls and file edits were too easy to miss in the chat timeline.
+  - Worktree rows in Terminal Manager did not behave like normal project rows for foreground launcher access.
+- Root cause:
+  - Timeline reorder controls were applied to normal ACP timeline rows instead of only queued prompts.
+  - ACP tool/status output had only generic tool cards and source-control side-panel refreshes, not dedicated chat cards.
+  - Terminal Manager foreground launcher visibility was gated with `!isWorktree`.
+- Resolution:
+  - Add copy controls for ACP user messages, dedicated todo/status/change-summary cards, deduped slash command fallback visibility, and remove normal timeline drag controls.
+  - Allow worktree rows to show the same foreground launcher button as root project rows.
+- Prevent recurrence:
+  - Keep reorder behavior scoped to queued prompt rows.
+  - Keep ACP command/status parity tests focused on real slash commands and real protocol output, without fake context metrics.
+  - Keep worktree row launcher visibility tied to the Terminal Manager filter, not the project type.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/shared/acpTimeline.ts`, `electron/shared/types.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/components/AcpTimeline.tsx`, `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/lib/acpChanges.ts`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/terminalManagerState.ts`, `electron/renderer/src/styles/global.css`, `KNOWN_ISSUES.md`
+- References: User request 2026-06-15

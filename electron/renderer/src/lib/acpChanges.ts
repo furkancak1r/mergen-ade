@@ -1,4 +1,4 @@
-import type { GitFileDiff, SourceControlFile } from '../../../shared/types';
+import type { AcpTimelineChangeSummaryFile, GitFileDiff, SourceControlFile } from '../../../shared/types';
 
 export interface AcpChangeGroups {
   staged: SourceControlFile[];
@@ -15,6 +15,45 @@ export function groupAcpChanges(files: readonly SourceControlFile[]): AcpChangeG
 export function acpDiffTotals(diff: GitFileDiff | undefined): string | undefined {
   if (!diff || diff.status !== 'ready') return undefined;
   return `+${diff.addedLines} -${diff.removedLines}`;
+}
+
+export function buildAcpChangeSummaryFiles(
+  files: readonly SourceControlFile[],
+  diffs: ReadonlyMap<string, GitFileDiff | undefined>,
+): AcpTimelineChangeSummaryFile[] {
+  return files.map((file) => {
+    const diff = diffs.get(file.path);
+    return {
+      path: file.path,
+      status: file.status,
+      staged: file.staged,
+      addedLines: diff?.status === 'ready' ? diff.addedLines : 0,
+      removedLines: diff?.status === 'ready' ? diff.removedLines : 0,
+      binary: diff?.status === 'ready' ? diff.binary : false,
+      error: diff?.status === 'error' ? diff.error || 'Diff unavailable' : undefined,
+    };
+  });
+}
+
+export function acpChangeSummarySignature(files: readonly AcpTimelineChangeSummaryFile[]): string {
+  return files
+    .map((file) => [
+      file.path,
+      file.status,
+      file.staged ? 'staged' : 'unstaged',
+      file.addedLines,
+      file.removedLines,
+      file.binary ? 'binary' : 'text',
+      file.error || '',
+    ].join(':'))
+    .join('|');
+}
+
+export function acpChangeSummaryTotals(files: readonly AcpTimelineChangeSummaryFile[]): { addedLines: number; removedLines: number } {
+  return files.reduce((totals, file) => ({
+    addedLines: totals.addedLines + file.addedLines,
+    removedLines: totals.removedLines + file.removedLines,
+  }), { addedLines: 0, removedLines: 0 });
 }
 
 export function nextSelectedChangePath(

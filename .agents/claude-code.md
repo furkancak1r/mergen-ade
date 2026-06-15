@@ -22,3 +22,15 @@
   ```
   Then verify with `claude --version`. Persistent failures can be diagnosed with `claude doctor`.
 - **Secret handling**: `~/.claude/settings.json`, `.claude/settings.local.json`, and `.claude/state/` are ignored by git (via `.gitignore`). No API keys or tokens are committed to the repository.
+
+## Claude Code ACP Plan Mode
+
+- **Plan mode is supported in Claude Code ACP sessions.** The Tab key toggles between `plan` and `build` modes, identical to OpenCode ACP. The Plan pill appears when plan mode is active.
+- **Plan mode injects planning instructions.** When a prompt is sent in plan mode, a system instruction is prepended that tells Claude Code to analyze the codebase and create a structured implementation plan without making changes.
+- **Plan-complete question card.** After Claude Code finishes generating a plan, a question card appears with three options:
+  - **Accept & Implement**: Switches to build mode and sends a new prompt with the plan as context, asking Claude to implement it.
+  - **Accept Plan**: Stays in plan mode, allowing the user to refine the plan.
+  - **Reject & Request Changes**: Discards the plan and lets the user type new instructions.
+- **Keyboard navigation.** The plan-complete question card supports arrow key navigation (Up/Down to focus options, Enter to select, Escape to reject).
+- **Codex hook is disabled by default.** `claudeCodeCodexHookEnabled` defaults to `false`. Users can re-enable it from Settings if they want the Codex plan/review/fix workflow. The skill remains available regardless of this setting.
+- **ACP startup mode applies to Claude ACP.** The `acpStartupMode` setting (Plan or Build) applies to both OpenCode and Claude Code ACP sessions.

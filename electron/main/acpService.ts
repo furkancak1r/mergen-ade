@@ -8,11 +8,16 @@ import type {
   AcpConfigOption,
   AcpAvailableCommand,
   AcpChatMessage,
+  AcpTimelineChangeSummaryFile,
   AcpTimelineItem,
   AcpTimelineNoticeKind,
+  AcpTimelineStatusKind,
+  GitFileDiff,
   OpenCodeModelConfig,
+  OpenCodeQuestion,
   OpenCodeQuestionOption,
   QueuedAcpPrompt,
+  SourceControlFile,
 } from '../shared/types';
 import { activeBuildModel, effectivePlanModel, effectivePlanEffort, mergeAcpKnownModels } from '../shared/types';
 import { normalizeAcpTimelineToolStatus } from '../shared/acpTimeline';
@@ -35,6 +40,7 @@ import {
 } from '../shared/acpProtocol';
 import { loadConfig, saveConfig } from './config';
 import { getOpencodeBinPath } from './opencode';
+import { getGitFileDiff, getGitStatus } from './worktree';
 
 /**
  * Load slash commands from SKILL.md files in .zed/skills/
@@ -77,6 +83,44 @@ function loadSlashCommandsFromSkills(projectPath: string): AcpAvailableCommand[]
   } catch {
     return [];
   }
+}
+
+function defaultAcpSlashCommands(): AcpAvailableCommand[] {
+  return [
+    { id: '/help', name: '/help', description: 'Show help and available commands' },
+    { id: '/clear', name: '/clear', description: 'Clear conversation history' },
+    { id: '/compact', name: '/compact', description: 'Compact conversation to save context' },
+    { id: '/config', name: '/config', description: 'View/change configuration' },
+    { id: '/cost', name: '/cost', description: 'Show token usage and cost' },
+    { id: '/doctor', name: '/doctor', description: 'Check ACP health' },
+    { id: '/init', name: '/init', description: 'Initialize project memory' },
+    { id: '/memory', name: '/memory', description: 'Edit project memory' },
+    { id: '/model', name: '/model', description: 'Switch AI model' },
+    { id: '/permissions', name: '/permissions', description: 'Manage tool permissions' },
+    { id: '/review', name: '/review', description: 'Request a code review' },
+    { id: '/status', name: '/status', description: 'Show current status' },
+    { id: '/terminal-setup', name: '/terminal-setup', description: 'Configure terminal integration' },
+    { id: '/mcp', name: '/mcp', description: 'Manage MCP servers' },
+  ];
+}
+
+function mergeAcpSlashCommands(...groups: AcpAvailableCommand[][]): AcpAvailableCommand[] {
+  const merged: AcpAvailableCommand[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    for (const command of group) {
+      const id = slashCommandKey(command.id || command.name);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      merged.push(command);
+    }
+  }
+  return merged;
+}
+
+function slashCommandKey(value: string | undefined): string {
+  const token = (value || '').trim().replace(/^\/+/, '').toLowerCase();
+  return token && !/\s/.test(token) ? `/${token}` : '';
 }
 
 function buildAcpPromptText(text: string, attachments: string[]): string {
@@ -130,6 +174,8 @@ interface AcpSession {
   nextInteractionId: number;
   tool?: 'opencode' | 'claude_acp';
   nextTimelineId: number;
+  lastChangeSummarySignature?: string;
+  changeSummaryInFlight?: boolean;
 }
 
 const sessions = new Map<string, AcpSession>();
@@ -249,6 +295,174 @@ function appendAcpTimelineNotice(
   });
 }
 
+function appendAcpTimelineStatus(
+  session: AcpSession,
+  kind: AcpTimelineStatusKind,
+  title: string,
+  text: string,
+  timestamp = Date.now(),
+): void {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  const item: AcpTimelineItem = {
+    id: createTimelineId(session, `${kind}-status`),
+    type: 'status',
+    kind,
+    title,
+    text: trimmed,
+    timestamp,
+  };
+  session.timeline.push(item);
+  broadcast('acp:event', session.chatId, { type: 'timelineItem', item });
+}
+
+function scheduleAcpChangeSummary(session: AcpSession): void {
+  if (session.changeSummaryInFlight) return;
+  session.changeSummaryInFlight = true;
+  void appendAcpChangeSummary(session)
+    .finally(() => {
+      session.changeSummaryInFlight = false;
+    });
+}
+
+async function appendAcpChangeSummary(session: AcpSession): Promise<void> {
+  const status = await getGitStatus(session.cwd, false);
+  if (status.error || status.files.length === 0) return;
+
+  const visibleFiles = status.files.slice(0, 12);
+  const diffs = await Promise.all(visibleFiles.map(async (file) => {
+    try {
+      return await getGitFileDiff(session.cwd, file.path);
+    } catch (error) {
+      return {
+        status: 'error',
+        filePath: file.path,
+        patch: '',
+        addedLines: 0,
+        removedLines: 0,
+        binary: false,
+        error: error instanceof Error ? error.message : String(error),
+      } satisfies GitFileDiff;
+    }
+  }));
+
+  const files = visibleFiles.map((file, index) => acpChangeSummaryFile(file, diffs[index]));
+  const signature = acpChangeSummarySignature(status.files, files);
+  if (!signature || signature === session.lastChangeSummarySignature) return;
+
+  session.lastChangeSummarySignature = signature;
+  const totals = files.reduce((sum, file) => ({
+    addedLines: sum.addedLines + file.addedLines,
+    removedLines: sum.removedLines + file.removedLines,
+  }), { addedLines: 0, removedLines: 0 });
+  const item: AcpTimelineItem = {
+    id: createTimelineId(session, 'change-summary'),
+    type: 'change_summary',
+    files,
+    totalFiles: status.files.length,
+    addedLines: totals.addedLines,
+    removedLines: totals.removedLines,
+    signature,
+    timestamp: Date.now(),
+  };
+  session.timeline.push(item);
+  broadcast('acp:event', session.chatId, { type: 'timelineItem', item });
+}
+
+function acpChangeSummaryFile(file: SourceControlFile, diff: GitFileDiff | undefined): AcpTimelineChangeSummaryFile {
+  return {
+    path: file.path,
+    status: file.status,
+    staged: file.staged,
+    addedLines: diff?.status === 'ready' ? diff.addedLines : 0,
+    removedLines: diff?.status === 'ready' ? diff.removedLines : 0,
+    binary: diff?.status === 'ready' ? diff.binary : false,
+    error: diff?.status === 'error' ? diff.error || 'Diff unavailable' : undefined,
+  };
+}
+
+function acpChangeSummarySignature(
+  statusFiles: readonly SourceControlFile[],
+  visibleFiles: readonly AcpTimelineChangeSummaryFile[],
+): string {
+  const statusPart = statusFiles
+    .map((file) => `${file.path}:${file.status}:${file.staged ? 'staged' : 'unstaged'}`)
+    .join('|');
+  const diffPart = visibleFiles
+    .map((file) => `${file.path}:${file.addedLines}:${file.removedLines}:${file.binary ? 'binary' : 'text'}:${file.error || ''}`)
+    .join('|');
+  return `${statusFiles.length}::${statusPart}::${diffPart}`;
+}
+
+function isAcpFileModifyingToolKind(kind: string | undefined): boolean {
+  const normalized = (kind || '').trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized.includes('edit') || normalized.includes('patch') || normalized.includes('write')
+    || normalized.includes('bash') || normalized.includes('shell') || normalized.includes('terminal');
+}
+
+function isTerminalToolStatus(status: unknown): boolean {
+  const normalized = normalizeAcpTimelineToolStatus(status);
+  return normalized === 'completed' || normalized === 'failed';
+}
+
+function appendAcpStatusFromProtocolUpdate(session: AcpSession, value: unknown): void {
+  const text = acpProtocolStatusText(value);
+  if (!text) return;
+  const lower = text.toLowerCase();
+  const kind: AcpTimelineStatusKind = lower.includes('compact')
+    ? 'compact'
+    : lower.includes('context')
+      ? 'context'
+      : lower.includes('cost') || lower.includes('token')
+        ? 'cost'
+        : lower.includes('terminal')
+          ? 'terminal'
+          : lower.includes('status')
+            ? 'status'
+            : 'info';
+  if (kind === 'info') return;
+  appendAcpTimelineStatus(session, kind, acpProtocolStatusTitle(kind), text);
+}
+
+function acpProtocolStatusTitle(kind: AcpTimelineStatusKind): string {
+  switch (kind) {
+    case 'compact':
+      return 'Context Compacting';
+    case 'context':
+      return 'Context';
+    case 'status':
+      return 'Status';
+    case 'cost':
+      return 'Cost';
+    case 'terminal':
+      return 'Terminal';
+    case 'info':
+      return 'Info';
+  }
+}
+
+function acpProtocolStatusText(value: unknown): string {
+  if (!value) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value !== 'object') return '';
+
+  const record = value as Record<string, unknown>;
+  const direct = firstStringValue(record, ['message', 'text', 'summary', 'status', 'description']);
+  if (direct) return direct;
+
+  const json = JSON.stringify(value);
+  return /compact|context|cost|token|terminal|status/i.test(json) ? json : '';
+}
+
+function firstStringValue(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
 function upsertAcpTimelineTool(
   session: AcpSession,
   options: { toolCallId: string; title: string; kind: string; status: unknown; raw?: unknown },
@@ -282,14 +496,16 @@ function upsertAcpTimelineTool(
   });
 }
 
-function updateAcpTimelineToolStatus(session: AcpSession, toolCallId: string, status: unknown): void {
+function updateAcpTimelineToolStatus(session: AcpSession, toolCallId: string, status: unknown): AcpTimelineItem | undefined {
   const now = Date.now();
   const normalized = normalizeAcpTimelineToolStatus(status);
   const existing = session.timeline.find((item) => item.type === 'tool' && item.toolCallId === toolCallId);
   if (existing?.type === 'tool') {
     existing.status = normalized;
     existing.updatedAt = now;
+    return existing;
   }
+  return undefined;
 }
 
 function appendAcpTimelinePermission(
@@ -390,7 +606,7 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
     promptInput: '',
     attachments: [],
     configOptions: [],
-    currentModeId: isClaudeCode ? undefined : startupModeToModeId(loadConfig().acpStartupMode),
+    currentModeId: startupModeToModeId(loadConfig().acpStartupMode),
     queuedPrompts: [],
     pendingInteractions: new Map(),
     nextInteractionId: 1,
@@ -423,32 +639,11 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
       },
     ];
 
-    // Populate slash commands for the composer "/" popup
-    const builtinCommands: AcpAvailableCommand[] = [
-      { id: '/help', name: '/help', description: 'Show help and available commands' },
-      { id: '/clear', name: '/clear', description: 'Clear conversation history' },
-      { id: '/compact', name: '/compact', description: 'Compact conversation to save context' },
-      { id: '/config', name: '/config', description: 'View/change configuration' },
-      { id: '/cost', name: '/cost', description: 'Show token usage and cost' },
-      { id: '/doctor', name: '/doctor', description: 'Check Claude Code health' },
-      { id: '/init', name: '/init', description: 'Initialize project with CLAUDE.md' },
-      { id: '/login', name: '/login', description: 'Switch Anthropic account' },
-      { id: '/logout', name: '/logout', description: 'Sign out from Anthropic' },
-      { id: '/memory', name: '/memory', description: 'Edit CLAUDE.md memory file' },
-      { id: '/model', name: '/model', description: 'Switch AI model' },
-      { id: '/permissions', name: '/permissions', description: 'Manage tool permissions' },
-      { id: '/review', name: '/review', description: 'Request a code review' },
-      { id: '/status', name: '/status', description: 'Show current status' },
-      { id: '/terminal-setup', name: '/terminal-setup', description: 'Configure terminal integration' },
-      { id: '/vim', name: '/vim', description: 'Toggle vim keybindings' },
-      { id: '/mcp', name: '/mcp', description: 'Manage MCP servers' },
-    ];
-
     // Load custom commands from .zed/skills/
     const customCommands = loadSlashCommandsFromSkills(opts.cwd || process.cwd());
 
     // Merge: custom commands first, then built-in commands
-    session.availableCommands = [...customCommands, ...builtinCommands];
+    session.availableCommands = mergeAcpSlashCommands(customCommands, defaultAcpSlashCommands());
 
     broadcast('acp:event', chatId, { type: 'sessionCreated', sessionId: session.sessionId });
     broadcast('acp:event', chatId, { type: 'configOptions', options: session.configOptions });
@@ -628,10 +823,16 @@ function handleAcpLine(session: AcpSession, line: string): void {
           }
           broadcast('acp:event', session.chatId, { type: 'configOptions', options: session.configOptions });
         }
+        session.availableCommands = mergeAcpSlashCommands(
+          loadSlashCommandsFromSkills(session.cwd || process.cwd()),
+          session.availableCommands ?? [],
+          defaultAcpSlashCommands(),
+        );
         // Apply startup/pending mode and model binding from Mergen config on session start.
         setSessionMode(session, session.currentModeId || startupModeToModeId(loadConfig().acpStartupMode), true);
         updateAcpStandbyStatus(session.chatId, 'idle', session.sessionId);
         broadcast('acp:event', session.chatId, { type: 'sessionCreated', sessionId: session.sessionId });
+        broadcast('acp:event', session.chatId, { type: 'commands', commands: session.availableCommands });
         // Flush any prompts queued while starting
         flushNextQueuedPrompt(session);
         return;
@@ -642,6 +843,7 @@ function handleAcpLine(session: AcpSession, line: string): void {
         session.status = 'idle';
         clearPendingInteractions(session);
         updateAcpStandbyStatus(session.chatId, 'idle');
+        scheduleAcpChangeSummary(session);
         broadcast('acp:event', session.chatId, { type: 'promptResponse', stopReason: result.stopReason, text: result.text, queuedPrompts: session.queuedPrompts.length });
         // Flush queued prompts one at a time
         flushNextQueuedPrompt(session);
@@ -776,13 +978,19 @@ function handleAcpLine(session: AcpSession, line: string): void {
           const status = (update.status as string) || 'pending';
           session.messages.push({ role: 'system', text: `${title} (${kind})`, timestamp: Date.now() });
           upsertAcpTimelineTool(session, { toolCallId, title, kind, status, raw: update });
-          broadcast('acp:event', session.chatId, { type: 'toolCall', toolCallId, title, kind, status });
+          if (isAcpFileModifyingToolKind(kind) && isTerminalToolStatus(status)) {
+            scheduleAcpChangeSummary(session);
+          }
+          broadcast('acp:event', session.chatId, { type: 'toolCall', toolCallId, title, kind, status, raw: update });
           return;
         }
         case 'tool_call_update': {
           const toolCallId = (update.toolCallId as string) || '';
           const status = (update.status as string) || '';
-          updateAcpTimelineToolStatus(session, toolCallId, status);
+          const tool = updateAcpTimelineToolStatus(session, toolCallId, status);
+          if (tool?.type === 'tool' && isAcpFileModifyingToolKind(tool.kind) && isTerminalToolStatus(status)) {
+            scheduleAcpChangeSummary(session);
+          }
           broadcast('acp:event', session.chatId, { type: 'toolCallUpdate', toolCallId, status });
           return;
         }
@@ -833,16 +1041,18 @@ function handleAcpLine(session: AcpSession, line: string): void {
           const serverCommands = (update.availableCommands as AcpAvailableCommand[]) || (update.commands as AcpAvailableCommand[]) || [];
           // Merge custom commands from .zed/skills/ with server commands
           const customCommands = loadSlashCommandsFromSkills(session.cwd || process.cwd());
-          session.availableCommands = [...customCommands, ...serverCommands];
+          session.availableCommands = mergeAcpSlashCommands(customCommands, serverCommands, defaultAcpSlashCommands());
           broadcast('acp:event', session.chatId, { type: 'commands', commands: session.availableCommands });
           return;
         }
         default:
+          appendAcpStatusFromProtocolUpdate(session, update);
           return;
       }
     }
 
     if (method) {
+      appendAcpStatusFromProtocolUpdate(session, msg);
       broadcast('acp:event', session.chatId, { type: 'raw', message: msg });
     }
   } catch {
@@ -877,13 +1087,22 @@ function flushNextQueuedPrompt(session: AcpSession): void {
   broadcast('acp:event', session.chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
 }
 
+const PLAN_SYSTEM_INSTRUCTION = `You are in PLAN MODE. Your task is to analyze the user's request and create a detailed implementation plan. Follow these rules:
+1. Read and understand the relevant code files before making a plan.
+2. Create a clear, step-by-step implementation plan with specific file paths and changes.
+3. Do NOT make any code changes, edits, or modifications. Plan only.
+4. Present the plan in a structured format with sections: Overview, Steps, Files to modify, and Risks/Considerations.
+5. Be specific about what code to add, modify, or remove in each step.`;
+
 function sendClaudeCodePrompt(session: AcpSession, promptText: string, attachments: string[]): void {
-  const fullText = buildAcpPromptText(promptText, attachments);
+  const isPlanMode = session.currentModeId === 'plan';
+  const effectiveText = isPlanMode ? `${PLAN_SYSTEM_INSTRUCTION}\n\nUser request: ${promptText}` : promptText;
+  const fullText = buildAcpPromptText(effectiveText, attachments);
 
   // Queue if already running
   if (session.status === 'running') {
     updateAcpChatTitleFromPrompt(session, fullText);
-    session.queuedPrompts.push({ text: promptText, attachments, modeId: 'build', finalPromptText: fullText });
+    session.queuedPrompts.push({ text: promptText, attachments, modeId: session.currentModeId || 'build', finalPromptText: fullText });
     broadcast('acp:event', session.chatId, { type: 'queued', count: session.queuedPrompts.length, queuedPrompts: session.queuedPrompts.length });
     return;
   }
@@ -948,10 +1167,36 @@ function sendClaudeCodePrompt(session: AcpSession, promptText: string, attachmen
 
     proc.on('exit', (_code) => {
       session.process = null;
-      session.status = 'idle';
-      clearPendingInteractions(session);
-      broadcast('acp:event', session.chatId, { type: 'promptResponse', stopReason: 'end_turn', queuedPrompts: session.queuedPrompts.length });
-      flushNextQueuedPrompt(session);
+
+      // Plan mode: show plan-complete question instead of normal completion
+      if (isPlanMode) {
+        session.status = 'permission';
+        const requestId = `plan-complete-${Date.now()}`;
+        const planQuestion: OpenCodeQuestion = {
+          kind: 'question',
+          header: 'Plan Complete',
+          question: 'The plan has been generated. How would you like to proceed?',
+          options: [
+            { id: 'accept_implement', label: 'Accept & Implement', description: 'Approve the plan and start implementing it' },
+            { id: 'accept', label: 'Accept Plan', description: 'Keep the plan, stay in plan mode for refinement' },
+            { id: 'reject', label: 'Reject & Request Changes', description: 'Discard the plan and provide new instructions' },
+          ],
+          multiple: false,
+          custom: false,
+          requestId,
+          sessionId: session.sessionId || '',
+        };
+        session.pendingInteractions.set(requestId, { kind: 'question', rpcId: requestId, questionCount: 1 });
+        appendAcpTimelinePermission(session, { interactionKind: 'question', requestId, header: planQuestion.header, question: planQuestion.question, options: planQuestion.options });
+        broadcast('acp:event', session.chatId, { type: 'question', ...planQuestion });
+        return;
+      }
+
+        session.status = 'idle';
+        clearPendingInteractions(session);
+        scheduleAcpChangeSummary(session);
+        broadcast('acp:event', session.chatId, { type: 'promptResponse', stopReason: 'end_turn', queuedPrompts: session.queuedPrompts.length });
+        flushNextQueuedPrompt(session);
     });
 
     proc.on('error', (err) => {
@@ -1000,7 +1245,7 @@ function handleClaudeCodeLine(session: AcpSession, line: string): void {
             const title = claudeToolUseTitle(name, input);
             const kind = claudeToolUseKind(name);
             upsertAcpTimelineTool(session, { toolCallId, title, kind, status: 'running', raw: block });
-            broadcast('acp:event', session.chatId, { type: 'toolCall', toolCallId, title, kind, status: 'running' });
+            broadcast('acp:event', session.chatId, { type: 'toolCall', toolCallId, title, kind, status: 'running', raw: block });
           }
         }
       }
@@ -1016,7 +1261,10 @@ function handleClaudeCodeLine(session: AcpSession, line: string): void {
           if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
             const toolCallId = block.tool_use_id;
             const isError = block.is_error === true;
-            updateAcpTimelineToolStatus(session, toolCallId, isError ? 'failed' : 'completed');
+            const tool = updateAcpTimelineToolStatus(session, toolCallId, isError ? 'failed' : 'completed');
+            if (tool?.type === 'tool' && isAcpFileModifyingToolKind(tool.kind)) {
+              scheduleAcpChangeSummary(session);
+            }
             broadcast('acp:event', session.chatId, { type: 'toolCallUpdate', toolCallId, status: isError ? 'failed' : 'completed' });
           }
         }
@@ -1202,14 +1450,18 @@ export function setAcpConfigOption(chatId: string, configId: string, value: stri
   const session = sessions.get(chatId);
   if (!session) return;
 
-  // Claude Code: ignore config option changes (model is fixed, no mode concept)
-  if (session.tool === 'claude_acp') return;
-
   if (configId === 'mode') {
-    setSessionMode(session, value, Boolean(session.sessionId));
+    session.currentModeId = value;
     broadcast('acp:event', session.chatId, { type: 'modeUpdate', modeId: value });
+    // For OpenCode, also send RPC to the ACP process
+    if (session.tool !== 'claude_acp' && session.sessionId) {
+      sendRpc(session, 'session/set_config_option', { sessionId: session.sessionId, configId: 'mode', value });
+    }
     return;
   }
+
+  // Claude Code: ignore non-mode config option changes (model is fixed)
+  if (session.tool === 'claude_acp') return;
 
   if (!session.sessionId) return;
 
@@ -1265,11 +1517,57 @@ export function sendAcpQuestionResponse(chatId: string, requestId: string, answe
 
   session.pendingInteractions.delete(requestId);
   resolveAcpTimelinePermission(session, requestId, rejected);
+
+  // Plan-complete question: handle locally (no ACP process to respond to)
+  if (requestId.startsWith('plan-complete-')) {
+    handlePlanCompleteAnswer(session, normalizedAnswers, rejected);
+    return true;
+  }
+
   sendRawRpc(session, buildAcpQuestionResponse(interaction.rpcId, normalizedAnswers, rejected));
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
   broadcast('acp:event', chatId, { type: 'questionResponse', requestId, rejected, status: 'running', queuedPrompts: session.queuedPrompts.length });
   return true;
+}
+
+function handlePlanCompleteAnswer(session: AcpSession, answers: string[][], rejected: boolean): void {
+  // The answer is the option label (e.g., "Accept & Implement"). Map to action.
+  const answerLabel = (answers[0]?.[0] || '').toLowerCase();
+
+  if (rejected || answerLabel.includes('reject')) {
+    // Reject: clear and stay in plan mode, user can type new prompt
+    session.status = 'idle';
+    broadcast('acp:event', session.chatId, { type: 'questionResponse', requestId: '', rejected: true, status: 'idle', queuedPrompts: session.queuedPrompts.length });
+    return;
+  }
+
+  if (answerLabel.includes('implement')) {
+    // Accept and implement: switch to build mode and send implementation prompt
+    session.currentModeId = 'build';
+    broadcast('acp:event', session.chatId, { type: 'modeUpdate', modeId: 'build' });
+
+    // Collect the plan from the last assistant messages
+    const planText = session.messages
+      .filter((m) => m.role === 'assistant')
+      .map((m) => m.text)
+      .join('\n\n');
+
+    const implementPrompt = `Based on the plan we just discussed, please implement all the changes now. Here is the plan:\n\n${planText}`;
+    sendClaudeCodePrompt(session, implementPrompt, []);
+    return;
+  }
+
+  if (answerLabel.includes('accept')) {
+    // Accept plan only: stay in plan mode, user can refine
+    session.status = 'idle';
+    broadcast('acp:event', session.chatId, { type: 'promptResponse', stopReason: 'end_turn', queuedPrompts: session.queuedPrompts.length });
+    return;
+  }
+
+  // Unknown choice: just clear
+  session.status = 'idle';
+  broadcast('acp:event', session.chatId, { type: 'promptResponse', stopReason: 'end_turn', queuedPrompts: session.queuedPrompts.length });
 }
 
 export function getAcpSession(chatId: string): AcpChatSession | undefined {

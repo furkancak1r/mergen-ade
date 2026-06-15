@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import type { AcpChatSession, ProjectRecord, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
+import type { AcpChatSession, AcpTimelineItem, ProjectRecord, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
 import { activeBuildModel, defaultAppConfig, effectivePlanModel } from '../../../shared/types';
 import { fallbackTimelineFromMessages, normalizeAcpTimelineToolStatus } from '../../../shared/acpTimeline';
 import { appendMentionsToInput, pathToMention, removeMentionFromInput } from '../lib/acpParser';
@@ -51,6 +51,16 @@ interface AcpPanelEvent {
   title?: string;
   kind?: string;
   status?: string;
+  item?: AcpTimelineItem;
+  raw?: unknown;
+}
+
+/** Returns true if the tool kind indicates a potential file modification (edit, write, bash/shell). */
+function isFileModifyingToolKind(kind: string | undefined): boolean {
+  const normalized = (kind || '').trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized.includes('edit') || normalized.includes('patch') || normalized.includes('write')
+    || normalized.includes('bash') || normalized.includes('shell') || normalized.includes('terminal');
 }
 
 interface AcpChatPanelProps {
@@ -118,6 +128,7 @@ function withTimelineTool(session: AcpChatSession, event: AcpPanelEvent): AcpCha
         kind: event.kind || current.kind,
         status,
         updatedAt: now,
+        raw: event.raw ?? current.raw,
       };
     }
   } else {
@@ -130,7 +141,19 @@ function withTimelineTool(session: AcpChatSession, event: AcpPanelEvent): AcpCha
       status,
       startedAt: now,
       updatedAt: now,
+      raw: event.raw,
     });
+  }
+  return { ...session, timeline };
+}
+
+function withTimelineItem(session: AcpChatSession, item: AcpTimelineItem): AcpChatSession {
+  const timeline = [...(session.timeline && session.timeline.length > 0 ? session.timeline : fallbackTimelineFromMessages(session.messages))];
+  const existingIndex = timeline.findIndex((candidate) => candidate.id === item.id);
+  if (existingIndex >= 0) {
+    timeline[existingIndex] = item;
+  } else {
+    timeline.push(item);
   }
   return { ...session, timeline };
 }
@@ -152,15 +175,16 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
   const [customAnswer, setCustomAnswer] = useState('');
   const [questionAnswers, setQuestionAnswers] = useState<Record<number, string>>({});
+  const [questionFocusIndex, setQuestionFocusIndex] = useState(0);
   const [slashCommandItemsState, setSlashCommandItemsState] = useState<AcpSlashCommandItem[]>([]);
   const [slashCommandSelectedIndex, setSlashCommandSelectedIndex] = useState(0);
   const [queuedPromptEditReturn, setQueuedPromptEditReturn] = useState<QueuedPromptEditReturn | null>(null);
   const [queueStatusMessage, setQueueStatusMessage] = useState<string | null>(null);
   const [queueExpanded, setQueueExpanded] = useState(true);
-  const [dragSourceIndex, setDragSourceIndex] = useState<number | null>(null);
-  const [dragTargetIndex, setDragTargetIndex] = useState<number | null>(null);
   const [queueDragSource, setQueueDragSource] = useState<number | null>(null);
   const [queueDragTarget, setQueueDragTarget] = useState<number | null>(null);
+  const [copyToastVisible, setCopyToastVisible] = useState(false);
+  const copyToastTimerRef = useRef<number | null>(null);
   const [changesRefreshKey, setChangesRefreshKey] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -172,37 +196,13 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     setSelectedOptions([]);
     setCustomAnswer('');
     setQuestionAnswers({});
+    setQuestionFocusIndex(0);
   }, []);
 
   const refreshSession = useCallback(async () => {
     const s = await api.invoke('acp:getSession', chatId) as AcpChatSession | null;
     setSession(s);
   }, [chatId]);
-
-  const handleDragStart = useCallback((index: number) => {
-    setDragSourceIndex(index);
-  }, []);
-
-  const handleDragOver = useCallback((_e: React.DragEvent, index: number) => {
-    setDragTargetIndex(index);
-  }, []);
-
-  const handleDrop = useCallback((targetIndex: number) => {
-    setSession(prev => {
-      if (!prev || dragSourceIndex === null || dragSourceIndex === targetIndex) return prev;
-      const timeline = [...(prev.timeline && prev.timeline.length > 0 ? prev.timeline : fallbackTimelineFromMessages(prev.messages))];
-      const [moved] = timeline.splice(dragSourceIndex, 1);
-      timeline.splice(targetIndex, 0, moved);
-      return { ...prev, timeline };
-    });
-    setDragSourceIndex(null);
-    setDragTargetIndex(null);
-  }, [dragSourceIndex]);
-
-  const handleDragEnd = useCallback(() => {
-    setDragSourceIndex(null);
-    setDragTargetIndex(null);
-  }, []);
 
   const handleQueueDragStart = useCallback((index: number) => {
     setQueueDragSource(index);
@@ -250,17 +250,23 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         return;
       }
 
+      if (event.type === 'timelineItem' && event.item) {
+        setSession((prev) => {
+          if (!prev) return prev;
+          return withTimelineItem(prev, event.item!);
+        });
+        return;
+      }
+
       if (event.type === 'toolCall') {
         setSession((prev) => {
           if (!prev) return prev;
           return withTimelineTool(prev, event);
         });
-        setChangesRefreshKey((value) => value + 1);
+        if (isFileModifyingToolKind(event.kind)) {
+          setChangesRefreshKey((value) => value + 1);
+        }
         return;
-      }
-
-      if (event.type === 'toolCallUpdate') {
-        setChangesRefreshKey((value) => value + 1);
       }
 
       if (event.type === 'promptResponse' || event.type === 'cancelled' || event.type === 'permissionResponse' || event.type === 'questionResponse') {
@@ -282,6 +288,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         setSelectedOptions([]);
         setCustomAnswer('');
         setQuestionAnswers({});
+        setQuestionFocusIndex(0);
       }
       if (event.type === 'question') {
         const questions = event.questions && event.questions.length > 0
@@ -305,6 +312,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         setSelectedOptions([]);
         setCustomAnswer('');
         setQuestionAnswers({});
+        setQuestionFocusIndex(0);
       }
       if (event.type === 'promptResponse' || event.type === 'cancelled' || event.type === 'permissionResponse' || event.type === 'questionResponse') {
         clearPendingInteraction();
@@ -331,6 +339,8 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     setQueueExpanded(true);
   }, [chatId, clearPendingInteraction]);
 
+  useEffect(() => () => { if (copyToastTimerRef.current !== null) window.clearTimeout(copyToastTimerRef.current); }, []);
+
   // Update slash hints when input changes
   useEffect(() => {
     if (!input.startsWith('/')) {
@@ -354,6 +364,68 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   useEffect(() => {
     if (disabled) return;
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Question card keyboard navigation (arrow keys, Enter, Escape)
+      if (pendingQuestion) {
+        const active = document.activeElement;
+        const isTextInput = active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT' || (active as HTMLElement).isContentEditable);
+        if (!isTextInput || active === customInputRef.current) {
+          const options = pendingQuestion.options;
+          const questions = pendingQuestion.questions && pendingQuestion.questions.length > 0
+            ? pendingQuestion.questions
+            : [{ header: pendingQuestion.header, question: pendingQuestion.question, options: pendingQuestion.options }];
+          const isMultiQuestion = pendingQuestion.kind === 'question' && questions.length > 1;
+
+          if (isMultiQuestion) {
+            // Multi-question: each question's answer index
+            const totalQuestions = questions.length;
+            if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+              e.preventDefault();
+              setQuestionFocusIndex((prev) => Math.max(0, prev - 1));
+              return;
+            }
+            if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+              e.preventDefault();
+              setQuestionFocusIndex((prev) => Math.min(totalQuestions - 1, prev + 1));
+              return;
+            }
+            if (e.key === 'Enter' && !e.ctrlKey) {
+              e.preventDefault();
+              submitPendingInteraction();
+              return;
+            }
+          } else if (questions.length === 1 && questions[0].options.length > 0) {
+            // Single question with options
+            const opts = questions[0].options;
+            if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+              e.preventDefault();
+              setQuestionFocusIndex((prev) => Math.max(0, prev - 1));
+              return;
+            }
+            if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+              e.preventDefault();
+              setQuestionFocusIndex((prev) => Math.min(opts.length - 1, prev + 1));
+              return;
+            }
+            if (e.key === 'Enter' && !e.ctrlKey) {
+              e.preventDefault();
+              // Select the focused option
+              const opt = opts[questionFocusIndex];
+              if (opt) {
+                setQuestionAnswers((prev) => ({ ...prev, 0: opt.id }));
+                // For single-question single-choice, auto-submit
+                setTimeout(() => submitPendingInteraction(), 0);
+              }
+              return;
+            }
+          }
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            rejectPendingInteraction();
+            return;
+          }
+        }
+      }
+
       if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
         if (modeDropdownOpen) {
           setModeDropdownOpen(false);
@@ -387,7 +459,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [session?.status, disabled, modeDropdownOpen, slashCommandItemsState, slashCommandSelectedIndex]);
+  }, [session?.status, disabled, modeDropdownOpen, slashCommandItemsState, slashCommandSelectedIndex, pendingQuestion, questionFocusIndex, questionAnswers]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -549,6 +621,16 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const copyQueuedPrompt = useCallback(async (prompt: QueuedAcpPrompt) => {
     const text = prompt.finalPromptText.trim() || prompt.text.trim() || queuedPromptPreview(prompt);
     await api.invoke('clipboard:writeText', text);
+    setCopyToastVisible(true);
+    if (copyToastTimerRef.current !== null) window.clearTimeout(copyToastTimerRef.current);
+    copyToastTimerRef.current = window.setTimeout(() => { setCopyToastVisible(false); copyToastTimerRef.current = null; }, 1600);
+  }, []);
+
+  const copyTimelineMessage = useCallback(async (text: string) => {
+    await api.invoke('clipboard:writeText', text);
+    setCopyToastVisible(true);
+    if (copyToastTimerRef.current !== null) window.clearTimeout(copyToastTimerRef.current);
+    copyToastTimerRef.current = window.setTimeout(() => { setCopyToastVisible(false); copyToastTimerRef.current = null; }, 1600);
   }, []);
 
   const editQueuedPrompt = useCallback(async (index: number, prompt: QueuedAcpPrompt) => {
@@ -635,17 +717,10 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
             </div>
           </div>
         ) : (
-          <div onDragEnd={handleDragEnd}>
-            <AcpTimeline
-              items={timelineItems}
-              dragSourceIndex={dragSourceIndex}
-              dragTargetIndex={dragTargetIndex}
-              onDragStart={handleDragStart}
-              onDragOver={handleDragOver}
-              onDrop={handleDrop}
-              onDragEnd={handleDragEnd}
-            />
-          </div>
+          <AcpTimeline
+            items={timelineItems}
+            onCopyMessage={copyTimelineMessage}
+          />
         )}
         <div ref={messagesEndRef} />
       </div>
@@ -696,6 +771,12 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {copyToastVisible && (
+        <div style={{ position: 'fixed', bottom: 16, right: 16, background: '#1e1e1e', border: '1px solid #2a2a2a', borderRadius: 6, boxShadow: '0 8px 24px rgba(0,0,0,0.35)', color: '#f4f4f4', fontSize: 12, padding: '6px 10px', pointerEvents: 'none', whiteSpace: 'nowrap', zIndex: 9999 }}>
+          Copied to clipboard
         </div>
       )}
 
@@ -853,7 +934,15 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
                   e.preventDefault();
                   const selected = slashCommandItemsState[slashCommandSelectedIndex];
                   if (selected) {
-                    setInput(selected.hint + ' ');
+                    const selectedValue = selected.hint + ' ';
+                    if (input === selectedValue) {
+                      // Already selected — send instead of re-selecting
+                      setSlashCommandItemsState([]);
+                      setSlashCommandSelectedIndex(0);
+                      if (hasDraft) send();
+                      return;
+                    }
+                    setInput(selectedValue);
                     setSlashCommandItemsState([]);
                     setSlashCommandSelectedIndex(0);
                   }
@@ -874,11 +963,12 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               flex: 1,
               background: 'transparent',
               border: 'none',
-              color: '#ccc',
-              fontSize: 12,
-              fontWeight: 600,
+              color: '#d6d6d6',
+              fontFamily: 'inherit',
+              fontSize: 13,
+              fontWeight: 400,
               resize: 'none',
-              lineHeight: '20px',
+              lineHeight: 1.55,
               minHeight: 20,
               maxHeight: 100,
               outline: 'none',
@@ -935,60 +1025,100 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
             <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 4 }}>{pendingQuestion.header}</div>
             {pendingQuestion.kind === 'question' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {(pendingQuestion.questions && pendingQuestion.questions.length > 0 ? pendingQuestion.questions : [{ header: pendingQuestion.header, question: pendingQuestion.question, options: pendingQuestion.options }]).map((q, idx) => (
-                  <div key={idx} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    {idx > 0 && <div style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>{q.header}</div>}
-                    <div style={{ fontSize: 12, color: '#aaa' }}>{q.question}</div>
-                    {q.options.length > 0 ? (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                        {q.options.map((opt) => (
-                          <label key={`${idx}-${opt.label}`} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, fontSize: 12, color: '#ccc', cursor: 'pointer' }}>
-                            <input
-                              type="radio"
-                              name={`acp-question-${idx}`}
-                              checked={questionAnswers[idx] === opt.id}
-                              onChange={() => setQuestionAnswers((prev) => ({ ...prev, [idx]: opt.id }))}
-                              style={{ marginTop: 2 }}
-                            />
-                            <span>
-                              <span>{opt.label}</span>
-                              {opt.description && <span style={{ display: 'block', color: '#777', fontSize: 11 }}>{opt.description}</span>}
-                            </span>
-                          </label>
-                        ))}
-                      </div>
-                    ) : (
-                      <input
-                        value={questionAnswers[idx] || ''}
-                        onChange={(e) => setQuestionAnswers((prev) => ({ ...prev, [idx]: e.target.value }))}
-                        placeholder="Your answer..."
-                        style={{ width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', fontSize: 12, padding: '4px 8px', borderRadius: 4 }}
-                      />
-                    )}
-                  </div>
-                ))}
+                {(pendingQuestion.questions && pendingQuestion.questions.length > 0 ? pendingQuestion.questions : [{ header: pendingQuestion.header, question: pendingQuestion.question, options: pendingQuestion.options }]).map((q, qIdx) => {
+                  const isQuestionFocused = (pendingQuestion.questions && pendingQuestion.questions.length > 1) ? questionFocusIndex === qIdx : false;
+                  return (
+                    <div key={qIdx} style={{ display: 'flex', flexDirection: 'column', gap: 4, padding: '4px 6px', borderRadius: 4, background: isQuestionFocused ? 'rgba(0,120,212,0.15)' : 'transparent', border: isQuestionFocused ? '1px solid rgba(0,120,212,0.4)' : '1px solid transparent' }}>
+                      {qIdx > 0 && <div style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>{q.header}</div>}
+                      <div style={{ fontSize: 12, color: '#aaa' }}>{q.question}</div>
+                      {q.options.length > 0 ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                          {q.options.map((opt, optIdx) => {
+                            const isOptFocused = (pendingQuestion.questions && pendingQuestion.questions.length <= 1 || !pendingQuestion.questions || pendingQuestion.questions.length === 0) && questionFocusIndex === optIdx;
+                            return (
+                              <label
+                                key={`${qIdx}-${opt.label}`}
+                                onClick={() => setQuestionAnswers((prev) => ({ ...prev, [qIdx]: opt.id }))}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'flex-start',
+                                  gap: 6,
+                                  fontSize: 12,
+                                  color: '#ccc',
+                                  cursor: 'pointer',
+                                  padding: '3px 6px',
+                                  borderRadius: 4,
+                                  background: isOptFocused ? 'rgba(0,120,212,0.2)' : 'transparent',
+                                  border: isOptFocused ? '1px solid #0078d4' : '1px solid transparent',
+                                  transition: 'background 0.1s',
+                                }}
+                              >
+                                <input
+                                  type="radio"
+                                  name={`acp-question-${qIdx}`}
+                                  checked={questionAnswers[qIdx] === opt.id}
+                                  onChange={() => setQuestionAnswers((prev) => ({ ...prev, [qIdx]: opt.id }))}
+                                  style={{ marginTop: 2 }}
+                                />
+                                <span>
+                                  <span>{opt.label}</span>
+                                  {opt.description && <span style={{ display: 'block', color: '#777', fontSize: 11 }}>{opt.description}</span>}
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <input
+                          value={questionAnswers[qIdx] || ''}
+                          onChange={(e) => setQuestionAnswers((prev) => ({ ...prev, [qIdx]: e.target.value }))}
+                          placeholder="Your answer..."
+                          style={{ width: '100%', background: '#0c0c0c', border: '1px solid #333', color: '#ccc', fontSize: 12, padding: '4px 8px', borderRadius: 4 }}
+                        />
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <>
                 <div style={{ fontSize: 12, color: '#aaa', marginBottom: 8 }}>{pendingQuestion.question}</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                  {pendingQuestion.options.map((opt) => (
-                    <label key={opt.id} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#ccc', cursor: 'pointer' }}>
-                      <input
-                        type={pendingQuestion.multiple ? 'checkbox' : 'radio'}
-                        name="acp-permission"
-                        checked={selectedOptions.includes(opt.id)}
-                        onChange={() => {
-                          if (pendingQuestion.multiple) {
-                            setSelectedOptions((prev) => prev.includes(opt.id) ? prev.filter((x) => x !== opt.id) : [...prev, opt.id]);
-                          } else {
-                            setSelectedOptions([opt.id]);
-                          }
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  {pendingQuestion.options.map((opt, optIdx) => {
+                    const isFocused = questionFocusIndex === optIdx;
+                    return (
+                      <label
+                        key={opt.id}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          fontSize: 12,
+                          color: '#ccc',
+                          cursor: 'pointer',
+                          padding: '3px 6px',
+                          borderRadius: 4,
+                          background: isFocused ? 'rgba(0,120,212,0.2)' : 'transparent',
+                          border: isFocused ? '1px solid #0078d4' : '1px solid transparent',
+                          transition: 'background 0.1s',
                         }}
-                      />
-                      {opt.label}
-                    </label>
-                  ))}
+                      >
+                        <input
+                          type={pendingQuestion.multiple ? 'checkbox' : 'radio'}
+                          name="acp-permission"
+                          checked={selectedOptions.includes(opt.id)}
+                          onChange={() => {
+                            if (pendingQuestion.multiple) {
+                              setSelectedOptions((prev) => prev.includes(opt.id) ? prev.filter((x) => x !== opt.id) : [...prev, opt.id]);
+                            } else {
+                              setSelectedOptions([opt.id]);
+                            }
+                          }}
+                        />
+                        {opt.label}
+                      </label>
+                    );
+                  })}
                 </div>
                 {pendingQuestion.custom && (
                   <input
@@ -1015,6 +1145,9 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               >
                 Reject
               </button>
+            </div>
+            <div style={{ fontSize: 10, color: '#555', marginTop: 4 }}>
+              Arrow keys to navigate, Enter to select, Esc to reject
             </div>
           </div>
         )}
@@ -1049,12 +1182,15 @@ const QueuedPromptRow: React.FC<{
   onDrop?: (index: number) => void;
   onDragEnd?: () => void;
 }> = ({ index, prompt, onRunNext, onCopy, onEdit, onDelete, isDragTarget, onDragStart, onDragOver, onDrop, onDragEnd }) => {
+  const [hovered, setHovered] = useState(false);
   const modeLabel = acpModeUiLabel(prompt.modeId);
   const indexLabel = acpQueuedPromptIndexLabel(index);
   const attachmentLabel = acpQueuedPromptAttachmentLabel(prompt.attachments.length);
   const preview = queuedPromptPreview(prompt);
   return (
     <div
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       style={{ display: 'flex', alignItems: 'center', gap: 6, minHeight: 32, padding: '4px 8px', background: '#1a1a1a', borderRadius: 6, marginBottom: 3, fontSize: 12, color: '#888', borderTop: isDragTarget ? '2px solid #4a9eff' : '2px solid transparent', transition: 'border-color 0.15s' }}
       onDragOver={(e) => { e.preventDefault(); onDragOver?.(e, index); }}
       onDrop={() => onDrop?.(index)}
@@ -1087,21 +1223,21 @@ const QueuedPromptRow: React.FC<{
       <button
         onClick={() => onEdit(index, prompt)}
         title="Edit"
-        style={queuedPromptActionStyle}
+        style={{ ...queuedPromptActionStyle, opacity: hovered ? 1 : 0, pointerEvents: hovered ? 'auto' : 'none', transition: 'opacity 0.15s' }}
       >
         ✎
       </button>
       <button
         onClick={() => onDelete(index)}
         title="Delete"
-        style={queuedPromptActionStyle}
+        style={{ ...queuedPromptActionStyle, opacity: hovered ? 1 : 0, pointerEvents: hovered ? 'auto' : 'none', transition: 'opacity 0.15s' }}
       >
         ✕
       </button>
       <button
         onClick={() => onRunNext(index)}
         title="Send now"
-        style={{ ...queuedPromptActionStyle, color: '#ccc' }}
+        style={{ ...queuedPromptActionStyle, color: '#ccc', opacity: hovered ? 1 : 0, pointerEvents: hovered ? 'auto' : 'none', transition: 'opacity 0.15s' }}
       >
         ↑
       </button>

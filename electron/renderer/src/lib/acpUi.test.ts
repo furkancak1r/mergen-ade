@@ -248,8 +248,8 @@ describe('acpUi', () => {
   it('drops malformed slash commands instead of throwing', () => {
     expect(slashCommandHint({ id: undefined, name: undefined })).toBeUndefined();
     expect(slashCommandHint({ name: 'two words' })).toBeUndefined();
-    expect(slashCommandHints(undefined, '')).toEqual([]);
-    expect(slashCommandHints([null, {}, { id: 7 }, { name: 'run' }], '')).toEqual(['/run']);
+    expect(slashCommandHints(undefined, '').slice(0, 4)).toEqual(['/compact', '/cost', '/status', '/terminal-setup']);
+    expect(slashCommandHints([null, {}, { id: 7 }, { name: 'run' }], '', 1)).toEqual(['/run']);
   });
 
   it('filters slash command hints by id or name without requiring id', () => {
@@ -258,7 +258,7 @@ describe('acpUi', () => {
       { id: 'apply', name: 'Build Apply' },
       { id: 'review', name: 'Review' },
     ];
-    expect(slashCommandHints(commands, '')).toEqual(['/init', '/apply', '/review']);
+    expect(slashCommandHints(commands, '').slice(0, 3)).toEqual(['/init', '/apply', '/review']);
     expect(slashCommandHints(commands, 'bu')).toEqual(['/apply']);
     expect(slashCommandHints(commands, 're')).toEqual(['/review']);
   });
@@ -269,7 +269,7 @@ describe('acpUi', () => {
       { id: 'apply', name: 'Build Apply', description: 'Apply a plan' },
     ];
 
-    expect(slashCommandItems(commands, '')).toEqual([
+    expect(slashCommandItems(commands, '', 2)).toEqual([
       { hint: '/init', description: 'Create project memory' },
       { hint: '/apply', description: 'Apply a plan' },
     ]);
@@ -293,7 +293,7 @@ describe('acpUi', () => {
     const commands = [{ id: 'init', name: 'Initialize', description: 'Create project memory' }];
     expect(slashCommandItemsForInput(commands, '')).toEqual([]);
     expect(slashCommandItemsForInput(commands, 'init')).toEqual([]);
-    expect(slashCommandItemsForInput(commands, '/')).toEqual([
+    expect(slashCommandItemsForInput(commands, '/', 1)).toEqual([
       { hint: '/init', description: 'Create project memory' },
     ]);
   });
@@ -302,8 +302,17 @@ describe('acpUi', () => {
     const commands = [{ id: 'init', name: 'Initialize', description: 'Create project memory' }];
 
     expect(slashCommandItemsForComposer(commands, '/', false)).toEqual([]);
-    expect(slashCommandItemsForComposer(commands, '/', true)).toEqual([
+    expect(slashCommandItemsForComposer(commands, '/', true, 1)).toEqual([
       { hint: '/init', description: 'Create project memory' },
+    ]);
+  });
+
+  it('adds fallback ACP terminal/status commands and deduplicates server commands', () => {
+    expect(slashCommandHints([{ id: '/compact', name: 'Server compact' }], '')).toEqual([
+      '/compact',
+      '/cost',
+      '/status',
+      '/terminal-setup',
     ]);
   });
 });

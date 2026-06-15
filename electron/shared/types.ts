@@ -596,7 +596,7 @@ export interface AppConfig {
 export const defaultAppConfig = (): AppConfig => ({
   version: APP_CONFIG_VERSION,
   defaultShell: defaultShellForPlatform(),
-  claudeCodeCodexHookEnabled: true,
+  claudeCodeCodexHookEnabled: false,
   ui: defaultUiConfig(),
   launchers: defaultLaunchers(),
   terminalShortcuts: defaultTerminalShortcuts(),
@@ -847,7 +847,9 @@ export type AcpTimelineItem =
   | AcpTimelineToolItem
   | AcpTimelinePermissionItem
   | AcpTimelineNoticeItem
-  | AcpTimelineThinkingItem;
+  | AcpTimelineThinkingItem
+  | AcpTimelineChangeSummaryItem
+  | AcpTimelineStatusItem;
 
 export interface AcpTimelineMessageItem {
   id: string;
@@ -892,6 +894,38 @@ export interface AcpTimelineNoticeItem {
 export interface AcpTimelineThinkingItem {
   id: string;
   type: 'thinking';
+  text: string;
+  timestamp: number;
+}
+
+export interface AcpTimelineChangeSummaryFile {
+  path: string;
+  status: string;
+  staged: boolean;
+  addedLines: number;
+  removedLines: number;
+  binary: boolean;
+  error?: string;
+}
+
+export interface AcpTimelineChangeSummaryItem {
+  id: string;
+  type: 'change_summary';
+  files: AcpTimelineChangeSummaryFile[];
+  totalFiles: number;
+  addedLines: number;
+  removedLines: number;
+  signature: string;
+  timestamp: number;
+}
+
+export type AcpTimelineStatusKind = 'compact' | 'context' | 'status' | 'cost' | 'terminal' | 'info';
+
+export interface AcpTimelineStatusItem {
+  id: string;
+  type: 'status';
+  kind: AcpTimelineStatusKind;
+  title: string;
   text: string;
   timestamp: number;
 }

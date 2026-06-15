@@ -6,11 +6,11 @@ import { LeftSidebarTab as LeftSidebarTabEnum, defaultAppConfig, defaultAppHisto
 import { MainArea } from './components/MainArea';
 import { ProjectExplorer } from './components/ProjectExplorer';
 import { TerminalManager } from './components/TerminalManager';
-import { SourceControl } from './components/SourceControl';
 import { FileEditor } from './components/FileEditor';
 import { AcpChatPanel } from './components/AcpChatPanel';
 import { AcpErrorBoundary } from './components/AcpErrorBoundary';
-import { BrowserPanel } from './components/BrowserPanel';
+import { RightPanel } from './components/RightPanel';
+import type { RightPanelTab } from './components/RightPanel';
 import { SettingsPopup } from './components/SettingsPopup';
 import { InputHistory } from './components/InputHistory';
 import { GlobalTooltip } from './components/Tooltip';
@@ -82,10 +82,12 @@ function App() {
   const [acpQueuedPrompts, setAcpQueuedPrompts] = useState(false);
   const [acpDraftByChatId, setAcpDraftByChatId] = useState<Map<string, string>>(new Map());
 
+  const [rightPanelOpen, setRightPanelOpen] = useState(false);
+  const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('sourceControl');
   const [browserOpenProjects, setBrowserOpenProjects] = useState<Set<number>>(new Set());
-  const [browserPanelWidth, setBrowserPanelWidth] = useState(520);
-  const [isResizingBrowser, setIsResizingBrowser] = useState(false);
-  const browserResizeStartRef = useRef<{ pointerX: number; width: number } | null>(null);
+  const [rightPanelWidth, setRightPanelWidth] = useState(520);
+  const [isResizingRightPanel, setIsResizingRightPanel] = useState(false);
+  const rightPanelResizeStartRef = useRef<{ pointerX: number; width: number } | null>(null);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [terminalManagerOverlayOpen, setTerminalManagerOverlayOpen] = useState(false);
@@ -112,7 +114,7 @@ function App() {
       setConfig(loaded);
       setActiveTab(loaded.ui.leftSidebarTab);
       setSidebarWidth(loaded.ui.projectExplorerWidth);
-      setBrowserPanelWidth(loaded.ui.browserPanelWidth);
+      setRightPanelWidth(loaded.ui.browserPanelWidth);
       if (loaded.projects.length > 0) {
         const lastId = loaded.ui.lastSelectedProjectId;
         const match = lastId ? loaded.projects.find((p) => p.id === lastId) : undefined;
@@ -156,9 +158,9 @@ function App() {
   }, [sidebarWidth]);
 
   useEffect(() => {
-    if (!config || config.ui.browserPanelWidth === browserPanelWidth) return;
-    setConfig((prev) => prev ? { ...prev, ui: { ...prev.ui, browserPanelWidth } } : prev);
-  }, [browserPanelWidth]);
+    if (!config || config.ui.browserPanelWidth === rightPanelWidth) return;
+    setConfig((prev) => prev ? { ...prev, ui: { ...prev.ui, browserPanelWidth: rightPanelWidth } } : prev);
+  }, [rightPanelWidth]);
 
   useEffect(() => {
     if (!config || config.ui.lastSelectedProjectId === selectedProjectId) return;
@@ -664,13 +666,13 @@ function App() {
   }, [isResizing]);
 
   useEffect(() => {
-    if (!isResizingBrowser) return;
+    if (!isResizingRightPanel) return;
     document.body.classList.add('is-column-resizing');
     function handleMove(e: PointerEvent) {
       e.preventDefault();
-      const start = browserResizeStartRef.current;
+      const start = rightPanelResizeStartRef.current;
       if (!start) return;
-      setBrowserPanelWidth(panelWidthFromPointerDrag({
+      setRightPanelWidth(panelWidthFromPointerDrag({
         pointerX: e.clientX,
         startPointerX: start.pointerX,
         startWidth: start.width,
@@ -681,8 +683,8 @@ function App() {
     }
     function handleUp(e: PointerEvent) {
       e.preventDefault();
-      browserResizeStartRef.current = null;
-      setIsResizingBrowser(false);
+      rightPanelResizeStartRef.current = null;
+      setIsResizingRightPanel(false);
     }
     window.addEventListener('pointermove', handleMove);
     window.addEventListener('pointerup', handleUp);
@@ -693,7 +695,7 @@ function App() {
       window.removeEventListener('pointerup', handleUp);
       window.removeEventListener('pointercancel', handleUp);
     };
-  }, [isResizingBrowser]);
+  }, [isResizingRightPanel]);
 
   const selectedProject = config?.projects.find((p) => p.id === selectedProjectId) ?? null;
   const activeTerminalForSettings = terminals.find((t) => t.id === activeTerminalId);
@@ -960,26 +962,57 @@ function App() {
     api.invoke('acp:standby:clear', projectId);
   }, [activeAcpChat, activeAcpChatByProject]);
 
+  const toggleRightPanel = useCallback((tab?: RightPanelTab) => {
+    if (!selectedProjectId) return;
+    if (rightPanelOpen && !tab) {
+      // Close the panel
+      setRightPanelOpen(false);
+      return;
+    }
+    // Open the panel with specified tab or default to sourceControl
+    const targetTab = tab ?? 'sourceControl';
+    setRightPanelTab(targetTab);
+    setRightPanelOpen(true);
+    // If switching to browser, also register the project in browserOpenProjects
+    if (targetTab === 'browser') {
+      const hasForegroundTerminal = terminals.some((t) => t.projectId === selectedProjectId && t.kind === 'foreground' && !t.exited);
+      const prefix = `${selectedProjectId}:`;
+      const hasAcpChat = Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix));
+      if (hasForegroundTerminal || hasAcpChat) {
+        setBrowserOpenProjects((prev) => {
+          const next = new Set(prev);
+          next.add(selectedProjectId);
+          return next;
+        });
+      }
+    }
+  }, [selectedProjectId, rightPanelOpen, terminals, activeAcpChatByProject]);
+
   const toggleBrowser = useCallback(() => {
     if (!selectedProjectId) return;
-    // Only allow opening if project has a foreground terminal or ACP chat
     const isCurrentlyOpen = browserOpenProjects.has(selectedProjectId);
     if (!isCurrentlyOpen) {
       const hasForegroundTerminal = terminals.some((t) => t.projectId === selectedProjectId && t.kind === 'foreground' && !t.exited);
       const prefix = `${selectedProjectId}:`;
       const hasAcpChat = Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix));
       if (!hasForegroundTerminal && !hasAcpChat) return;
-    }
-    setBrowserOpenProjects((prev) => {
-      const next = new Set(prev);
-      if (next.has(selectedProjectId)) {
-        next.delete(selectedProjectId);
-      } else {
+      setBrowserOpenProjects((prev) => {
+        const next = new Set(prev);
         next.add(selectedProjectId);
+        return next;
+      });
+      setRightPanelTab('browser');
+      setRightPanelOpen(true);
+    } else {
+      // Switch to browser tab if panel is open, otherwise open it
+      if (rightPanelOpen && rightPanelTab === 'browser') {
+        setRightPanelOpen(false);
+      } else {
+        setRightPanelTab('browser');
+        setRightPanelOpen(true);
       }
-      return next;
-    });
-  }, [selectedProjectId, browserOpenProjects, terminals, activeAcpChatByProject]);
+    }
+  }, [selectedProjectId, browserOpenProjects, terminals, activeAcpChatByProject, rightPanelOpen, rightPanelTab]);
 
   // Auto-close browser when project loses all foreground terminals and ACP chats
   useEffect(() => {
@@ -1299,15 +1332,6 @@ function App() {
           <span className="rail-icon terminal">{activityRailItem('terminalManager').icon}</span>
         </button>
         <button
-          className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.SourceControl) ? 'active' : ''}`}
-          onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.SourceControl)}
-          data-tooltip={activityRailItem('sourceControl').title}
-          data-tooltip-right=""
-          aria-label={activityRailItem('sourceControl').title}
-        >
-          <span className="rail-icon">{activityRailItem('sourceControl').icon}</span>
-        </button>
-        <button
           className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.InputHistory) ? 'active' : ''}`}
           onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.InputHistory)}
           data-tooltip={activityRailItem('inputHistory').title}
@@ -1318,13 +1342,13 @@ function App() {
         </button>
         <div style={{ flex: 1 }} />
         <button
-          className={`rail-btn ${isBrowserOpen ? 'active' : ''}`}
-          onClick={toggleBrowser}
-          data-tooltip={activityRailItem('browser').title}
+          className={`rail-btn ${rightPanelOpen ? 'active' : ''}`}
+          onClick={() => toggleRightPanel()}
+          data-tooltip={activityRailItem('tools').title}
           data-tooltip-right=""
-          aria-label={activityRailItem('browser').title}
+          aria-label={activityRailItem('tools').title}
         >
-          <span className="rail-icon">{activityRailItem('browser').icon}</span>
+          <span className="rail-icon">{activityRailItem('tools').icon}</span>
         </button>
         <button
           className={`rail-btn ${settingsOpen ? 'active' : ''}`}
@@ -1404,70 +1428,6 @@ function App() {
             }}
           />
         )}
-        {activeTab === LeftSidebarTabEnum.SourceControl && selectedProject && config && (
-          <SourceControl
-            project={selectedProject}
-            projects={config.projects}
-            selectedProjectId={selectedProjectId}
-            onSelectProject={setSelectedProjectId}
-            registeredWorktreePaths={config.projects
-              .filter((p) => p.isWorktree && p.repoRoot === selectedProject.path)
-              .map((p) => p.path)}
-            onOrphanWorktrees={(orphanPaths) => {
-              const removedProjects = removeProjectsByPath(orphanPaths);
-              if (removedProjects.length === 0) return;
-              // Kill any terminals running in orphan worktrees
-              for (const path of orphanPaths) {
-                const normalizedPath = path.replace(/\\/g, '/');
-                const orphanTerminals = terminals.filter((t) => {
-                  const normalizedCwd = t.cwd.replace(/\\/g, '/');
-                  return normalizedCwd === normalizedPath || normalizedCwd.startsWith(normalizedPath + '/');
-                });
-                for (const t of orphanTerminals) {
-                  killTerminal(t.id);
-                }
-              }
-            }}
-            onRemoveWorktree={(worktree) => {
-              removeProjectsByPath([worktree.path]);
-            }}
-            onAddWorktree={(worktree) => {
-              if (!config) return;
-              const newProject: ProjectRecord = {
-                id: Date.now() + Math.floor(Math.random() * 1000),
-                name: worktree.branch || 'worktree',
-                path: worktree.path,
-                savedMessages: config.projects.find((p) => p.path === selectedProject?.repoRoot || p.path === selectedProject?.path)?.savedMessages || [],
-                aiConfig: {},
-                checklist: [],
-                isWorktree: true,
-                repoRoot: selectedProject?.repoRoot || selectedProject?.path,
-              };
-              const newConfig = { ...config, projects: [...config.projects, newProject] };
-              setConfig(newConfig);
-              setSelectedProjectId(newProject.id);
-            }}
-            onDeleteGitWorktree={async (worktree) => {
-              if (!config) return;
-              await api.invoke('git:removeWorktree', selectedProject.path, worktree.path);
-              removeProjectsByPath([worktree.path]);
-            }}
-            hasLiveTerminals={(path) => {
-              const normalizedPath = path.replace(/\\/g, '/');
-              return terminals.some((t) => {
-                const normalizedCwd = t.cwd.replace(/\\/g, '/');
-                return normalizedCwd === normalizedPath || normalizedCwd.startsWith(normalizedPath + '/');
-              });
-            }}
-            onBranchChange={(branch) => {
-              setBranchNameByProject((prev) => {
-                const next = new Map(prev);
-                next.set(selectedProject.id, branch);
-                return next;
-              });
-            }}
-          />
-        )}
         {activeTab === LeftSidebarTabEnum.InputHistory && config && (
           <InputHistory
             config={config}
@@ -1543,29 +1503,104 @@ function App() {
         )}
       </div>
 
-      {isBrowserOpen && selectedProject && (
+      {rightPanelOpen && selectedProject && config && (
         <>
           <div
             className="resize-handle"
             onPointerDown={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              browserResizeStartRef.current = { pointerX: event.clientX, width: browserPanelWidth };
+              rightPanelResizeStartRef.current = { pointerX: event.clientX, width: rightPanelWidth };
               event.currentTarget.setPointerCapture?.(event.pointerId);
-              setIsResizingBrowser(true);
+              setIsResizingRightPanel(true);
             }}
             style={{
               width: 4,
               cursor: 'col-resize',
-              background: isResizingBrowser ? '#0078d4' : undefined,
+              background: isResizingRightPanel ? '#0078d4' : undefined,
             }}
           />
-          <div style={{ width: browserPanelWidth, minWidth: 240, maxWidth: 800, display: 'flex', flexDirection: 'column', overflow: 'hidden', borderLeft: '1px solid #222' }}>
-            <BrowserPanel
+          <div style={{ width: rightPanelWidth, minWidth: 240, maxWidth: 800, display: 'flex', flexDirection: 'column', overflow: 'hidden', borderLeft: '1px solid #222' }}>
+            <RightPanel
+              activeTab={rightPanelTab}
+              onTabChange={(tab) => {
+                setRightPanelTab(tab);
+                if (tab === 'browser' && selectedProjectId) {
+                  const hasForegroundTerminal = terminals.some((t) => t.projectId === selectedProjectId && t.kind === 'foreground' && !t.exited);
+                  const prefix = `${selectedProjectId}:`;
+                  const hasAcpChat = Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix));
+                  if (hasForegroundTerminal || hasAcpChat) {
+                    setBrowserOpenProjects((prev) => {
+                      const next = new Set(prev);
+                      next.add(selectedProjectId);
+                      return next;
+                    });
+                  }
+                }
+              }}
+              onClose={() => setRightPanelOpen(false)}
               project={selectedProject}
+              projects={config.projects}
+              selectedProjectId={selectedProjectId}
+              onSelectProject={setSelectedProjectId}
+              registeredWorktreePaths={config.projects
+                .filter((p) => p.isWorktree && p.repoRoot === selectedProject.path)
+                .map((p) => p.path)}
+              onOrphanWorktrees={(orphanPaths) => {
+                const removedProjects = removeProjectsByPath(orphanPaths);
+                if (removedProjects.length === 0) return;
+                for (const path of orphanPaths) {
+                  const normalizedPath = path.replace(/\\/g, '/');
+                  const orphanTerminals = terminals.filter((t) => {
+                    const normalizedCwd = t.cwd.replace(/\\/g, '/');
+                    return normalizedCwd === normalizedPath || normalizedCwd.startsWith(normalizedPath + '/');
+                  });
+                  for (const t of orphanTerminals) {
+                    killTerminal(t.id);
+                  }
+                }
+              }}
+              onRemoveWorktree={(worktree) => {
+                removeProjectsByPath([worktree.path]);
+              }}
+              onAddWorktree={(worktree) => {
+                if (!config) return;
+                const newProject: ProjectRecord = {
+                  id: Date.now() + Math.floor(Math.random() * 1000),
+                  name: worktree.branch || 'worktree',
+                  path: worktree.path,
+                  savedMessages: config.projects.find((p) => p.path === selectedProject?.repoRoot || p.path === selectedProject?.path)?.savedMessages || [],
+                  aiConfig: {},
+                  checklist: [],
+                  isWorktree: true,
+                  repoRoot: selectedProject?.repoRoot || selectedProject?.path,
+                };
+                const newConfig = { ...config, projects: [...config.projects, newProject] };
+                setConfig(newConfig);
+                setSelectedProjectId(newProject.id);
+              }}
+              onDeleteGitWorktree={async (worktree) => {
+                if (!config) return;
+                await api.invoke('git:removeWorktree', selectedProject.path, worktree.path);
+                removeProjectsByPath([worktree.path]);
+              }}
+              hasLiveTerminals={(path) => {
+                const normalizedPath = path.replace(/\\/g, '/');
+                return terminals.some((t) => {
+                  const normalizedCwd = t.cwd.replace(/\\/g, '/');
+                  return normalizedCwd === normalizedPath || normalizedCwd.startsWith(normalizedPath + '/');
+                });
+              }}
+              onBranchChange={(branch) => {
+                setBranchNameByProject((prev) => {
+                  const next = new Map(prev);
+                  next.set(selectedProject.id, branch);
+                  return next;
+                });
+              }}
+              browserVisible={isBrowserOpen}
               activeTerminalId={activeTerminalId}
-              visibleScopeOverride={browserPanelVisibleScopeByProject.get(selectedProjectId) ?? undefined}
-              onClose={toggleBrowser}
+              visibleScopeOverride={selectedProjectId != null ? browserPanelVisibleScopeByProject.get(selectedProjectId) ?? undefined : undefined}
               tabsByScope={browserTabsByScope}
               activeTabByScope={browserActiveTabByScope}
               urlDraftByScope={browserUrlDraftByScope}
@@ -1574,22 +1609,22 @@ function App() {
               onActiveTabChange={setBrowserActiveTabByScope}
               onUrlDraftChange={setBrowserUrlDraftByScope}
               onDesignInspectChange={setBrowserDesignInspectByScope}
-              onClearProjectBrowserLastUrl={clearProjectBrowserLastUrl}
-              hidden={settingsOpen}
               onScopeEmpty={(scope) => {
                 setBrowserOpenProjects((prev) => browserProjectIdsAfterScopeEmpty(prev, scope));
-                if (scope.type === BrowserScopeKeyType.Terminal) {
+                if (scope.type === BrowserScopeKeyType.Terminal && selectedProjectId != null) {
                   setBrowserPanelVisibleScopeByProject((prev) => {
-                    const override = prev.get(selectedProjectId);
+                    const override = prev.get(selectedProjectId!);
                     if (override && override.type === BrowserScopeKeyType.Terminal && override.terminalId === scope.terminalId) {
                       const copy = new Map(prev);
-                      copy.delete(selectedProjectId);
+                      copy.delete(selectedProjectId!);
                       return copy;
                     }
                     return prev;
                   });
                 }
               }}
+              onClearProjectBrowserLastUrl={clearProjectBrowserLastUrl}
+              settingsOpen={settingsOpen}
             />
           </div>
         </>

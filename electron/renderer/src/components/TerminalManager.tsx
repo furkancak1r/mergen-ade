@@ -1,8 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import type { AcpChatSession, AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry, AiCliTool } from '../../../shared/types';
 import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalManagerFilterEnum, BuiltinLauncherKind, AiCliTool as AiCliToolEnum, activeBuildModel } from '../../../shared/types';
-import type { GitDiffSummary } from '../../../shared/gitDiffSummary';
-import { gitDiffSummaryLabel } from '../../../shared/gitDiffSummary';
 import type { TerminalInstance } from '../hooks/usePty';
 import {
   OPENCODE_ACP_OPEN_BUTTON_LABEL,
@@ -14,7 +12,7 @@ import {
 } from '../lib/acpUi';
 import { effectiveLauncherCommand } from '../lib/launcher';
 import { effectiveAiStatusForDisplay } from '../lib/smartInput';
-import { shouldShowOpenCodeAcpButton, terminalManagerPathMenuLabel } from '../lib/terminalManagerState';
+import { shouldShowForegroundLauncherButton, shouldShowOpenCodeAcpButton, terminalManagerPathMenuLabel } from '../lib/terminalManagerState';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
 
@@ -51,7 +49,6 @@ const TERMINAL_HISTORY_MESSAGE_MAX_HEIGHT = 120;
 const TERMINAL_HISTORY_POPUP_MAX_VISIBLE_ENTRIES = 5;
 const TERMINAL_HISTORY_POPUP_CHROME_HEIGHT_ESTIMATE = 56;
 const TERMINAL_HISTORY_POPUP_ROW_GAP = 4;
-const TERMINAL_MANAGER_DIFF_REFRESH_INTERVAL_MS = 30_000;
 const TERMINAL_AI_BADGE_RUNNING_BORDER = 'rgba(100, 200, 100, 0.25)';
 const TERMINAL_AI_BADGE_RUNNING = '#64c864';
 const TERMINAL_AI_BADGE_ATTENTION = '#e8a838';
@@ -139,8 +136,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   const [expandedProjects, setExpandedProjects] = useState<Set<number>>(initialExpanded);
   const [showSavedMessages, setShowSavedMessages] = useState<number | null>(null);
   const [showLauncherMenu, setShowLauncherMenu] = useState<number | null>(null);
-  const [diffSummaries, setDiffSummaries] = useState<Map<number, GitDiffSummary>>(new Map());
-  const [diffSummaryLoading, setDiffSummaryLoading] = useState<Set<number>>(new Set());
   const [historyPopupTerminalId, setHistoryPopupTerminalId] = useState<number | null>(null);
   const [historyPopupJustOpened, setHistoryPopupJustOpened] = useState(false);
   const [pathContextMenu, setPathContextMenu] = useState<TerminalManagerPathContextMenu | null>(null);
@@ -157,63 +152,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
     onOverlayOpenChange?.(overlayOpen);
     return () => onOverlayOpenChange?.(false);
   }, [overlayOpen, onOverlayOpenChange]);
-
-  const projectDiffKey = config.projects.map((p) => `${p.id}:${p.path}`).join('\0');
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const refreshDiffSummaries = (showLoading: boolean) => {
-      const projects = config.projects;
-      if (showLoading) {
-        setDiffSummaryLoading(new Set(projects.map((p) => p.id)));
-      }
-      setDiffSummaries((prev) => {
-        const next = new Map<number, GitDiffSummary>();
-        for (const project of projects) {
-          const existing = prev.get(project.id);
-          if (existing) next.set(project.id, existing);
-        }
-        return next;
-      });
-
-      for (const project of projects) {
-        api.invoke('git:diffSummary', project.path)
-          .then((value) => {
-            if (cancelled) return;
-            setDiffSummaries((prev) => new Map(prev).set(project.id, value as GitDiffSummary));
-          })
-          .catch((error) => {
-            if (cancelled) return;
-            setDiffSummaries((prev) => new Map(prev).set(project.id, {
-              status: 'error',
-              addedLines: 0,
-              removedLines: 0,
-              error: error instanceof Error ? error.message : String(error),
-            }));
-          })
-          .finally(() => {
-            if (cancelled || !showLoading) return;
-            setDiffSummaryLoading((prev) => {
-              const next = new Set(prev);
-              next.delete(project.id);
-              return next;
-            });
-          });
-      }
-    };
-
-    refreshDiffSummaries(true);
-    const interval = window.setInterval(
-      () => refreshDiffSummaries(false),
-      TERMINAL_MANAGER_DIFF_REFRESH_INTERVAL_MS,
-    );
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [projectDiffKey]);
 
   const toggleProject = useCallback((projectId: number) => {
     setExpandedProjects((prev) => {
@@ -430,8 +368,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
               <ProjectGroup
                 project={project}
                 terminals={getProjectTerminals(project.id)}
-                diffSummary={diffSummaries.get(project.id)}
-                diffSummaryLoading={diffSummaryLoading.has(project.id)}
                 filter={filter}
                 expanded={expanded}
                 onToggle={() => toggleProject(project.id)}
@@ -472,8 +408,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                   <ProjectGroup
                     project={worktree}
                     terminals={getProjectTerminals(worktree.id)}
-                    diffSummary={diffSummaries.get(worktree.id)}
-                    diffSummaryLoading={diffSummaryLoading.has(worktree.id)}
                     filter={filter}
                     expanded={expandedProjects.has(worktree.id)}
                     onToggle={() => toggleProject(worktree.id)}
@@ -563,8 +497,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
 interface ProjectGroupProps {
   project: ProjectRecord;
   terminals: TerminalInstance[];
-  diffSummary?: GitDiffSummary;
-  diffSummaryLoading: boolean;
   filter: TerminalManagerFilter;
   expanded: boolean;
   onToggle: () => void;
@@ -601,8 +533,6 @@ interface ProjectGroupProps {
 const ProjectGroup: React.FC<ProjectGroupProps> = ({
   project,
   terminals,
-  diffSummary,
-  diffSummaryLoading,
   filter,
   expanded,
   onToggle,
@@ -653,17 +583,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   const activeAcpRow = activeAcpProjectId === project.id;
   const activeAcpRowChrome = terminalManagerRowChrome(activeAcpRow, hoveredAcpRow);
   const showOpenCodeAcpButton = shouldShowOpenCodeAcpButton(filter, hasActiveAcpChat);
-  const diffLabel = gitDiffSummaryLabel(diffSummary, diffSummaryLoading);
-  const showReadyDiff = Boolean(
-    diffSummary
-      && diffSummary.status === 'ready'
-      && !diffSummaryLoading
-      && (diffSummary.addedLines > 0 || diffSummary.removedLines > 0),
-  );
-  const diffTooltip = diffSummary?.status === 'error'
-    ? diffSummary.error || 'Git diff summary unavailable'
-    : 'Changed lines in this worktree';
-
   // Project header text color: bright only when has live terminal
   const headerTextColor = hasLiveTerminal ? TEXT_PRIMARY : withAlpha(TEXT_MUTED, 180);
 
@@ -713,39 +632,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
         }}>
           {project.name}
         </span>
-        {filter === TerminalManagerFilterEnum.Foreground && hoveredProject && showReadyDiff ? (
-          <span
-            data-tooltip={diffTooltip}
-            style={{
-              display: 'inline-flex',
-              gap: 4,
-              alignItems: 'center',
-              fontSize: 10,
-              fontWeight: 600,
-              zIndex: 1,
-              marginLeft: 6,
-              flexShrink: 0,
-              fontVariantNumeric: 'tabular-nums',
-            }}
-          >
-            <span style={{ color: '#64c38c' }}>+{diffSummary!.addedLines}</span>
-            <span style={{ color: '#d47a7a' }}>-{diffSummary!.removedLines}</span>
-          </span>
-        ) : filter === TerminalManagerFilterEnum.Foreground && hoveredProject && diffLabel ? (
-          <span
-            data-tooltip={diffTooltip}
-            style={{
-              fontSize: 10,
-              color: withAlpha(TEXT_MUTED, 150),
-              zIndex: 1,
-              marginLeft: 6,
-              flexShrink: 0,
-              fontVariantNumeric: 'tabular-nums',
-            }}
-          >
-            {diffLabel}
-          </span>
-        ) : null}
         {isWorktree && (
           <span style={{ fontSize: 10, color: withAlpha(ACCENT, 200), zIndex: 1, marginLeft: 4 }}>🌿</span>
         )}
@@ -753,7 +639,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
         {/* Action buttons on hover for project header */}
         {hoveredProject && (
           <div style={{ display: 'flex', gap: 2, zIndex: 1, marginLeft: 'auto', flexShrink: 0 }}>
-            {filter === TerminalManagerFilterEnum.Foreground && !isWorktree && (
+            {shouldShowForegroundLauncherButton(filter) && (
               <>
                 <IconButton
                   icon="▶"

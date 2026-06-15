@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   acpTimelineNoticeTitle,
+  acpTimelineStatusTitle,
+  acpTimelineTodoEntries,
   acpTimelineToolDisplayTitle,
   acpTimelineToolKindLabel,
   fallbackTimelineFromMessages,
@@ -41,5 +43,32 @@ describe('acpTimeline', () => {
     expect(acpTimelineNoticeTitle('warning')).toBe('Warning');
     expect(acpTimelineNoticeTitle('error')).toBe('Error');
     expect(acpTimelineNoticeTitle('cancelled')).toBe('Cancelled');
+  });
+
+  it('extracts todo entries from Claude TodoWrite payloads', () => {
+    expect(acpTimelineTodoEntries({
+      type: 'tool_use',
+      name: 'TodoWrite',
+      input: {
+        todos: [
+          { content: 'Inspect ACP UI', status: 'completed', priority: 'high' },
+          { content: 'Add copy button', status: 'in_progress' },
+        ],
+      },
+    })).toEqual([
+      { text: 'Inspect ACP UI', status: 'completed', priority: 'high' },
+      { text: 'Add copy button', status: 'in_progress', priority: undefined },
+    ]);
+  });
+
+  it('extracts todo entries from string payloads', () => {
+    expect(acpTimelineTodoEntries('Review final diff')).toEqual([{ text: 'Review final diff' }]);
+    expect(acpTimelineTodoEntries('{"todos":["One","Two"]}')).toEqual([{ text: 'One' }, { text: 'Two' }]);
+  });
+
+  it('labels status cards without inventing context metrics', () => {
+    expect(acpTimelineStatusTitle('compact')).toBe('Context Compacting');
+    expect(acpTimelineStatusTitle('context')).toBe('Context');
+    expect(acpTimelineStatusTitle('terminal')).toBe('Terminal');
   });
 });

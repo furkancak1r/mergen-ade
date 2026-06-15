@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  acpChangeSummarySignature,
+  acpChangeSummaryTotals,
   acpChangeStatusAbbreviation,
   acpDiffLineClass,
   acpDiffTotals,
+  buildAcpChangeSummaryFiles,
   groupAcpChanges,
   nextSelectedChangePath,
 } from './acpChanges';
@@ -46,5 +49,27 @@ describe('acpChanges helpers', () => {
     expect(acpChangeStatusAbbreviation('Modified')).toBe('M');
     expect(acpChangeStatusAbbreviation('Untracked')).toBe('U');
     expect(acpChangeStatusAbbreviation('Conflicted')).toBe('!');
+  });
+
+  it('builds change summary files from git diffs', () => {
+    const diffs = new Map([
+      ['src/app.ts', { status: 'ready' as const, filePath: 'src/app.ts', patch: '', addedLines: 4, removedLines: 2, binary: false }],
+      ['assets/logo.png', { status: 'ready' as const, filePath: 'assets/logo.png', patch: '', addedLines: 0, removedLines: 0, binary: true }],
+      ['bad.ts', { status: 'error' as const, filePath: 'bad.ts', patch: '', addedLines: 0, removedLines: 0, binary: false, error: 'diff failed' }],
+    ]);
+
+    const summary = buildAcpChangeSummaryFiles([
+      { path: 'src/app.ts', status: 'Modified', staged: false },
+      { path: 'assets/logo.png', status: 'Added', staged: true },
+      { path: 'bad.ts', status: 'Modified', staged: false },
+    ], diffs);
+
+    expect(summary).toEqual([
+      { path: 'src/app.ts', status: 'Modified', staged: false, addedLines: 4, removedLines: 2, binary: false, error: undefined },
+      { path: 'assets/logo.png', status: 'Added', staged: true, addedLines: 0, removedLines: 0, binary: true, error: undefined },
+      { path: 'bad.ts', status: 'Modified', staged: false, addedLines: 0, removedLines: 0, binary: false, error: 'diff failed' },
+    ]);
+    expect(acpChangeSummaryTotals(summary)).toEqual({ addedLines: 4, removedLines: 2 });
+    expect(acpChangeSummarySignature(summary)).toContain('src/app.ts:Modified:unstaged:4:2:text:');
   });
 });

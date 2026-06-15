@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { defaultAppConfig, LeftSidebarTab, TerminalManagerFilter } from '../../../shared/types';
 import {
   normalizeTerminalManagerStartupState,
+  shouldShowForegroundLauncherButton,
   shouldShowOpenCodeAcpButton,
   terminalManagerPathMenuLabel,
   withTerminalManagerFilter,
@@ -82,5 +83,10 @@ describe('terminalManagerState', () => {
     expect(shouldShowOpenCodeAcpButton(TerminalManagerFilter.Foreground, false)).toBe(true);
     expect(shouldShowOpenCodeAcpButton(TerminalManagerFilter.Foreground, true)).toBe(false);
     expect(shouldShowOpenCodeAcpButton(TerminalManagerFilter.Background, false)).toBe(false);
+  });
+
+  it('shows the foreground launcher for any project row in Foreground filter', () => {
+    expect(shouldShowForegroundLauncherButton(TerminalManagerFilter.Foreground)).toBe(true);
+    expect(shouldShowForegroundLauncherButton(TerminalManagerFilter.Background)).toBe(false);
   });
 });

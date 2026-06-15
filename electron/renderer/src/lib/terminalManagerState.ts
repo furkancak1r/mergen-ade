@@ -19,6 +19,12 @@ export function shouldShowOpenCodeAcpButton(
   return terminalManagerFilter === TerminalManagerFilterEnum.Foreground && !hasActiveAcpChat;
 }
 
+export function shouldShowForegroundLauncherButton(
+  terminalManagerFilter: TerminalManagerFilter,
+): boolean {
+  return terminalManagerFilter === TerminalManagerFilterEnum.Foreground;
+}
+
 export function withTerminalManagerFilter(
   config: AppConfig,
   terminalManagerFilter: TerminalManagerFilter,

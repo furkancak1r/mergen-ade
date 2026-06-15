@@ -26,6 +26,7 @@ export const AcpChangesPanel: React.FC<AcpChangesPanelProps> = ({ repoPath, refr
   const [diff, setDiff] = useState<GitFileDiff | undefined>();
   const [loading, setLoading] = useState(false);
   const [diffLoading, setDiffLoading] = useState(false);
+  const [collapsed, setCollapsed] = useState(true);
   const statusRequestIdRef = useRef(0);
 
   const refreshStatus = useCallback(async () => {
@@ -103,60 +104,69 @@ export const AcpChangesPanel: React.FC<AcpChangesPanelProps> = ({ repoPath, refr
   const selectedFile = files.find((file) => file.path === selectedPath);
 
   return (
-    <aside className="acp-changes-panel">
-      <div className="acp-changes-header">
+    <aside className={`acp-changes-panel ${collapsed ? 'is-collapsed' : ''}`}>
+      <div className="acp-changes-header" onClick={() => setCollapsed((v) => !v)} style={{ cursor: 'pointer' }}>
         <div className="acp-changes-heading">
           <div className="acp-changes-title-row">
             <span className="acp-changes-icon" aria-hidden="true">⑂</span>
             <span className="acp-changes-title">Source Control</span>
             <span className="acp-changes-count">{files.length}</span>
+            <span className="acp-changes-chevron">{collapsed ? '◂' : '▸'}</span>
           </div>
-          <div className="acp-changes-branch" data-tooltip={repoPath}>
-            <span>{branch || 'No branch'}</span>
-            <span>{branchMeta}</span>
-          </div>
+          {!collapsed && (
+            <div className="acp-changes-branch" data-tooltip={repoPath}>
+              <span>{branch || 'No branch'}</span>
+              <span>{branchMeta}</span>
+            </div>
+          )}
         </div>
-        <button className="acp-icon-button" onClick={refreshStatus} data-tooltip="Refresh changes" aria-label="Refresh changes">
-          ↻
-        </button>
-      </div>
-
-      <div className="acp-changes-files">
-        {loading && <div className="acp-changes-empty">Loading changes...</div>}
-        {!loading && error && <div className="acp-changes-empty is-error">{error}</div>}
-        {!loading && !error && files.length === 0 && <div className="acp-changes-empty">Working tree is clean</div>}
-        {!loading && !error && (
-          <>
-            <ChangeSection
-              title="Staged Changes"
-              files={groups.staged}
-              selectedPath={selectedPath}
-              onSelect={setSelectedPath}
-            />
-            <ChangeSection
-              title="Changes"
-              files={groups.unstaged}
-              selectedPath={selectedPath}
-              onSelect={setSelectedPath}
-            />
-          </>
+        {!collapsed && (
+          <button className="acp-icon-button" onClick={(e) => { e.stopPropagation(); refreshStatus(); }} data-tooltip="Refresh changes" aria-label="Refresh changes">
+            ↻
+          </button>
         )}
       </div>
 
-      <div className="acp-diff-header">
-        <span>{repairMojibakeDisplay(selectedFile?.path || selectedPath || 'No file selected')}</span>
-        {totals && <span className="acp-diff-totals">{totals}</span>}
-      </div>
-      <div className="acp-diff-view">
-        {diffLoading && <div className="acp-changes-empty">Loading diff...</div>}
-        {!diffLoading && diff?.status === 'error' && <div className="acp-changes-empty is-error">{diff.error || 'Diff unavailable'}</div>}
-        {!diffLoading && diff?.status === 'ready' && diff.binary && <div className="acp-changes-empty">Binary file diff</div>}
-        {!diffLoading && diff?.status === 'ready' && !diff.binary && (
-          diff.patch.trim().length > 0
-            ? <UnifiedDiff patch={diff.patch} />
-            : <div className="acp-changes-empty">No text diff</div>
-        )}
-      </div>
+      {!collapsed && (
+        <>
+          <div className="acp-changes-files">
+            {loading && <div className="acp-changes-empty">Loading changes...</div>}
+            {!loading && error && <div className="acp-changes-empty is-error">{error}</div>}
+            {!loading && !error && files.length === 0 && <div className="acp-changes-empty">Working tree is clean</div>}
+            {!loading && !error && (
+              <>
+                <ChangeSection
+                  title="Staged Changes"
+                  files={groups.staged}
+                  selectedPath={selectedPath}
+                  onSelect={setSelectedPath}
+                />
+                <ChangeSection
+                  title="Changes"
+                  files={groups.unstaged}
+                  selectedPath={selectedPath}
+                  onSelect={setSelectedPath}
+                />
+              </>
+            )}
+          </div>
+
+          <div className="acp-diff-header">
+            <span>{repairMojibakeDisplay(selectedFile?.path || selectedPath || 'No file selected')}</span>
+            {totals && <span className="acp-diff-totals">{totals}</span>}
+          </div>
+          <div className="acp-diff-view">
+            {diffLoading && <div className="acp-changes-empty">Loading diff...</div>}
+            {!diffLoading && diff?.status === 'error' && <div className="acp-changes-empty is-error">{diff.error || 'Diff unavailable'}</div>}
+            {!diffLoading && diff?.status === 'ready' && diff.binary && <div className="acp-changes-empty">Binary file diff</div>}
+            {!diffLoading && diff?.status === 'ready' && !diff.binary && (
+              diff.patch.trim().length > 0
+                ? <UnifiedDiff patch={diff.patch} />
+                : <div className="acp-changes-empty">No text diff</div>
+            )}
+          </div>
+        </>
+      )}
     </aside>
   );
 };

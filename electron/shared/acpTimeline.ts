@@ -2,8 +2,15 @@ import type {
   AcpChatMessage,
   AcpTimelineItem,
   AcpTimelineNoticeKind,
+  AcpTimelineStatusKind,
   AcpTimelineToolStatus,
 } from './types';
+
+export interface AcpTimelineTodoEntry {
+  text: string;
+  status?: string;
+  priority?: string;
+}
 
 export function normalizeAcpTimelineToolStatus(status: unknown): AcpTimelineToolStatus {
   const text = typeof status === 'string' ? status.trim().toLowerCase() : '';
@@ -52,6 +59,38 @@ export function acpTimelineNoticeTitle(kind: AcpTimelineNoticeKind): string {
   }
 }
 
+export function acpTimelineStatusTitle(kind: AcpTimelineStatusKind): string {
+  switch (kind) {
+    case 'compact':
+      return 'Context Compacting';
+    case 'context':
+      return 'Context';
+    case 'status':
+      return 'Status';
+    case 'cost':
+      return 'Cost';
+    case 'terminal':
+      return 'Terminal';
+    case 'info':
+      return 'Info';
+  }
+}
+
+export function acpTimelineTodoEntries(raw: unknown): AcpTimelineTodoEntry[] {
+  const direct = extractTodoEntries(raw);
+  if (direct.length > 0) return direct;
+
+  if (raw && typeof raw === 'object') {
+    const record = raw as Record<string, unknown>;
+    for (const key of ['input', 'params', 'arguments', 'args', 'content']) {
+      const nested = extractTodoEntries(record[key]);
+      if (nested.length > 0) return nested;
+    }
+  }
+
+  return [];
+}
+
 export function fallbackTimelineFromMessages(messages: readonly AcpChatMessage[] | undefined): AcpTimelineItem[] {
   return (messages ?? []).map((message, index) => ({
     id: `legacy-message-${index}`,
@@ -60,4 +99,50 @@ export function fallbackTimelineFromMessages(messages: readonly AcpChatMessage[]
     text: message.text,
     timestamp: message.timestamp,
   }));
+}
+
+function extractTodoEntries(value: unknown): AcpTimelineTodoEntry[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map(todoEntryFromUnknown).filter((entry): entry is AcpTimelineTodoEntry => Boolean(entry));
+  if (typeof value === 'string') return todoEntriesFromString(value);
+  if (typeof value !== 'object') return [];
+
+  const record = value as Record<string, unknown>;
+  for (const key of ['todos', 'todo', 'items', 'tasks']) {
+    const entries = extractTodoEntries(record[key]);
+    if (entries.length > 0) return entries;
+  }
+  return [];
+}
+
+function todoEntriesFromString(value: string): AcpTimelineTodoEntry[] {
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  try {
+    return extractTodoEntries(JSON.parse(trimmed));
+  } catch {
+    return [{ text: trimmed }];
+  }
+}
+
+function todoEntryFromUnknown(value: unknown): AcpTimelineTodoEntry | undefined {
+  if (typeof value === 'string') {
+    const text = value.trim();
+    return text ? { text } : undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+
+  const record = value as Record<string, unknown>;
+  const text = stringValue(record.content) || stringValue(record.text) || stringValue(record.title) || stringValue(record.task);
+  if (!text) return undefined;
+
+  return {
+    text,
+    status: stringValue(record.status) || undefined,
+    priority: stringValue(record.priority) || undefined,
+  };
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
 }

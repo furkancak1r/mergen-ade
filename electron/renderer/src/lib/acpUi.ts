@@ -43,6 +43,12 @@ export const OPENCODE_ACP_LABEL = 'OpenCode ACP';
 export const CLAUDE_ACP_LABEL = 'Claude ACP';
 export const OPENCODE_ACP_OPEN_BUTTON_LABEL = '+ ACP';
 export const OPENCODE_ACP_CLOSE_TOOLTIP = `Close ${OPENCODE_ACP_LABEL}`;
+export const ACP_FALLBACK_SLASH_COMMANDS: AcpCommandLike[] = [
+  { id: '/compact', name: '/compact', description: 'Compact conversation to save context' },
+  { id: '/cost', name: '/cost', description: 'Show token usage and cost' },
+  { id: '/status', name: '/status', description: 'Show current status' },
+  { id: '/terminal-setup', name: '/terminal-setup', description: 'Configure terminal integration' },
+];
 
 export function acpLabelForTool(tool?: string): string {
   return tool === 'claude_acp' ? CLAUDE_ACP_LABEL : OPENCODE_ACP_LABEL;
@@ -318,12 +324,14 @@ export function slashCommandHint(command: AcpCommandLike): string | undefined {
 }
 
 export function slashCommandItems(commands: unknown, query: string, limit = 20): AcpSlashCommandItem[] {
-  if (!Array.isArray(commands)) return [];
+  const commandList = Array.isArray(commands)
+    ? [...commands, ...ACP_FALLBACK_SLASH_COMMANDS]
+    : ACP_FALLBACK_SLASH_COMMANDS;
   const normalizedQuery = query.trim().replace(/^\/+/, '').toLowerCase();
   const items: AcpSlashCommandItem[] = [];
   const seen = new Set<string>();
 
-  for (const command of commands) {
+  for (const command of commandList) {
     if (!command || typeof command !== 'object') continue;
     const candidate = command as AcpCommandLike;
     const hint = slashCommandHint(candidate);
