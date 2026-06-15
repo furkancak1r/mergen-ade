@@ -122,41 +122,44 @@ function writeJsonResponse(socket: Socket, status: number, bodyValue: unknown): 
 }
 
 async function handleHttpRequest(socket: Socket, data: string): Promise<void> {
-  const lines = data.split('\r\n');
-  const firstLine = lines[0];
-  if (!firstLine) return;
+  try {
+    const lines = data.split('\r\n');
+    const firstLine = lines[0];
+    if (!firstLine) return;
 
-  const [method, path] = firstLine.split(' ');
+    const [method, path] = firstLine.split(' ');
 
-  if (method === 'GET' && path === '/answer') {
-    const answer = peekAnswer();
-    if (answer) {
-      writeJsonResponse(socket, 200, { requestId: answer.requestId, answers: answer.answers, rejected: answer.rejected });
-    } else {
-      writeJsonResponse(socket, 200, {});
-    }
-  } else if (method === 'POST' && path === '/answer/ack') {
-    ackAnswer();
-    writeJsonResponse(socket, 200, { ok: true });
-  } else if (method === 'POST' && path === MERGEN_BROWSER_MCP_ENDPOINT_PATH) {
-    try {
-      const body = JSON.parse(httpRequestBody(data)) as Record<string, unknown>;
-      if (body.token !== browserMcpToken) {
-        writeJsonResponse(socket, 403, { ok: false, error: 'Invalid Browser MCP token' });
-      } else if (!browserMcpHandler) {
-        writeJsonResponse(socket, 500, { ok: false, error: 'Browser MCP handler is not registered' });
+    if (method === 'GET' && path === '/answer') {
+      const answer = peekAnswer();
+      if (answer) {
+        writeJsonResponse(socket, 200, { requestId: answer.requestId, answers: answer.answers, rejected: answer.rejected });
       } else {
-        const result = await browserMcpHandler(body);
-        writeJsonResponse(socket, 200, { ok: true, result });
+        writeJsonResponse(socket, 200, {});
       }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      writeJsonResponse(socket, 500, { ok: false, error: message });
+    } else if (method === 'POST' && path === '/answer/ack') {
+      ackAnswer();
+      writeJsonResponse(socket, 200, { ok: true });
+    } else if (method === 'POST' && path === MERGEN_BROWSER_MCP_ENDPOINT_PATH) {
+      try {
+        const body = JSON.parse(httpRequestBody(data)) as Record<string, unknown>;
+        if (body.token !== browserMcpToken) {
+          writeJsonResponse(socket, 403, { ok: false, error: 'Invalid Browser MCP token' });
+        } else if (!browserMcpHandler) {
+          writeJsonResponse(socket, 500, { ok: false, error: 'Browser MCP handler is not registered' });
+        } else {
+          const result = await browserMcpHandler(body);
+          writeJsonResponse(socket, 200, { ok: true, result });
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        writeJsonResponse(socket, 500, { ok: false, error: message });
+      }
+    } else {
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     }
-  } else {
-    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+  } finally {
+    socket.end();
   }
-  socket.end();
 }
 
 function processHookEvent(event: AiHookEvent): void {

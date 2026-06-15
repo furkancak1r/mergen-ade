@@ -846,7 +846,8 @@ export type AcpTimelineItem =
   | AcpTimelineMessageItem
   | AcpTimelineToolItem
   | AcpTimelinePermissionItem
-  | AcpTimelineNoticeItem;
+  | AcpTimelineNoticeItem
+  | AcpTimelineThinkingItem;
 
 export interface AcpTimelineMessageItem {
   id: string;
@@ -884,6 +885,13 @@ export interface AcpTimelineNoticeItem {
   id: string;
   type: 'notice';
   kind: AcpTimelineNoticeKind;
+  text: string;
+  timestamp: number;
+}
+
+export interface AcpTimelineThinkingItem {
+  id: string;
+  type: 'thinking';
   text: string;
   timestamp: number;
 }

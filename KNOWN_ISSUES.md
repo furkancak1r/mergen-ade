@@ -6011,3 +6011,33 @@
   - Added regression tests for message popup survival after row-hover loss and foreground send preserving the saved-message list.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: User request 2026-06-11
+
+---
+
+#### Terminal Manager layout, resize, ACP changes, and Codex input regressions {#electron-terminal-manager-acp-codex-input-regressions}
+- Date: 2026-06-12
+- Context: User reported several Electron UI/runtime regressions in Terminal Manager, ACP source control, and Codex terminal typing.
+- Symptoms/Impact:
+  - Terminal Manager row close/kill actions could appear offset from the right edge.
+  - Tooltip/hover content near the right side could be clipped by panel overflow.
+  - The left sidebar resize handle could select panel content and jump back or resize from an absolute pointer coordinate instead of the drag delta.
+  - ACP's right-side source control panel was too sparse and could overflow when inspecting changed files/diffs.
+  - Launching Codex from the foreground launcher could leave Smart Input visible when it should stay hidden.
+  - Fast terminal typing could feel delayed because each xterm input chunk was sent as a separate renderer-to-main IPC call.
+- Root cause:
+  - Row action containers were not consistently right-aligned with fixed shrink behavior.
+  - CSS pseudo tooltips rendered inside overflow-constrained containers and could not clamp to the viewport.
+  - Resize handlers used mouse events and absolute coordinates without pointer capture or user-select suppression.
+  - ACP changes UI used a single simple list and diff area without staged/unstaged grouping or robust async error handling.
+  - Codex launcher state did not explicitly clear AI session state that enables Smart Input.
+  - Terminal input did not batch high-frequency ordinary text before `pty:write`.
+- Resolution:
+  - Added viewport-aware global tooltips, delta-based pointer resize helpers, terminal input micro-batching, Codex/Droid launcher AI-state marking, and a grouped ACP changes panel with contained diff scrolling.
+  - Added focused helper tests for resize math, tooltip positioning, terminal input flushing, and ACP changes helpers.
+- Prevent recurrence:
+  - Keep Terminal Manager hover/action layout fixed-width and right-aligned.
+  - Prefer viewport-positioned tooltip rendering over pseudo-elements inside scroll/overflow containers.
+  - Keep resize logic in pure helper tests and use pointer events for drag handles.
+  - Keep terminal typing paths low-latency by batching ordinary text and immediately flushing control/submit input.
+- Files/Commands touched: `electron/renderer/src/components/TerminalManager.tsx`, `electron/renderer/src/components/TerminalPane.tsx`, `electron/renderer/src/components/AcpChangesPanel.tsx`, `electron/renderer/src/components/Tooltip.tsx`, `electron/renderer/src/App.tsx`, `electron/renderer/src/styles/global.css`, `electron/renderer/src/hooks/usePty.ts`, `KNOWN_ISSUES.md`
+- References: User request 2026-06-12

@@ -317,7 +317,7 @@ export function slashCommandHint(command: AcpCommandLike): string | undefined {
   return `/${token}`;
 }
 
-export function slashCommandItems(commands: unknown, query: string, limit = 6): AcpSlashCommandItem[] {
+export function slashCommandItems(commands: unknown, query: string, limit = 20): AcpSlashCommandItem[] {
   if (!Array.isArray(commands)) return [];
   const normalizedQuery = query.trim().replace(/^\/+/, '').toLowerCase();
   const items: AcpSlashCommandItem[] = [];
@@ -347,11 +347,11 @@ export function slashCommandItems(commands: unknown, query: string, limit = 6): 
   return items;
 }
 
-export function slashCommandHints(commands: unknown, query: string, limit = 6): string[] {
+export function slashCommandHints(commands: unknown, query: string, limit = 20): string[] {
   return slashCommandItems(commands, query, limit).map((item) => item.hint);
 }
 
-export function slashCommandItemsForInput(commands: unknown, input: string, limit = 6): AcpSlashCommandItem[] {
+export function slashCommandItemsForInput(commands: unknown, input: string, limit = 20): AcpSlashCommandItem[] {
   const query = input.trim();
   if (!query.startsWith('/')) return [];
   return slashCommandItems(commands, query.slice(1), limit);
@@ -361,7 +361,7 @@ export function slashCommandItemsForComposer(
   commands: unknown,
   input: string,
   controlsEnabled: boolean,
-  limit = 6,
+  limit = 20,
 ): AcpSlashCommandItem[] {
   if (!controlsEnabled) return [];
   return slashCommandItemsForInput(commands, input, limit);

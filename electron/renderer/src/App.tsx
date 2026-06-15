@@ -13,6 +13,7 @@ import { AcpErrorBoundary } from './components/AcpErrorBoundary';
 import { BrowserPanel } from './components/BrowserPanel';
 import { SettingsPopup } from './components/SettingsPopup';
 import { InputHistory } from './components/InputHistory';
+import { GlobalTooltip } from './components/Tooltip';
 import { usePty } from './hooks/usePty';
 import {
   activeBrowserScope as resolveActiveBrowserScope,
@@ -40,6 +41,7 @@ import {
 import { recordInputHistory, removeProjectsInputHistory } from './lib/inputHistory';
 import { activityRailItem, isLeftSidebarTabActive, withLeftSidebarRailToggle, withLeftSidebarTabOpen } from './lib/activityRail';
 import { browserProjectIdsAfterScopeEmpty } from './lib/browserToolbar';
+import { panelWidthFromPointerDrag } from './lib/sidebarResize';
 import {
   fileEditorLocationFromPath,
   initialFileEditorNavigationState,
@@ -64,6 +66,7 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
+  const sidebarResizeStartRef = useRef<{ pointerX: number; width: number } | null>(null);
 
   const [fileEditorState, setFileEditorState] = useState(initialFileEditorNavigationState);
   const [fileEditorDirty, setFileEditorDirty] = useState(false);
@@ -77,10 +80,12 @@ function App() {
   const [activeAcpAttentionByProject, setActiveAcpAttentionByProject] = useState<Map<string, AcpTerminalManagerAttentionReason>>(new Map());
   const [acpRunning, setAcpRunning] = useState(false);
   const [acpQueuedPrompts, setAcpQueuedPrompts] = useState(false);
+  const [acpDraftByChatId, setAcpDraftByChatId] = useState<Map<string, string>>(new Map());
 
   const [browserOpenProjects, setBrowserOpenProjects] = useState<Set<number>>(new Set());
   const [browserPanelWidth, setBrowserPanelWidth] = useState(520);
   const [isResizingBrowser, setIsResizingBrowser] = useState(false);
+  const browserResizeStartRef = useRef<{ pointerX: number; width: number } | null>(null);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [terminalManagerOverlayOpen, setTerminalManagerOverlayOpen] = useState(false);
@@ -629,37 +634,64 @@ function App() {
 
   useEffect(() => {
     if (!isResizing) return;
-    function handleMove(e: MouseEvent) {
-      const newWidth = Math.max(200, Math.min(500, e.clientX));
-      setSidebarWidth(newWidth);
+    document.body.classList.add('is-column-resizing');
+    function handleMove(e: PointerEvent) {
+      e.preventDefault();
+      const start = sidebarResizeStartRef.current;
+      if (!start) return;
+      setSidebarWidth(panelWidthFromPointerDrag({
+        pointerX: e.clientX,
+        startPointerX: start.pointerX,
+        startWidth: start.width,
+        minWidth: 200,
+        maxWidth: 500,
+      }));
     }
-    function handleUp() {
+    function handleUp(e: PointerEvent) {
+      e.preventDefault();
+      sidebarResizeStartRef.current = null;
       setIsResizing(false);
     }
-    window.addEventListener('mousemove', handleMove);
-    window.addEventListener('mouseup', handleUp);
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+    window.addEventListener('pointercancel', handleUp);
     return () => {
-      window.removeEventListener('mousemove', handleMove);
-      window.removeEventListener('mouseup', handleUp);
+      document.body.classList.remove('is-column-resizing');
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+      window.removeEventListener('pointercancel', handleUp);
     };
   }, [isResizing]);
 
   useEffect(() => {
     if (!isResizingBrowser) return;
-    function handleMove(e: MouseEvent) {
-      if (!mainRef.current) return;
-      const mainRect = mainRef.current.getBoundingClientRect();
-      const newWidth = Math.max(240, Math.min(800, mainRect.right - e.clientX));
-      setBrowserPanelWidth(newWidth);
+    document.body.classList.add('is-column-resizing');
+    function handleMove(e: PointerEvent) {
+      e.preventDefault();
+      const start = browserResizeStartRef.current;
+      if (!start) return;
+      setBrowserPanelWidth(panelWidthFromPointerDrag({
+        pointerX: e.clientX,
+        startPointerX: start.pointerX,
+        startWidth: start.width,
+        minWidth: 240,
+        maxWidth: 800,
+        direction: 'left',
+      }));
     }
-    function handleUp() {
+    function handleUp(e: PointerEvent) {
+      e.preventDefault();
+      browserResizeStartRef.current = null;
       setIsResizingBrowser(false);
     }
-    window.addEventListener('mousemove', handleMove);
-    window.addEventListener('mouseup', handleUp);
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+    window.addEventListener('pointercancel', handleUp);
     return () => {
-      window.removeEventListener('mousemove', handleMove);
-      window.removeEventListener('mouseup', handleUp);
+      document.body.classList.remove('is-column-resizing');
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+      window.removeEventListener('pointercancel', handleUp);
     };
   }, [isResizingBrowser]);
 
@@ -783,7 +815,7 @@ function App() {
     const selectedPath = result[0];
     const folderName = selectedPath.split(/[\\/]/).pop() || 'project';
     const newProject: ProjectRecord = {
-      id: Date.now(),
+      id: Date.now() + Math.floor(Math.random() * 1000),
       name: folderName,
       path: selectedPath,
       savedMessages: [],
@@ -912,6 +944,13 @@ function App() {
       const next = new Map(prev);
       for (const key of prev.keys()) {
         if (key.startsWith(prefix)) next.delete(key);
+      }
+      return next;
+    });
+    setAcpDraftByChatId((prev) => {
+      const next = new Map(prev);
+      for (const [key, chatId] of activeAcpChatByProject.entries()) {
+        if (key.startsWith(prefix)) next.delete(chatId);
       }
       return next;
     });
@@ -1163,12 +1202,8 @@ function App() {
   }, [pty]);
 
   const handleScrollDetached = useCallback((terminalId: number, detached: boolean) => {
-    const t = terminals.find((x) => x.id === terminalId);
-    if (!t) return;
-    t.opencodeManualScrollDetached = detached;
-    // Notify subscribers to re-render
-    pty.updateSmartInputState(terminalId, { ...t.smartInputState });
-  }, [pty, terminals]);
+    pty.updateOpencodeManualScrollDetached(terminalId, detached);
+  }, [pty]);
 
   // Clear ACP chat state for projects that no longer exist in config
   useEffect(() => {
@@ -1243,11 +1278,13 @@ function App() {
 
   return (
     <div className="app-container">
+      <GlobalTooltip />
       <div className="activity-rail">
         <button
           className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.Directory) ? 'active' : ''}`}
           onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.Directory)}
           data-tooltip={activityRailItem('directory').title}
+          data-tooltip-right=""
           aria-label={activityRailItem('directory').title}
         >
           <span className="rail-icon">{activityRailItem('directory').icon}</span>
@@ -1256,6 +1293,7 @@ function App() {
           className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.TerminalManager) ? 'active' : ''}`}
           onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.TerminalManager)}
           data-tooltip={activityRailItem('terminalManager').title}
+          data-tooltip-right=""
           aria-label={activityRailItem('terminalManager').title}
         >
           <span className="rail-icon terminal">{activityRailItem('terminalManager').icon}</span>
@@ -1264,6 +1302,7 @@ function App() {
           className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.SourceControl) ? 'active' : ''}`}
           onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.SourceControl)}
           data-tooltip={activityRailItem('sourceControl').title}
+          data-tooltip-right=""
           aria-label={activityRailItem('sourceControl').title}
         >
           <span className="rail-icon">{activityRailItem('sourceControl').icon}</span>
@@ -1272,6 +1311,7 @@ function App() {
           className={`rail-btn ${isLeftSidebarTabActive(config, LeftSidebarTabEnum.InputHistory) ? 'active' : ''}`}
           onClick={() => openLeftSidebarTab(LeftSidebarTabEnum.InputHistory)}
           data-tooltip={activityRailItem('inputHistory').title}
+          data-tooltip-right=""
           aria-label={activityRailItem('inputHistory').title}
         >
           <span className="rail-icon">{activityRailItem('inputHistory').icon}</span>
@@ -1281,6 +1321,7 @@ function App() {
           className={`rail-btn ${isBrowserOpen ? 'active' : ''}`}
           onClick={toggleBrowser}
           data-tooltip={activityRailItem('browser').title}
+          data-tooltip-right=""
           aria-label={activityRailItem('browser').title}
         >
           <span className="rail-icon">{activityRailItem('browser').icon}</span>
@@ -1289,6 +1330,7 @@ function App() {
           className={`rail-btn ${settingsOpen ? 'active' : ''}`}
           onClick={() => setSettingsOpen(true)}
           data-tooltip={activityRailItem('settings').title}
+          data-tooltip-right=""
           aria-label={activityRailItem('settings').title}
         >
           <span className="rail-icon">{activityRailItem('settings').icon}</span>
@@ -1342,6 +1384,7 @@ function App() {
             onActivateTerminal={activateTerminal}
             onSpawnTerminal={spawnTerminal}
             onMarkClaudeLaunchPending={pty.markClaudeLaunchPending}
+            onMarkLauncherAiTool={pty.markLauncherAiTool}
             onKillTerminal={killTerminal}
             rerunBackground={pty.rerunBackground}
             sendSavedMessageToTerminal={pty.sendSavedMessageToTerminal}
@@ -1391,7 +1434,7 @@ function App() {
             onAddWorktree={(worktree) => {
               if (!config) return;
               const newProject: ProjectRecord = {
-                id: Date.now(),
+                id: Date.now() + Math.floor(Math.random() * 1000),
                 name: worktree.branch || 'worktree',
                 path: worktree.path,
                 savedMessages: config.projects.find((p) => p.path === selectedProject?.repoRoot || p.path === selectedProject?.path)?.savedMessages || [],
@@ -1441,11 +1484,17 @@ function App() {
       {leftSidebarVisible && (
         <div
           className="resize-handle"
-          onMouseDown={() => setIsResizing(true)}
+          onPointerDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            sidebarResizeStartRef.current = { pointerX: event.clientX, width: sidebarWidth };
+            event.currentTarget.setPointerCapture?.(event.pointerId);
+            setIsResizing(true);
+          }}
           style={{
             width: 4,
             cursor: 'col-resize',
-            background: isResizing ? '#0078d4' : 'transparent',
+            background: isResizing ? '#0078d4' : undefined,
           }}
         />
       )}
@@ -1460,6 +1509,8 @@ function App() {
               onClose={closeAcpChat}
               disabled={settingsOpen}
               branchName={branchNameByProject.get(activeAcpChat.projectId)}
+              draft={acpDraftByChatId.get(activeAcpChat.chatId)}
+              onDraftChange={(id, text) => setAcpDraftByChatId((prev) => { const next = new Map(prev); next.set(id, text); return next; })}
             />
           </AcpErrorBoundary>
         ) : fileEditorOpen && fileEditorPath && fileEditorName ? (
@@ -1496,11 +1547,17 @@ function App() {
         <>
           <div
             className="resize-handle"
-            onMouseDown={() => setIsResizingBrowser(true)}
+            onPointerDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              browserResizeStartRef.current = { pointerX: event.clientX, width: browserPanelWidth };
+              event.currentTarget.setPointerCapture?.(event.pointerId);
+              setIsResizingBrowser(true);
+            }}
             style={{
               width: 4,
               cursor: 'col-resize',
-              background: isResizingBrowser ? '#0078d4' : 'transparent',
+              background: isResizingBrowser ? '#0078d4' : undefined,
             }}
           />
           <div style={{ width: browserPanelWidth, minWidth: 240, maxWidth: 800, display: 'flex', flexDirection: 'column', overflow: 'hidden', borderLeft: '1px solid #222' }}>

@@ -161,6 +161,26 @@ export function usePty() {
     notify();
   }, [notify]);
 
+  const markLauncherAiTool = useCallback((terminalId: number, tool: AiCliTool, title?: string) => {
+    const t = terminalsRef.current.get(terminalId);
+    if (!t) return;
+    t.aiTool = tool;
+    t.aiStatus = 'inactive';
+    t.aiStatusReason = undefined;
+    t.aiAttentionKind = undefined;
+    t.claudeLaunchPending = false;
+    t.opencodePromptSubmitSince = undefined;
+    clearOpenCodeSessionState(t);
+    if (tool === AiCliToolEnum.Codex || tool === AiCliToolEnum.Droid) {
+      t.smartInputState = defaultSmartInputState();
+      t.pendingDelayedEnters = [];
+    }
+    if (title?.trim()) {
+      t.title = title.trim();
+    }
+    notify();
+  }, [notify]);
+
   const resizeTerminal = useCallback((terminalId: number, cols: number, rows: number) => {
     const t = terminalsRef.current.get(terminalId);
     if (t) {
@@ -192,7 +212,7 @@ export function usePty() {
       // Background rerun: Windows batch confirmation detection
       if (t.pendingRerunPhase === 'interrupt_sent') {
         const lines = t.recentOutputBuffer.split(/\r?\n/);
-        const lastNonEmpty = lines.reverse().find((l) => l.trim().length > 0);
+        const lastNonEmpty = [...lines].reverse().find((l) => l.trim().length > 0);
         if (lastNonEmpty && lastNonEmpty.includes('Terminate batch job (Y/N)?')) {
           api.invoke('pty:write', terminalId, 'y\r');
           t.pendingRerunPhase = 'batch_confirm_sent';
@@ -562,6 +582,13 @@ export function usePty() {
     notify();
   }, [notify]);
 
+  const updateOpencodeManualScrollDetached = useCallback((terminalId: number, detached: boolean) => {
+    const t = terminalsRef.current.get(terminalId);
+    if (!t) return;
+    t.opencodeManualScrollDetached = detached;
+    notify();
+  }, [notify]);
+
   const setOpencodeSessionActive = useCallback((terminalId: number, value: boolean) => {
     const t = terminalsRef.current.get(terminalId);
     if (!t) return;
@@ -722,12 +749,14 @@ export function usePty() {
     createTerminal,
     writeTerminal,
     markClaudeLaunchPending,
+    markLauncherAiTool,
     resizeTerminal,
     killTerminal,
     getTerminals,
     subscribe,
     updateSmartInputState,
     setTerminalOutputFocusOverride,
+    updateOpencodeManualScrollDetached,
     setOpencodeSessionActive,
     updateQuestionState,
     updateClaudeCodexHookProgress,

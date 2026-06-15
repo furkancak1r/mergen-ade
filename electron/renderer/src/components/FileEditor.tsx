@@ -293,10 +293,7 @@ export const FileEditor: React.FC<FileEditorProps> = ({
                 e.preventDefault();
                 save();
               }
-              if (e.ctrlKey && e.key === 'c') {
-                // Let native copy work, but also ensure selection is preserved
-                handleCopy();
-              }
+              // Ctrl+C is handled by the native 'copy' event listener below
             }}
             onContextMenu={handleContextMenu}
             style={{

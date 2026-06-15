@@ -8,6 +8,10 @@ import {
   nextTerminalViewportScrollTop,
   type TerminalViewportScrollSnapshot,
 } from '../lib/terminalViewport';
+import {
+  shouldFlushTerminalInput,
+  TERMINAL_INPUT_BATCH_FLUSH_MS,
+} from '../lib/terminalInputBuffer';
 import '@xterm/xterm/css/xterm.css';
 
 interface TerminalContextMenu {
@@ -107,9 +111,30 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
     lastPtySizeRef.current = { cols, rows };
     api.invoke('pty:resize', terminalId, cols, rows);
 
-    term.onData((data) => {
+    let inputWriteBuffer = '';
+    let inputWriteTimer: number | null = null;
+    const flushInputWriteBuffer = () => {
+      if (inputWriteTimer !== null) {
+        window.clearTimeout(inputWriteTimer);
+        inputWriteTimer = null;
+      }
+      if (!inputWriteBuffer) return;
+      const data = inputWriteBuffer;
+      inputWriteBuffer = '';
       api.invoke('pty:write', terminalId, data);
-    });
+    };
+    const queueInputWrite = (data: string) => {
+      inputWriteBuffer += data;
+      if (shouldFlushTerminalInput(data, inputWriteBuffer.length)) {
+        flushInputWriteBuffer();
+        return;
+      }
+      if (inputWriteTimer === null) {
+        inputWriteTimer = window.setTimeout(flushInputWriteBuffer, TERMINAL_INPUT_BATCH_FLUSH_MS);
+      }
+    };
+
+    term.onData(queueInputWrite);
 
     // Ctrl+C: copy selection to clipboard when text is selected, otherwise send to PTY
     term.attachCustomKeyEventHandler((event) => {
@@ -251,6 +276,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
       if (scrollRaf) cancelAnimationFrame(scrollRaf);
+      flushInputWriteBuffer();
       unsub();
       term.dispose();
       lastPtySizeRef.current = null;
@@ -328,10 +354,12 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
+    const handleKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
     window.addEventListener('click', close);
-    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+    window.addEventListener('keydown', handleKeyDown);
     return () => {
       window.removeEventListener('click', close);
+      window.removeEventListener('keydown', handleKeyDown);
     };
   }, [contextMenu]);
 

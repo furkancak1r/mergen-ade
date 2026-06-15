@@ -36,6 +36,49 @@ import {
 import { loadConfig, saveConfig } from './config';
 import { getOpencodeBinPath } from './opencode';
 
+/**
+ * Load slash commands from SKILL.md files in .zed/skills/
+ */
+function loadSlashCommandsFromSkills(projectPath: string): AcpAvailableCommand[] {
+  try {
+    const skillsBaseDir = path.join(projectPath, '.zed', 'skills');
+    if (!fs.existsSync(skillsBaseDir)) return [];
+
+    const entries = fs.readdirSync(skillsBaseDir, { withFileTypes: true });
+    const commands: AcpAvailableCommand[] = [];
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const skillFile = path.join(skillsBaseDir, entry.name, 'SKILL.md');
+      try {
+        const content = fs.readFileSync(skillFile, 'utf-8');
+        // Parse frontmatter
+        const frontmatterMatch = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
+        if (!frontmatterMatch) continue;
+
+        const frontmatter = frontmatterMatch[1];
+        const nameMatch = frontmatter.match(/^name:\s*(.+)$/m);
+        const descMatch = frontmatter.match(/^description:\s*(.+)$/m);
+
+        if (nameMatch) {
+          const name = nameMatch[1].trim();
+          commands.push({
+            id: `/${name}`,
+            name: `/${name}`,
+            description: descMatch ? descMatch[1].trim() : '',
+          });
+        }
+      } catch {
+        // Skip directories without SKILL.md or parse errors
+      }
+    }
+
+    return commands;
+  } catch {
+    return [];
+  }
+}
+
 function buildAcpPromptText(text: string, attachments: string[]): string {
   if (attachments.length === 0) return text;
   const attachmentBlock = `Attached file paths:\n${attachments.join('\n')}`;
@@ -167,6 +210,24 @@ function appendAcpTimelineMessageChunk(
       id: createTimelineId(session, `${role}-message`),
       type: 'message',
       role,
+      text,
+      timestamp,
+    });
+  }
+}
+
+function appendAcpTimelineThinkingChunk(
+  session: AcpSession,
+  text: string,
+  timestamp = Date.now(),
+): void {
+  const lastTimeline = session.timeline[session.timeline.length - 1];
+  if (lastTimeline && lastTimeline.type === 'thinking') {
+    lastTimeline.text += text;
+  } else {
+    session.timeline.push({
+      id: createTimelineId(session, 'thinking'),
+      type: 'thinking',
       text,
       timestamp,
     });
@@ -362,8 +423,36 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
       },
     ];
 
+    // Populate slash commands for the composer "/" popup
+    const builtinCommands: AcpAvailableCommand[] = [
+      { id: '/help', name: '/help', description: 'Show help and available commands' },
+      { id: '/clear', name: '/clear', description: 'Clear conversation history' },
+      { id: '/compact', name: '/compact', description: 'Compact conversation to save context' },
+      { id: '/config', name: '/config', description: 'View/change configuration' },
+      { id: '/cost', name: '/cost', description: 'Show token usage and cost' },
+      { id: '/doctor', name: '/doctor', description: 'Check Claude Code health' },
+      { id: '/init', name: '/init', description: 'Initialize project with CLAUDE.md' },
+      { id: '/login', name: '/login', description: 'Switch Anthropic account' },
+      { id: '/logout', name: '/logout', description: 'Sign out from Anthropic' },
+      { id: '/memory', name: '/memory', description: 'Edit CLAUDE.md memory file' },
+      { id: '/model', name: '/model', description: 'Switch AI model' },
+      { id: '/permissions', name: '/permissions', description: 'Manage tool permissions' },
+      { id: '/review', name: '/review', description: 'Request a code review' },
+      { id: '/status', name: '/status', description: 'Show current status' },
+      { id: '/terminal-setup', name: '/terminal-setup', description: 'Configure terminal integration' },
+      { id: '/vim', name: '/vim', description: 'Toggle vim keybindings' },
+      { id: '/mcp', name: '/mcp', description: 'Manage MCP servers' },
+    ];
+
+    // Load custom commands from .zed/skills/
+    const customCommands = loadSlashCommandsFromSkills(opts.cwd || process.cwd());
+
+    // Merge: custom commands first, then built-in commands
+    session.availableCommands = [...customCommands, ...builtinCommands];
+
     broadcast('acp:event', chatId, { type: 'sessionCreated', sessionId: session.sessionId });
     broadcast('acp:event', chatId, { type: 'configOptions', options: session.configOptions });
+    broadcast('acp:event', chatId, { type: 'commands', commands: session.availableCommands });
     return chatId;
   }
 
@@ -741,9 +830,11 @@ function handleAcpLine(session: AcpSession, line: string): void {
           return;
         }
         case 'available_commands_update': {
-          const commands = (update.availableCommands as AcpAvailableCommand[]) || (update.commands as AcpAvailableCommand[]) || [];
-          session.availableCommands = commands;
-          broadcast('acp:event', session.chatId, { type: 'commands', commands });
+          const serverCommands = (update.availableCommands as AcpAvailableCommand[]) || (update.commands as AcpAvailableCommand[]) || [];
+          // Merge custom commands from .zed/skills/ with server commands
+          const customCommands = loadSlashCommandsFromSkills(session.cwd || process.cwd());
+          session.availableCommands = [...customCommands, ...serverCommands];
+          broadcast('acp:event', session.chatId, { type: 'commands', commands: session.availableCommands });
           return;
         }
         default:
@@ -896,9 +987,37 @@ function handleClaudeCodeLine(session: AcpSession, line: string): void {
       const content = message.content as Array<Record<string, unknown>> | undefined;
       if (Array.isArray(content)) {
         for (const block of content) {
-          if (block.type === 'text' && typeof block.text === 'string') {
+          if (block.type === 'thinking' && typeof block.thinking === 'string') {
+            appendAcpTimelineThinkingChunk(session, block.thinking);
+            broadcast('acp:event', session.chatId, { type: 'thinkingChunk', text: block.thinking });
+          } else if (block.type === 'text' && typeof block.text === 'string') {
             appendAcpTimelineMessageChunk(session, 'assistant', block.text);
             broadcast('acp:event', session.chatId, { type: 'messageChunk', text: block.text, role: 'assistant' });
+          } else if (block.type === 'tool_use' && typeof block.id === 'string') {
+            const toolCallId = block.id;
+            const name = (typeof block.name === 'string' ? block.name : '').trim();
+            const input = (block.input as Record<string, unknown>) || {};
+            const title = claudeToolUseTitle(name, input);
+            const kind = claudeToolUseKind(name);
+            upsertAcpTimelineTool(session, { toolCallId, title, kind, status: 'running', raw: block });
+            broadcast('acp:event', session.chatId, { type: 'toolCall', toolCallId, title, kind, status: 'running' });
+          }
+        }
+      }
+      return;
+    }
+
+    // User message with tool_result blocks
+    if (msg.type === 'user' && msg.message) {
+      const message = msg.message as Record<string, unknown>;
+      const content = message.content as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+            const toolCallId = block.tool_use_id;
+            const isError = block.is_error === true;
+            updateAcpTimelineToolStatus(session, toolCallId, isError ? 'failed' : 'completed');
+            broadcast('acp:event', session.chatId, { type: 'toolCallUpdate', toolCallId, status: isError ? 'failed' : 'completed' });
           }
         }
       }
@@ -913,6 +1032,32 @@ function handleClaudeCodeLine(session: AcpSession, line: string): void {
   } catch {
     // Ignore unparseable lines
   }
+}
+
+function claudeToolUseKind(name: string): string {
+  const lower = name.toLowerCase();
+  if (lower === 'bash' || lower === 'shell' || lower === 'terminal') return 'bash';
+  if (lower === 'edit' || lower === 'write' || lower === 'create') return 'edit';
+  if (lower === 'read' || lower === 'readfile') return 'read';
+  if (lower === 'grep' || lower === 'glob' || lower === 'search') return 'search';
+  if (lower === 'todowrite' || lower === 'task') return 'todo';
+  return lower || 'tool';
+}
+
+function claudeToolUseTitle(name: string, input: Record<string, unknown>): string {
+  const lower = name.toLowerCase();
+  // Bash: show command
+  if ((lower === 'bash' || lower === 'shell' || lower === 'terminal') && typeof input.command === 'string') {
+    const cmd = input.command.trim();
+    return cmd.length > 120 ? `${cmd.slice(0, 117)}...` : cmd;
+  }
+  // Edit/Write/Read: show file path
+  const filePath = input.file_path ?? input.path ?? input.filePath;
+  if (typeof filePath === 'string' && filePath.trim()) {
+    return filePath.trim();
+  }
+  // Fallback to tool name
+  return name || 'Tool';
 }
 
 function isValidQueueIndex(session: AcpSession, index: number): boolean {

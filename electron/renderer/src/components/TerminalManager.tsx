@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
-import type { AcpChatSession, AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry } from '../../../shared/types';
-import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalManagerFilterEnum, BuiltinLauncherKind, activeBuildModel } from '../../../shared/types';
+import type { AcpChatSession, AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry, AiCliTool } from '../../../shared/types';
+import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalManagerFilterEnum, BuiltinLauncherKind, AiCliTool as AiCliToolEnum, activeBuildModel } from '../../../shared/types';
 import type { GitDiffSummary } from '../../../shared/gitDiffSummary';
 import { gitDiffSummaryLabel } from '../../../shared/gitDiffSummary';
 import type { TerminalInstance } from '../hooks/usePty';
@@ -87,6 +87,7 @@ interface TerminalManagerProps {
   onActivateTerminal: (id: number) => void;
   onSpawnTerminal: (projectId: number, kind: TerminalKind) => Promise<number>;
   onMarkClaudeLaunchPending?: (terminalId: number, title?: string) => void;
+  onMarkLauncherAiTool?: (terminalId: number, tool: AiCliTool, title?: string) => void;
   onKillTerminal: (id: number) => void;
   rerunBackground: (terminalId: number) => void;
   sendSavedMessageToTerminal?: (terminalId: number, message: string, recordRecentInput: boolean) => void;
@@ -109,6 +110,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onActivateTerminal,
   onSpawnTerminal,
   onMarkClaudeLaunchPending,
+  onMarkLauncherAiTool,
   onKillTerminal,
   rerunBackground,
   sendSavedMessageToTerminal,
@@ -437,6 +439,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 onActivate={onActivateTerminal}
                 onSpawn={onSpawnTerminal}
                 onMarkClaudeLaunchPending={onMarkClaudeLaunchPending}
+                onMarkLauncherAiTool={onMarkLauncherAiTool}
                 onKill={onKillTerminal}
                 showSavedMessages={showSavedMessages}
                 setShowSavedMessages={setShowSavedMessages}
@@ -478,6 +481,7 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                     onActivate={onActivateTerminal}
                     onSpawn={onSpawnTerminal}
                     onMarkClaudeLaunchPending={onMarkClaudeLaunchPending}
+                    onMarkLauncherAiTool={onMarkLauncherAiTool}
                     onKill={onKillTerminal}
                     showSavedMessages={showSavedMessages}
                     setShowSavedMessages={setShowSavedMessages}
@@ -568,6 +572,7 @@ interface ProjectGroupProps {
   onActivate: (id: number) => void;
   onSpawn: (projectId: number, kind: TerminalKind) => Promise<number>;
   onMarkClaudeLaunchPending?: (terminalId: number, title?: string) => void;
+  onMarkLauncherAiTool?: (terminalId: number, tool: AiCliTool, title?: string) => void;
   onKill: (id: number) => void;
   showSavedMessages: number | null;
   setShowSavedMessages: (id: number | null) => void;
@@ -605,6 +610,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   onActivate,
   onSpawn,
   onMarkClaudeLaunchPending,
+  onMarkLauncherAiTool,
   onKill,
   showSavedMessages,
   setShowSavedMessages,
@@ -698,6 +704,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
           fontWeight: 600,
           color: headerTextColor,
           flex: 1,
+          minWidth: 0,
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
@@ -745,7 +752,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
 
         {/* Action buttons on hover for project header */}
         {hoveredProject && (
-          <div style={{ display: 'flex', gap: 2, zIndex: 1, marginLeft: 4 }}>
+          <div style={{ display: 'flex', gap: 2, zIndex: 1, marginLeft: 'auto', flexShrink: 0 }}>
             {filter === TerminalManagerFilterEnum.Foreground && !isWorktree && (
               <>
                 <IconButton
@@ -789,8 +796,8 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
             <div data-launcher-popup style={{
               position: 'fixed',
               zIndex: 20,
-              top: launcherMenuButtonRect ? launcherMenuButtonRect.top : 100,
-              left: Math.max(8, panelRight + 8),
+              top: launcherMenuButtonRect ? Math.max(8, Math.min(launcherMenuButtonRect.top, window.innerHeight - 48)) : 100,
+              left: Math.max(8, Math.min(panelRight + 8, window.innerWidth - 176)),
               background: SURFACE_BG,
               border: `1px solid ${BORDER_COLOR}`,
               borderRadius: 4,
@@ -827,6 +834,10 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                         if (targetId) {
                           if (l.builtin === BuiltinLauncherKind.Claude) {
                             onMarkClaudeLaunchPending?.(targetId, l.launchCommand || cmd);
+                          } else if (l.builtin === BuiltinLauncherKind.Codex) {
+                            onMarkLauncherAiTool?.(targetId, AiCliToolEnum.Codex, cmd);
+                          } else if (l.builtin === BuiltinLauncherKind.Droid) {
+                            onMarkLauncherAiTool?.(targetId, AiCliToolEnum.Droid, cmd);
                           }
                           const isSlash = cmd.startsWith('/');
                           await api.invoke('pty:write', targetId, '\x1b[200~' + cmd + '\x1b[201~');
@@ -952,6 +963,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                 fontSize: 11,
                 color: activeAcpStatus === 'error' ? BTN_RED : activeAcpRowChrome.titleColor,
                 flex: 1,
+                minWidth: 0,
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
@@ -960,7 +972,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
               }}>
                 {acpTerminalManagerRowLabel(activeAcpSession)}
               </span>
-              <div style={{ display: 'flex', gap: 2, zIndex: 1, minWidth: CONTROL_ROW_HEIGHT }}>
+              <div style={{ display: 'flex', gap: 2, zIndex: 1, minWidth: CONTROL_ROW_HEIGHT, marginLeft: 'auto', justifyContent: 'flex-end', flexShrink: 0 }}>
                 <div style={{ display: 'flex', gap: 2, visibility: (hoveredAcpRow || activeAcpRow) ? 'visible' : 'hidden' }}>
                   <button
                     onClick={(e) => {
@@ -1041,6 +1053,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                   fontSize: 11,
                   color: t.exited ? withAlpha(TEXT_MUTED, 160) : rowChrome.titleColor,
                   flex: 1,
+                  minWidth: 0,
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
@@ -1067,7 +1080,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                     return w + (count - 1) * 2;
                   })();
                   return (
-                    <div style={{ display: 'flex', gap: 2, zIndex: 1, minWidth: actionMinWidth }}>
+                    <div style={{ display: 'flex', gap: 2, zIndex: 1, minWidth: actionMinWidth, marginLeft: 'auto', justifyContent: 'flex-end', flexShrink: 0 }}>
                       {/* Saved messages button — always visible for background terminals */}
                       {t.kind === 'background' && (
                         <button

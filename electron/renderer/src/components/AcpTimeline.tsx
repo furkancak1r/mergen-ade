@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import type { AcpTimelineItem, AcpTimelineToolItem } from '../../../shared/types';
+import type { AcpTimelineItem, AcpTimelineThinkingItem, AcpTimelineToolItem } from '../../../shared/types';
 import {
   acpTimelineNoticeTitle,
   acpTimelineToolDisplayTitle,
@@ -91,6 +91,8 @@ const AcpTimelineItemView: React.FC<{ item: AcpTimelineItem }> = ({ item }) => {
           <pre className="acp-event-card-pre">{item.text}</pre>
         </div>
       );
+    case 'thinking':
+      return <AcpThinkingCard item={item} />;
   }
 };
 
@@ -118,6 +120,23 @@ const AcpToolCard: React.FC<{ item: AcpTimelineToolItem }> = ({ item }) => {
           </button>
           {expanded && <pre className="acp-event-card-pre">{rawText}</pre>}
         </>
+      )}
+    </div>
+  );
+};
+
+const AcpThinkingCard: React.FC<{ item: AcpTimelineThinkingItem }> = ({ item }) => {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="acp-thinking-card">
+      <button className="acp-thinking-toggle" onClick={() => setExpanded((value) => !value)}>
+        <span className="acp-thinking-icon">{expanded ? '▼' : '▶'}</span>
+        <span className="acp-thinking-label">Thinking</span>
+      </button>
+      {expanded && (
+        <div className="acp-thinking-content">
+          <AcpMarkdownMessage text={item.text} />
+        </div>
       )}
     </div>
   );

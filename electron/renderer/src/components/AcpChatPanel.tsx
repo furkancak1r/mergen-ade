@@ -60,6 +60,8 @@ interface AcpChatPanelProps {
   onClose?: () => void;
   disabled?: boolean;
   branchName?: string;
+  draft?: string;
+  onDraftChange?: (chatId: string, draft: string) => void;
 }
 
 interface QueuedPromptEditReturn {
@@ -88,6 +90,17 @@ function withTimelineMessageChunk(session: AcpChatSession, role: 'user' | 'assis
     timeline.push({ id: localTimelineId(`${role}-message`), type: 'message', role, text, timestamp: Date.now() });
   }
   return { ...session, messages, timeline };
+}
+
+function withTimelineThinkingChunk(session: AcpChatSession, text: string): AcpChatSession {
+  const timeline = [...(session.timeline && session.timeline.length > 0 ? session.timeline : fallbackTimelineFromMessages(session.messages))];
+  const lastTimeline = timeline[timeline.length - 1];
+  if (lastTimeline && lastTimeline.type === 'thinking') {
+    timeline[timeline.length - 1] = { ...lastTimeline, text: lastTimeline.text + text };
+  } else {
+    timeline.push({ id: localTimelineId('thinking'), type: 'thinking', text, timestamp: Date.now() });
+  }
+  return { ...session, timeline };
 }
 
 function withTimelineTool(session: AcpChatSession, event: AcpPanelEvent): AcpChatSession {
@@ -122,9 +135,17 @@ function withTimelineTool(session: AcpChatSession, event: AcpPanelEvent): AcpCha
   return { ...session, timeline };
 }
 
-export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, config, onClose, disabled = false, branchName }) => {
+export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, config, onClose, disabled = false, branchName, draft, onDraftChange }) => {
   const [session, setSession] = useState<AcpChatSession | null>(null);
-  const [input, setInput] = useState('');
+  const [localInput, setLocalInput] = useState(draft ?? '');
+  const input = localInput;
+  const setInput = useCallback((value: string | ((prev: string) => string)) => {
+    setLocalInput((prev) => {
+      const next = typeof value === 'function' ? value(prev) : value;
+      onDraftChange?.(chatId, next);
+      return next;
+    });
+  }, [chatId, onDraftChange]);
   const [attachments, setAttachments] = useState<string[]>([]);
   const [modeDropdownOpen, setModeDropdownOpen] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState<OpenCodeQuestion | null>(null);
@@ -217,6 +238,14 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
           if (!prev) return prev;
           const role = (event.role || 'assistant') as 'user' | 'assistant' | 'system';
           return withTimelineMessageChunk(prev, role, event.text || '');
+        });
+        return;
+      }
+
+      if (event.type === 'thinkingChunk') {
+        setSession((prev) => {
+          if (!prev) return prev;
+          return withTimelineThinkingChunk(prev, event.text || '');
         });
         return;
       }
@@ -676,7 +705,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         {slashCommandItemsState.length > 0 && (
           <div style={slashCommandPopupStyle}>
             <div style={{ fontSize: 11, color: '#777', marginBottom: 4 }}>Commands:</div>
-            <div style={{ maxHeight: 168, overflowY: 'auto' }}>
+            <div style={{ maxHeight: 320, overflowY: 'auto' }}>
               {slashCommandItemsState.map((item, i) => (
               <button
                 key={i}

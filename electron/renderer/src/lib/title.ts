@@ -6,7 +6,7 @@ export function sanitizeTitle(title: string): string {
 }
 
 export function truncateTitle(title: string, maxLength: number): string {
-  if (title.length <= maxLength) return title;
-  const truncated = title.slice(0, maxLength - 1);
-  return truncated + '…';
+  const chars = Array.from(title);
+  if (chars.length <= maxLength) return title;
+  return chars.slice(0, maxLength - 1).join('') + '…';
 }
