@@ -3,7 +3,7 @@ import type { AcpRouteMode } from '../../../shared/acpRoute';
 
 export interface AcpEventLike {
   type?: string;
-  status?: AcpChatSession['status'];
+  status?: unknown;
   queuedPrompts?: number;
   count?: number;
 }
@@ -105,6 +105,16 @@ export function isAcpRunningStatus(status: AcpChatSession['status'] | undefined)
   return status === 'running' || status === 'permission';
 }
 
+export function isAcpSessionStatus(status: unknown): status is AcpChatSession['status'] {
+  return status === 'starting'
+    || status === 'connected'
+    || status === 'session_created'
+    || status === 'idle'
+    || status === 'running'
+    || status === 'permission'
+    || status === 'error';
+}
+
 export function acpStatusText(status: AcpChatSession['status'] | undefined): string {
   switch (status) {
     case 'starting':
@@ -178,6 +188,7 @@ export function nextAcpTerminalManagerAttention(
     || event.type === 'permissionResponse'
     || event.type === 'questionResponse'
     || event.type === 'cancelled'
+    || event.type === 'historyCleared'
     || event.type === 'sessionCreated'
     || event.type === 'exit'
     || event.type === 'error'
@@ -190,11 +201,11 @@ export function nextAcpTerminalManagerAttention(
 
 export function nextAcpActivityState(previous: AcpActivityState, event: AcpEventLike): AcpActivityState {
   let running = previous.running;
-  if (event.status !== undefined) {
+  if (isAcpSessionStatus(event.status)) {
     running = isAcpRunningStatus(event.status);
   } else if (event.type === 'promptSent' || event.type === 'permission') {
     running = true;
-  } else if (event.type === 'promptResponse' || event.type === 'cancelled' || event.type === 'exit' || event.type === 'error') {
+  } else if (event.type === 'promptResponse' || event.type === 'cancelled' || event.type === 'historyCleared' || event.type === 'exit' || event.type === 'error') {
     running = false;
   }
 

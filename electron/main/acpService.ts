@@ -31,6 +31,7 @@ import {
   firstAutoApproveOptionId,
   isAcpCancelNoise,
   isAcpCancelUnsupported,
+  isAcpClearCommand,
   isAcpErrorFatalForSession,
   isAcpUnknownResponseWarning,
   isJsonRpcId,
@@ -512,6 +513,21 @@ function upsertAcpTimelineTool(
   });
 }
 
+function broadcastAcpTimelineTool(
+  session: AcpSession,
+  options: { toolCallId: string; title: string; kind: string; status: unknown; raw?: unknown },
+): void {
+  upsertAcpTimelineTool(session, options);
+  broadcast('acp:event', session.chatId, {
+    type: 'toolCall',
+    toolCallId: options.toolCallId,
+    title: options.title,
+    kind: options.kind,
+    status: options.status,
+    raw: options.raw,
+  });
+}
+
 function updateAcpTimelineToolStatus(session: AcpSession, toolCallId: string, status: unknown): AcpTimelineItem | undefined {
   const now = Date.now();
   const normalized = normalizeAcpTimelineToolStatus(status);
@@ -575,6 +591,38 @@ function createPendingInteraction(session: AcpSession, interaction: AcpPendingIn
 function clearPendingInteractions(session: AcpSession): void {
   session.pendingInteractions.clear();
   session.autoRouteQuestions.clear();
+}
+
+function resetAcpConversation(session: AcpSession): void {
+  session.messages = [];
+  session.timeline = [];
+  session.title = acpLabelForTool(session.tool);
+  session.partialStderr = undefined;
+  session.lastChangeSummarySignature = undefined;
+}
+
+function clearAcpConversationForSlashCommand(session: AcpSession): boolean {
+  const canSendProviderClear = session.tool === 'opencode' && Boolean(session.sessionId) && session.status !== 'running' && session.status !== 'permission';
+  resetAcpConversation(session);
+  clearPendingInteractions(session);
+
+  if (canSendProviderClear && session.sessionId) {
+    session.status = 'running';
+    updateAcpStandbyStatus(session.chatId, 'running');
+    sendRpc(session, 'session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/clear' }] });
+  } else if (session.status !== 'running' && session.status !== 'permission') {
+    session.status = session.sessionId ? 'idle' : session.status;
+    updateAcpStandbyStatus(session.chatId, session.status, session.sessionId);
+  }
+
+  broadcast('acp:event', session.chatId, {
+    type: 'historyCleared',
+    status: session.status,
+    title: session.title,
+    queuedPrompts: session.queuedPrompts.length,
+  });
+
+  return canSendProviderClear;
 }
 
 function setSessionMode(session: AcpSession, modeId: string, forceRpc = false): void {
@@ -1111,6 +1159,13 @@ function flushNextQueuedPrompt(session: AcpSession): void {
 
   const next = session.queuedPrompts.shift()!;
   const fullText = buildAcpPromptText(next.text, next.attachments);
+  if (isAcpClearCommand(next.text, next.attachments)) {
+    const providerClearSent = clearAcpConversationForSlashCommand(session);
+    if (!providerClearSent) {
+      flushNextQueuedPrompt(session);
+    }
+    return;
+  }
 
   // CLI adapters spawn one process per queued prompt.
   if (session.tool === 'claude_acp') {
@@ -1201,11 +1256,23 @@ function sendClaudeCodexPlanPrompt(session: AcpSession, promptText: string, atta
   const originalPrompt = buildAcpPromptText(promptText, attachments);
   if (queueAdapterPromptIfRunning(session, promptText, attachments, originalPrompt, 'codex_plan')) return;
 
+  const planToolCallId = `claude-codex-plan-${Date.now()}-${session.nextTimelineId}`;
   session.status = 'running';
   updateAcpStandbyStatus(session.chatId, 'running');
   updateAcpChatTitleFromPrompt(session, originalPrompt);
   appendAcpTimelineMessage(session, 'user', originalPrompt);
-  appendAcpSystemMessage(session, 'Codex planning before Claude Code implementation.');
+  broadcastAcpTimelineTool(session, {
+    toolCallId: planToolCallId,
+    title: 'Running read-only Codex plan',
+    kind: 'codex_plan',
+    status: 'running',
+    raw: {
+      provider: 'Codex CLI',
+      route: 'codex_plan',
+      phase: 'planning',
+      message: 'Codex is reading the workspace and preparing implementation instructions for Claude Code.',
+    },
+  });
   broadcast('acp:event', session.chatId, { type: 'promptSent', text: originalPrompt, queuedPrompts: session.queuedPrompts.length });
 
   runClaudeCodexPlan({ terminalId: 0, projectPath: session.cwd, originalPrompt })
@@ -1214,9 +1281,36 @@ function sendClaudeCodexPlanPrompt(session: AcpSession, promptText: string, atta
       session.status = 'idle';
       setSessionMode(session, 'build');
       if (result.planError) {
+        broadcastAcpTimelineTool(session, {
+          toolCallId: planToolCallId,
+          title: 'Codex plan failed',
+          kind: 'codex_plan',
+          status: 'failed',
+          raw: {
+            provider: 'Codex CLI',
+            route: 'codex_plan',
+            phase: 'planning_failed',
+            planPath: result.planPath,
+            error: result.planError,
+          },
+        });
         appendAcpTimelineNotice(session, 'stderr', 'Codex planning failed; Claude Code will continue with the original prompt.');
+        appendAcpTimelineStatus(session, 'status', 'Claude Code Handoff', 'Codex planning failed. Claude Code is continuing with the original prompt.');
       } else {
-        appendAcpSystemMessage(session, 'Codex plan ready; handing off to Claude Code.');
+        broadcastAcpTimelineTool(session, {
+          toolCallId: planToolCallId,
+          title: 'Codex plan ready',
+          kind: 'codex_plan',
+          status: 'completed',
+          raw: {
+            provider: 'Codex CLI',
+            route: 'codex_plan',
+            phase: 'planned',
+            planPath: result.planPath,
+            plan: result.plan,
+          },
+        });
+        appendAcpTimelineStatus(session, 'status', 'Claude Code Handoff', 'Codex plan is ready. Starting Claude Code implementation.');
       }
       sendClaudeCodePrompt(session, result.implementationPrompt, []);
     })
@@ -1226,7 +1320,20 @@ function sendClaudeCodexPlanPrompt(session: AcpSession, promptText: string, atta
       setSessionMode(session, 'build');
       const message = error instanceof Error ? error.message : String(error);
       const fallback = `${originalPrompt}\n\nCodex pre-implementation step failed; continue with the original prompt using normal implementation flow.\n\nPre-step error:\n${message}`;
+      broadcastAcpTimelineTool(session, {
+        toolCallId: planToolCallId,
+        title: 'Codex plan failed',
+        kind: 'codex_plan',
+        status: 'failed',
+        raw: {
+          provider: 'Codex CLI',
+          route: 'codex_plan',
+          phase: 'planning_failed',
+          error: message,
+        },
+      });
       appendAcpTimelineNotice(session, 'stderr', 'Codex planning failed; Claude Code will continue with the original prompt.');
+      appendAcpTimelineStatus(session, 'status', 'Claude Code Handoff', 'Codex planning failed. Claude Code is continuing with the original prompt.');
       sendClaudeCodePrompt(session, fallback, []);
     });
 }
@@ -1661,6 +1768,11 @@ export function restoreAcpQueuedPrompt(chatId: string, index: number, prompt: Qu
 export function sendAcpPrompt(chatId: string, promptText: string, attachments: string[], modeId?: string, returnIndex?: number): void {
   const session = sessions.get(chatId);
   if (!session) return;
+
+  if (isAcpClearCommand(promptText, attachments) && session.status !== 'running' && session.status !== 'permission') {
+    clearAcpConversationForSlashCommand(session);
+    return;
+  }
 
   const route = resolveAcpRoute(promptText, {
     selectedRoute: modeId,

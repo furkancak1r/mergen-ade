@@ -110,3 +110,7 @@ export function isAcpErrorFatalForSession(text: string, hasSessionId: boolean, s
   if (isAcpJsonParseError(text)) return true;
   return !(hasSessionId || status === 'starting');
 }
+
+export function isAcpClearCommand(text: string, attachments: readonly unknown[] = []): boolean {
+  return attachments.length === 0 && text.trim().toLowerCase() === '/clear';
+}

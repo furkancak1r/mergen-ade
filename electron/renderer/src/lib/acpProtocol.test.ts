@@ -7,6 +7,7 @@ import {
   buildAcpQuestionResponse,
   createAcpRequestIdGenerator,
   firstAutoApproveOptionId,
+  isAcpClearCommand,
   isAcpCancelNoise,
   isAcpCancelUnsupported,
   isAcpErrorFatalForSession,
@@ -106,6 +107,14 @@ describe('acpProtocol', () => {
   it('classifies cancel stderr and error-response noise', () => {
     expect(isAcpCancelNoise('{"code":-32601,"message":"Method not found: session/cancel"}')).toBe(true);
     expect(isAcpCancelNoise('regular failure')).toBe(false);
+  });
+
+  it('recognizes only exact attachment-free ACP clear commands', () => {
+    expect(isAcpClearCommand('/clear')).toBe(true);
+    expect(isAcpClearCommand('  /CLEAR  ')).toBe(true);
+    expect(isAcpClearCommand('/clear now')).toBe(false);
+    expect(isAcpClearCommand('please /clear')).toBe(false);
+    expect(isAcpClearCommand('/clear', ['C:/repo/file.ts'])).toBe(false);
   });
 
   it('classifies unsupported cancel errors separately from generic cancel noise', () => {

@@ -1,5 +1,52 @@
 ---
 
+#### Claude Code ACP Codex Plan calisirken ilerleme gorunmuyordu {#claude-acp-codex-plan-progress}
+- Date: 2026-06-15
+- Context: User reported that while the Claude Code ACP `Codex Plan` route was running, the UI showed no visible progress.
+- Error signature:
+  1. `sendClaudeCodexPlanPrompt()` set ACP status to `running`, but the only local note was a system message outside the active timeline rendering path.
+  2. `runClaudeCodexPlan()` runs asynchronously and does not stream ACP events while Codex is preparing the read-only plan.
+  3. The user could see an apparently idle chat/timeline until Claude Code implementation started.
+- Symptoms/Impact:
+  - Long Codex planning runs looked stuck or unresponsive.
+  - Users could not tell whether Mergen had started Codex, was still planning, failed, or had handed off to Claude Code.
+- Root cause:
+  - The Claude ACP Codex pre-plan route had no timeline-level progress item for the intermediate Codex phase.
+- Resolution:
+  - Added a synthetic ACP tool timeline item for the `Codex Plan` phase with a running pulse while the read-only Codex planner is active.
+  - Updated the same timeline item to completed/failed when planning resolves.
+  - Added a visible `Claude Code Handoff` status card before starting Claude Code implementation.
+- Prevent recurrence:
+  - Added a main-process ACP regression test that mocks the Codex plan runner and asserts the running `codex_plan` timeline item exists while the promise is unresolved.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/main/acpService.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`
+- References: User request 2026-06-15
+
+---
+
+#### Electron ACP `/clear` komutu UI gecmisini temizlemiyordu {#electron-acp-clear-history-ui}
+- Date: 2026-06-15
+- Context: User reported that sending `/clear` in Claude Code ACP did not clear the Mergen ACP UI, and asked for the same behavior to be fixed for other ACPs.
+- Error signature:
+  1. `/clear` was treated like a normal ACP prompt and appended to `messages`/`timeline` through `promptSent`.
+  2. Claude/Codex adapter sessions keep their visible conversation state in Mergen, so provider-side clear behavior did not reset the local UI.
+  3. Renderer refreshes reloaded the stale main-process session snapshot.
+- Symptoms/Impact:
+  - Old ACP chat history stayed visible after `/clear`.
+  - Terminal Manager/chat title could continue to reflect the previous prompt.
+- Root cause:
+  - There was no provider-independent local clear path for exact `/clear` commands in `sendAcpPrompt`.
+- Resolution:
+  - Added exact, attachment-free `/clear` detection shared by main and tests.
+  - Reset main-process ACP `messages`, `timeline`, title, stderr, and pending local interaction state before provider-specific send logic.
+  - Broadcast `historyCleared` so the renderer clears immediately and then refreshes from the cleaned session snapshot.
+  - For OpenCode ACP, send `/clear` to the real ACP session without adding it as a visible user message; Claude/Codex adapters clear locally.
+- Prevent recurrence:
+  - Added regression tests for exact `/clear` matching, ACP activity/attention state, and Claude/Codex adapter clear behavior.
+- Files/Commands touched: `electron/shared/acpProtocol.ts`, `electron/main/acpService.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, ACP protocol/UI/service tests
+- References: User request 2026-06-15
+
+---
+
 #### Electron portable release Factory Droid hook context eksikti {#electron-portable-factory-droid-hook-context}
 - Date: 2026-06-15
 - Context: User wanted Mergen ADE to work cleanly when installed on another PC, including hook setup.

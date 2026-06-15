@@ -27,6 +27,7 @@ import {
   acpTerminalManagerRowLabel,
   getAcpRouteOptions,
   hasConfigSelectorOptions,
+  isAcpSessionStatus,
   moveQueuedPromptToFront,
   nextAcpDraftRoute,
   nextAcpTerminalManagerAttention,
@@ -93,11 +94,20 @@ describe('acpUi', () => {
   it('clears ACP running on terminal response and cancel events', () => {
     expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'promptResponse' }).running).toBe(false);
     expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'cancelled' }).running).toBe(false);
+    expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'historyCleared' }).running).toBe(false);
+    expect(nextAcpActivityState({ running: false, hasQueuedPrompts: false }, { type: 'historyCleared', status: 'running' }).running).toBe(true);
   });
 
   it('keeps ACP running for non-fatal stderr and warning events', () => {
     expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'stderr' }).running).toBe(true);
     expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'warning' }).running).toBe(true);
+  });
+
+  it('does not treat completed tool status as ACP session completion', () => {
+    expect(isAcpSessionStatus('completed')).toBe(false);
+    expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'toolCall', status: 'completed' }).running).toBe(true);
+    expect(nextAcpActivityState({ running: true, hasQueuedPrompts: false }, { type: 'toolCallUpdate', status: 'failed' }).running).toBe(true);
+    expect(nextAcpActivityState({ running: false, hasQueuedPrompts: false }, { type: 'toolCall', status: 'running' }).running).toBe(true);
   });
 
   it('maps ACP status values to Rust-style display text', () => {
@@ -139,6 +149,7 @@ describe('acpUi', () => {
     expect(nextAcpTerminalManagerAttention(undefined, { type: 'promptResponse', queuedPrompts: 0 })).toBe('turn_complete');
     expect(nextAcpTerminalManagerAttention(undefined, { type: 'promptResponse', queuedPrompts: 1 })).toBeUndefined();
     expect(nextAcpTerminalManagerAttention('turn_complete', { type: 'promptSent' })).toBeUndefined();
+    expect(nextAcpTerminalManagerAttention('turn_complete', { type: 'historyCleared' })).toBeUndefined();
     expect(nextAcpTerminalManagerAttention('permission', { type: 'stderr' })).toBe('permission');
   });
 

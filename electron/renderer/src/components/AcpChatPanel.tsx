@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import type { AcpChatSession, AcpTimelineItem, ProjectRecord, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
+import type { AcpChatSession, AcpTimelineItem, AcpTimelineToolStatus, ProjectRecord, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
 import { activeBuildModel, defaultAppConfig, effectivePlanModel } from '../../../shared/types';
 import { resetAcpRouteAfterSend, type AcpRouteMode } from '../../../shared/acpRoute';
 import { fallbackTimelineFromMessages, normalizeAcpTimelineToolStatus } from '../../../shared/acpTimeline';
@@ -18,6 +18,7 @@ import {
   acpQueuedPromptPlanCount,
   acpQueuedPromptVisibleRowCount,
   acpRouteShortLabel,
+  isAcpSessionStatus,
   acpStatusText,
   getAcpRouteOptions,
   hasConfigSelectorOptions,
@@ -54,7 +55,8 @@ interface AcpPanelEvent {
   toolCallId?: string;
   title?: string;
   kind?: string;
-  status?: string;
+  status?: AcpChatSession['status'] | AcpTimelineToolStatus;
+  queuedPrompts?: number;
   item?: AcpTimelineItem;
   raw?: unknown;
 }
@@ -248,6 +250,24 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     const controlsReady = actionControlsEnabled(session);
     const unsub = api.on('acp:event', (eventChatId: string, event: AcpPanelEvent) => {
       if (eventChatId !== chatId) return;
+
+      if (event.type === 'historyCleared') {
+        setSession((prev) => prev
+          ? {
+              ...prev,
+              status: isAcpSessionStatus(event.status) ? event.status : prev.status,
+              title: event.title ?? prev.title,
+              messages: [],
+              timeline: [],
+              partialStderr: undefined,
+            }
+          : prev);
+        clearPendingInteraction();
+        setRouteStatus('');
+        setSlashCommandItemsState([]);
+        refreshSession();
+        return;
+      }
 
       // Handle high-frequency message chunks locally without re-fetching session
       if (event.type === 'messageChunk') {
