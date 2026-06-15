@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import type {
   AcpTimelineChangeSummaryItem,
   AcpTimelineItem,
@@ -18,6 +18,7 @@ import { AcpMarkdownMessage } from './AcpMarkdownMessage';
 interface AcpTimelineProps {
   items: AcpTimelineItem[];
   onCopyMessage?: (text: string) => void;
+  activeThinkingId?: string;
 }
 
 /** A visual group of consecutive timeline items. */
@@ -65,6 +66,7 @@ function groupTimelineItems(items: AcpTimelineItem[]): TimelineGroup[] {
 export const AcpTimeline: React.FC<AcpTimelineProps> = ({
   items,
   onCopyMessage,
+  activeThinkingId,
 }) => {
   const groups = useMemo(() => groupTimelineItems(items), [items]);
 
@@ -83,7 +85,11 @@ export const AcpTimeline: React.FC<AcpTimelineProps> = ({
         const { item } = group;
         return (
           <div key={item.id} className="acp-timeline-row">
-            <AcpTimelineItemView item={item} onCopyMessage={onCopyMessage} />
+            <AcpTimelineItemView
+              item={item}
+              onCopyMessage={onCopyMessage}
+              activeThinking={item.type === 'thinking' && item.id === activeThinkingId}
+            />
           </div>
         );
       })}
@@ -91,7 +97,11 @@ export const AcpTimeline: React.FC<AcpTimelineProps> = ({
   );
 };
 
-const AcpTimelineItemView: React.FC<{ item: AcpTimelineItem; onCopyMessage?: (text: string) => void }> = ({ item, onCopyMessage }) => {
+const AcpTimelineItemView: React.FC<{
+  item: AcpTimelineItem;
+  onCopyMessage?: (text: string) => void;
+  activeThinking?: boolean;
+}> = ({ item, onCopyMessage, activeThinking = false }) => {
   switch (item.type) {
     case 'message':
       return (
@@ -141,7 +151,7 @@ const AcpTimelineItemView: React.FC<{ item: AcpTimelineItem; onCopyMessage?: (te
         </div>
       );
     case 'thinking':
-      return <AcpThinkingMinimal item={item} />;
+      return <AcpThinkingMinimal item={item} active={activeThinking} />;
     case 'change_summary':
       return <AcpChangeSummaryCard item={item} />;
     case 'status':
@@ -308,19 +318,27 @@ const AcpToolGroupCard: React.FC<{ items: AcpTimelineToolItem[]; kind: string }>
   );
 };
 
-/** Minimal thinking indicator with shimmer animation. */
-const AcpThinkingMinimal: React.FC<{ item: AcpTimelineThinkingItem }> = ({ item }) => {
-  const [expanded, setExpanded] = useState(false);
+const AcpThinkingMinimal: React.FC<{ item: AcpTimelineThinkingItem; active: boolean }> = ({ item, active }) => {
+  const [manualExpanded, setManualExpanded] = useState(false);
   const hasText = item.text.trim().length > 0;
+  const expanded = hasText && (active || manualExpanded);
+
+  useEffect(() => {
+    if (!active) setManualExpanded(false);
+  }, [active, item.id]);
 
   return (
-    <div className="acp-thinking-minimal">
-      <button className="acp-thinking-minimal-btn" onClick={() => setExpanded((v) => !v)}>
+    <div className={`acp-thinking-minimal ${active ? 'is-active' : ''}`}>
+      <button className="acp-thinking-minimal-btn" onClick={() => setManualExpanded((value) => !value)}>
+        <span className={`acp-thinking-minimal-dot ${active ? 'is-active' : ''}`} />
         <span className="acp-thinking-minimal-label">Thinking</span>
+        {hasText && <span className="acp-thinking-minimal-chevron">{expanded ? '▾' : '▸'}</span>}
       </button>
-      {expanded && hasText && (
-        <div className="acp-thinking-minimal-content">
-          <AcpMarkdownMessage text={item.text} />
+      {hasText && (
+        <div className={`acp-thinking-minimal-content ${expanded ? 'is-expanded' : ''}`}>
+          <div className="acp-thinking-minimal-content-inner">
+            <AcpMarkdownMessage text={item.text} />
+          </div>
         </div>
       )}
     </div>

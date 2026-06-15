@@ -632,10 +632,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
         }}>
           {project.name}
         </span>
-        {isWorktree && (
-          <span style={{ fontSize: 10, color: withAlpha(ACCENT, 200), zIndex: 1, marginLeft: 4 }}>🌿</span>
-        )}
-
         {/* Action buttons on hover for project header */}
         {hoveredProject && (
           <div style={{ display: 'flex', gap: 2, zIndex: 1, marginLeft: 'auto', flexShrink: 0 }}>

@@ -192,7 +192,6 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [queueDragTarget, setQueueDragTarget] = useState<number | null>(null);
   const [copyToastVisible, setCopyToastVisible] = useState(false);
   const copyToastTimerRef = useRef<number | null>(null);
-  const routeStatusTimerRef = useRef<number | null>(null);
   const [changesRefreshKey, setChangesRefreshKey] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -205,6 +204,9 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     [session?.tool, resolvedConfig.claudeCodeCodexHookEnabled],
   );
   const selectedRoute = routeOptions.includes(draftRoute) ? draftRoute : 'auto';
+  const routePillLabel = selectedRoute === 'auto' && routeStatus
+    ? routeStatus.replace('Codex Plan', 'Codex')
+    : acpRouteShortLabel(selectedRoute);
 
   const clearPendingInteraction = useCallback(() => {
     setPendingQuestion(null);
@@ -331,11 +333,10 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       }
       if (event.type === 'promptResponse' || event.type === 'cancelled' || event.type === 'permissionResponse' || event.type === 'questionResponse') {
         clearPendingInteraction();
+        setRouteStatus('');
       }
       if (event.type === 'routeResolved' && event.text) {
         setRouteStatus(event.text);
-        if (routeStatusTimerRef.current !== null) window.clearTimeout(routeStatusTimerRef.current);
-        routeStatusTimerRef.current = window.setTimeout(() => { setRouteStatus(''); routeStatusTimerRef.current = null; }, 1800);
       }
       if (event.type === 'commands' && event.commands) {
         setSlashCommandItemsState((prev) => {
@@ -364,7 +365,6 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
   useEffect(() => () => {
     if (copyToastTimerRef.current !== null) window.clearTimeout(copyToastTimerRef.current);
-    if (routeStatusTimerRef.current !== null) window.clearTimeout(routeStatusTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -512,6 +512,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     if (!input.trim() && attachments.length === 0) return;
     const text = input.trim();
     const returnIndex = queuedPromptEditReturn?.index;
+    setRouteStatus('');
     await api.invoke('acp:send', { chatId, promptText: text, attachments, modeId: draftRoute, returnIndex });
     setInput('');
     setAttachments([]);
@@ -606,6 +607,8 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const timelineItems = session?.timeline && session.timeline.length > 0
     ? session.timeline
     : fallbackTimelineFromMessages(session?.messages);
+  const lastTimelineItem = timelineItems[timelineItems.length - 1];
+  const activeThinkingId = isRunning && lastTimelineItem?.type === 'thinking' ? lastTimelineItem.id : undefined;
 
   const submitPendingInteraction = async () => {
     if (!pendingQuestion) return;
@@ -759,6 +762,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
           <AcpTimeline
             items={timelineItems}
             onCopyMessage={copyTimelineMessage}
+            activeThinkingId={activeThinkingId}
           />
         )}
         <div ref={messagesEndRef} />
@@ -899,7 +903,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
                 flexShrink: 0,
               }}
             >
-              {acpRouteShortLabel(selectedRoute)}
+              {routePillLabel}
             </button>
             {addMenuOpen && (
               <div style={{ position: 'absolute', bottom: '100%', left: 0, marginBottom: 6, background: '#121212', border: '1px solid #303030', borderRadius: 8, padding: 6, minWidth: 132, zIndex: 12 }}>
@@ -935,12 +939,6 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               </div>
             )}
           </div>
-
-          {routeStatus && (
-            <span style={{ fontSize: 11, color: '#dca046', flexShrink: 0, maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {routeStatus}
-            </span>
-          )}
 
           {/* Model + effort selector */}
           <div style={{ position: 'relative', flexShrink: 0 }} ref={modeDropdownRef}>
