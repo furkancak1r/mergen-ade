@@ -21,11 +21,14 @@ import {
   acpQueuedPromptIndexLabel,
   acpQueuedPromptPlanCount,
   acpQueuedPromptVisibleRowCount,
+  acpRouteShortLabel,
   acpStatusText,
   acpTerminalManagerBadgeVisual,
   acpTerminalManagerRowLabel,
+  getAcpRouteOptions,
   hasConfigSelectorOptions,
   moveQueuedPromptToFront,
+  nextAcpDraftRoute,
   nextAcpTerminalManagerAttention,
   nextAcpActivityState,
   openCodeAcpPanelTitle,
@@ -163,6 +166,28 @@ describe('acpUi', () => {
     expect(acpModeUiLabel('build')).toBeUndefined();
     expect(acpModeUiLabel(undefined)).toBeUndefined();
     expect(acpModeUiLabel('custom')).toBe('custom');
+  });
+
+  it('shows ACP route options based on Claude Codex availability', () => {
+    expect(getAcpRouteOptions('claude_acp', true)).toEqual(['auto', 'build', 'plan', 'codex_plan']);
+    expect(getAcpRouteOptions('claude_acp', false)).toEqual(['auto', 'build', 'plan']);
+    expect(getAcpRouteOptions('opencode_acp', true)).toEqual(['auto', 'build', 'plan']);
+  });
+
+  it('cycles ACP draft routes for Tab navigation', () => {
+    const options = getAcpRouteOptions('claude_acp', true);
+    expect(nextAcpDraftRoute('auto', options)).toBe('build');
+    expect(nextAcpDraftRoute('build', options)).toBe('plan');
+    expect(nextAcpDraftRoute('plan', options)).toBe('codex_plan');
+    expect(nextAcpDraftRoute('codex_plan', options)).toBe('auto');
+    expect(nextAcpDraftRoute('codex_plan', ['auto', 'build', 'plan'])).toBe('auto');
+  });
+
+  it('uses compact ACP route labels for the composer pill', () => {
+    expect(acpRouteShortLabel('auto')).toBe('Auto');
+    expect(acpRouteShortLabel('build')).toBe('Build');
+    expect(acpRouteShortLabel('plan')).toBe('Plan');
+    expect(acpRouteShortLabel('codex_plan')).toBe('Codex');
   });
 
   it('matches Rust ACP composer hint text priority', () => {

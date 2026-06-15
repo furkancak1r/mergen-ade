@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { AcpChatSession, AcpTimelineItem, ProjectRecord, QueuedAcpPrompt, AppConfig, OpenCodeQuestion } from '../../../shared/types';
 import { activeBuildModel, defaultAppConfig, effectivePlanModel } from '../../../shared/types';
-import { acpRouteLabel, resetAcpRouteAfterSend, type AcpRouteMode } from '../../../shared/acpRoute';
+import { resetAcpRouteAfterSend, type AcpRouteMode } from '../../../shared/acpRoute';
 import { fallbackTimelineFromMessages, normalizeAcpTimelineToolStatus } from '../../../shared/acpTimeline';
 import { appendMentionsToInput, pathToMention, removeMentionFromInput } from '../lib/acpParser';
 import {
@@ -17,8 +17,11 @@ import {
   acpQueuedPromptIndexLabel,
   acpQueuedPromptPlanCount,
   acpQueuedPromptVisibleRowCount,
+  acpRouteShortLabel,
   acpStatusText,
+  getAcpRouteOptions,
   hasConfigSelectorOptions,
+  nextAcpDraftRoute,
   openCodeAcpPanelTitle,
   openCodeAcpWelcomeText,
   optionValues,
@@ -173,6 +176,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [attachments, setAttachments] = useState<string[]>([]);
   const [draftRoute, setDraftRoute] = useState<AcpRouteMode>('auto');
   const [routeStatus, setRouteStatus] = useState('');
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [modeDropdownOpen, setModeDropdownOpen] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState<OpenCodeQuestion | null>(null);
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
@@ -192,8 +196,15 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [changesRefreshKey, setChangesRefreshKey] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const addMenuRef = useRef<HTMLDivElement>(null);
   const modeDropdownRef = useRef<HTMLDivElement>(null);
   const customInputRef = useRef<HTMLInputElement>(null);
+  const resolvedConfig = config ?? defaultAppConfig();
+  const routeOptions = useMemo(
+    () => getAcpRouteOptions(session?.tool, resolvedConfig.claudeCodeCodexHookEnabled),
+    [session?.tool, resolvedConfig.claudeCodeCodexHookEnabled],
+  );
+  const selectedRoute = routeOptions.includes(draftRoute) ? draftRoute : 'auto';
 
   const clearPendingInteraction = useCallback(() => {
     setPendingQuestion(null);
@@ -348,12 +359,17 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     setQueueExpanded(true);
     setDraftRoute('auto');
     setRouteStatus('');
+    setAddMenuOpen(false);
   }, [chatId, clearPendingInteraction]);
 
   useEffect(() => () => {
     if (copyToastTimerRef.current !== null) window.clearTimeout(copyToastTimerRef.current);
     if (routeStatusTimerRef.current !== null) window.clearTimeout(routeStatusTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    if (!routeOptions.includes(draftRoute)) setDraftRoute('auto');
+  }, [draftRoute, routeOptions]);
 
   // Update slash hints when input changes
   useEffect(() => {
@@ -441,6 +457,10 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       }
 
       if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+        if (addMenuOpen) {
+          setAddMenuOpen(false);
+          return;
+        }
         if (modeDropdownOpen) {
           setModeDropdownOpen(false);
           return;
@@ -466,17 +486,20 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
               setSlashCommandSelectedIndex(0);
             }
           } else {
-            setDraftRoute((current) => current === 'plan' ? 'build' : 'plan');
+            setDraftRoute((current) => nextAcpDraftRoute(current, routeOptions));
           }
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [session?.status, disabled, modeDropdownOpen, slashCommandItemsState, slashCommandSelectedIndex, pendingQuestion, questionFocusIndex, questionAnswers]);
+  }, [session?.status, disabled, addMenuOpen, modeDropdownOpen, slashCommandItemsState, slashCommandSelectedIndex, pendingQuestion, questionFocusIndex, questionAnswers, routeOptions]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
+      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node)) {
+        setAddMenuOpen(false);
+      }
       if (modeDropdownRef.current && !modeDropdownRef.current.contains(e.target as Node)) {
         setModeDropdownOpen(false);
       }
@@ -522,7 +545,6 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const modelOptions = session?.configOptions?.find((o) => o.id === 'model');
   const effortOptions = session?.configOptions?.find((o) => o.id === 'effort');
 
-  const resolvedConfig = config ?? defaultAppConfig();
   const favoriteModels = resolvedConfig.opencode.acpFavoriteModels;
   const knownModels = resolvedConfig.opencode.acpKnownModels;
 
@@ -553,6 +575,16 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   };
 
   const branchNameDisplay = branchName || 'main';
+
+  const attachFiles = useCallback(async () => {
+    if (!controlsEnabled) return;
+    setAddMenuOpen(false);
+    const paths = await api.invoke('dialog:showOpen', { properties: ['openFile', 'multiSelections'] }) as string[] | undefined;
+    if (paths?.length) {
+      setAttachments((prev) => [...prev, ...paths]);
+      setInput((prev) => appendMentionsToInput(prev, paths));
+    }
+  }, [controlsEnabled, setInput]);
 
   const isWelcome = shouldShowAcpWelcome(session?.messages, session?.queuedPrompts);
   const composerHint = acpComposerHintText({
@@ -822,69 +854,86 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
 
         {/* Composer capsule */}
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', background: '#1b1b1b', borderRadius: 12, padding: '8px 12px' }}>
-          <button
-            onClick={async () => {
-              if (!controlsEnabled) return;
-              const paths = await api.invoke('dialog:showOpen', { properties: ['openFile', 'multiSelections'] }) as string[] | undefined;
-              if (paths) {
-                setAttachments((prev) => [...prev, ...paths]);
-                setInput((prev) => appendMentionsToInput(prev, paths));
-              }
-            }}
-            disabled={!controlsEnabled}
-            style={{
-              width: 28,
-              height: 28,
-              borderRadius: '50%',
-              background: '#1a1a1a',
-              border: '1px solid #333',
-              color: '#ccc',
-              cursor: controlsEnabled ? 'pointer' : 'not-allowed',
-              fontSize: 14,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              flexShrink: 0,
-            }}
-          >
-            +
-          </button>
-
-          <div
-            title="Auto decides per message; manual choices apply once"
-            style={{
-              width: session?.tool === 'claude_acp' && resolvedConfig.claudeCodeCodexHookEnabled ? 168 : 126,
-              height: 28,
-              display: 'grid',
-              gridTemplateColumns: session?.tool === 'claude_acp' && resolvedConfig.claudeCodeCodexHookEnabled ? 'repeat(4, 1fr)' : 'repeat(3, 1fr)',
-              border: '1px solid #333',
-              borderRadius: 6,
-              overflow: 'hidden',
-              background: '#141414',
-              flexShrink: 0,
-            }}
-          >
-            {(['auto', 'build', 'plan', ...(session?.tool === 'claude_acp' && resolvedConfig.claudeCodeCodexHookEnabled ? ['codex_plan'] : [])] as AcpRouteMode[]).map((route, index, routes) => {
-              const active = draftRoute === route;
-              const accent = route === 'plan' || route === 'codex_plan';
-              return (
+          <div ref={addMenuRef} style={{ position: 'relative', display: 'flex', gap: 6, flexShrink: 0 }}>
+            <button
+              onClick={() => {
+                if (!controlsEnabled) return;
+                setAddMenuOpen((v) => !v);
+              }}
+              disabled={!controlsEnabled}
+              aria-expanded={addMenuOpen}
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: '50%',
+                background: '#1a1a1a',
+                border: '1px solid #333',
+                color: '#ccc',
+                cursor: controlsEnabled ? 'pointer' : 'not-allowed',
+                fontSize: 14,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexShrink: 0,
+              }}
+            >
+              +
+            </button>
+            <button
+              onClick={() => {
+                if (!controlsEnabled) return;
+                setAddMenuOpen((v) => !v);
+              }}
+              disabled={!controlsEnabled}
+              title="Tab cycles send mode"
+              style={{
+                height: 28,
+                minWidth: 54,
+                padding: '0 10px',
+                borderRadius: 6,
+                border: '1px solid #333',
+                background: selectedRoute === 'plan' || selectedRoute === 'codex_plan' ? '#281c10' : '#222',
+                color: selectedRoute === 'plan' || selectedRoute === 'codex_plan' ? '#dcb43c' : '#d6d6d6',
+                cursor: controlsEnabled ? 'pointer' : 'not-allowed',
+                fontSize: 11,
+                flexShrink: 0,
+              }}
+            >
+              {acpRouteShortLabel(selectedRoute)}
+            </button>
+            {addMenuOpen && (
+              <div style={{ position: 'absolute', bottom: '100%', left: 0, marginBottom: 6, background: '#121212', border: '1px solid #303030', borderRadius: 8, padding: 6, minWidth: 132, zIndex: 12 }}>
                 <button
-                  key={route}
-                  onClick={() => setDraftRoute(route)}
-                  style={{
-                    border: 'none',
-                    borderRight: index === routes.length - 1 ? 'none' : '1px solid #333',
-                    background: active ? (accent ? '#281c10' : '#222') : '#141414',
-                    color: active ? (accent ? '#dcb43c' : '#d6d6d6') : '#777',
-                    fontSize: 10,
-                    padding: 0,
-                    cursor: 'pointer',
-                  }}
+                  onClick={attachFiles}
+                  disabled={!controlsEnabled}
+                  style={addMenuRowStyle}
                 >
-                  {route === 'codex_plan' ? 'Codex' : acpRouteLabel(route)}
+                  Attach file...
                 </button>
-              );
-            })}
+                <div style={{ height: 1, background: '#2a2a2a', margin: '5px 0' }} />
+                {routeOptions.map((route) => {
+                  const active = selectedRoute === route;
+                  const accent = route === 'plan' || route === 'codex_plan';
+                  return (
+                    <button
+                      key={route}
+                      onClick={() => {
+                        setDraftRoute(route);
+                        setAddMenuOpen(false);
+                        inputRef.current?.focus();
+                      }}
+                      style={{
+                        ...addMenuRowStyle,
+                        background: active ? (accent ? '#281c10' : '#222') : 'transparent',
+                        color: active ? (accent ? '#dcb43c' : '#d6d6d6') : '#aaa',
+                      }}
+                    >
+                      {acpRouteShortLabel(route)}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {routeStatus && (
@@ -1331,5 +1380,18 @@ const slashCommandRowStyle: React.CSSProperties = {
   fontSize: 12,
   padding: '3px 0',
   cursor: 'pointer',
+  textAlign: 'left',
+};
+
+const addMenuRowStyle: React.CSSProperties = {
+  width: '100%',
+  minHeight: 28,
+  border: 'none',
+  borderRadius: 5,
+  background: 'transparent',
+  color: '#ccc',
+  cursor: 'pointer',
+  fontSize: 12,
+  padding: '4px 8px',
   textAlign: 'left',
 };

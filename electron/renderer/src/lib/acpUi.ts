@@ -1,4 +1,5 @@
 import type { AcpChatSession, AcpConfigOption } from '../../../shared/types';
+import type { AcpRouteMode } from '../../../shared/acpRoute';
 
 export interface AcpEventLike {
   type?: string;
@@ -225,6 +226,25 @@ export function acpModeUiLabel(modeId: string | undefined): string | undefined {
   if (modeId === 'plan') return 'Plan';
   if (!modeId || modeId === 'build') return undefined;
   return modeId;
+}
+
+export function getAcpRouteOptions(tool: string | undefined, codexEnabled: boolean): AcpRouteMode[] {
+  return tool === 'claude_acp' && codexEnabled
+    ? ['auto', 'build', 'plan', 'codex_plan']
+    : ['auto', 'build', 'plan'];
+}
+
+export function nextAcpDraftRoute(current: AcpRouteMode, options: readonly AcpRouteMode[]): AcpRouteMode {
+  if (options.length === 0) return 'auto';
+  const index = options.indexOf(current);
+  return options[index < 0 ? 0 : (index + 1) % options.length];
+}
+
+export function acpRouteShortLabel(route: AcpRouteMode): string {
+  if (route === 'codex_plan') return 'Codex';
+  if (route === 'auto') return 'Auto';
+  if (route === 'build') return 'Build';
+  return 'Plan';
 }
 
 export function acpComposerHintText(options: {
