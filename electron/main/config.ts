@@ -3,11 +3,14 @@ import fs from 'fs';
 import os from 'os';
 import { parse as parseToml } from '@iarna/toml';
 import type { AppConfig, AppHistory, ProjectRecord, TerminalShortcutEntry, LauncherEntry } from '../shared/types';
-import { BuiltinLauncherKind, BuiltinLauncherKindDefaultDisplayName, LauncherIconKey, ShellKind, AcpStartupMode, defaultAppConfig, defaultTerminalShortcuts, defaultLaunchers, defaultOpenCodeModelConfig, defaultAcpModeToggleShortcut, defaultOsNotificationConfig, APP_CONFIG_VERSION, DEFAULT_OPENCODE_BUILD_MODEL, DEFAULT_OPENCODE_PLAN_MODEL, DEFAULT_OPENCODE_PLAN_EFFORT, ensureConfiguredModelsAreFavorites, normalizeBuiltinLaunchCommand } from '../shared/types';
+import { BuiltinLauncherKind, BuiltinLauncherKindAll, BuiltinLauncherKindDefaultDisplayName, LauncherIconKey, ShellKind, defaultAppConfig, defaultTerminalShortcuts, defaultLaunchers, defaultOpenCodeModelConfig, defaultOsNotificationConfig, APP_CONFIG_VERSION, DEFAULT_OPENCODE_BUILD_MODEL, DEFAULT_OPENCODE_PLAN_MODEL, DEFAULT_OPENCODE_PLAN_EFFORT, normalizeBuiltinLaunchCommand } from '../shared/types';
 
 const QUALIFIER = 'com';
 const ORGANIZATION = 'Mergen';
 const APPLICATION = 'MergenADE';
+const CODEX_PROJECT_ENV_KEYS = ['CODEX_WORKSPACE_ROOT', 'CODEX_PROJECT_PATH', 'CODEX_PROJECT'] as const;
+const CODEX_MESSAGES_JSON_ENV = 'CODEX_SAVED_MESSAGES_JSON';
+const CODEX_MESSAGE_ENV = 'CODEX_MESSAGE';
 
 function getProjectDirs() {
   const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
@@ -151,6 +154,113 @@ function mergeLegacyTomlProjects(jsonConfig: AppConfig): { config: AppConfig; me
   }
 }
 
+function applyCodexEnvSavedMessages(config: AppConfig, env: NodeJS.ProcessEnv = process.env): boolean {
+  const messages = codexEnvSavedMessages(env);
+  if (messages.length === 0) return false;
+
+  const projects = config.projects ?? [];
+  const targetProject = findCodexEnvProjectFromEnv(projects, env);
+  if (!targetProject) return false;
+
+  const ownerId = savedMessageOwnerProjectId(projects, targetProject);
+  const family = projects.filter((project) => savedMessageOwnerProjectId(projects, project) === ownerId);
+  if (family.length === 0) return false;
+
+  const mergedMessages = mergeSavedMessageFamily(family, messages);
+  let changed = false;
+  for (const project of family) {
+    if (!stringArraysEqual(project.savedMessages ?? [], mergedMessages)) {
+      project.savedMessages = mergedMessages;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function findCodexEnvProjectFromEnv(projects: ProjectRecord[], env: NodeJS.ProcessEnv): ProjectRecord | undefined {
+  for (const key of CODEX_PROJECT_ENV_KEYS) {
+    const value = env[key]?.trim();
+    if (!value) continue;
+    const project = findCodexEnvProject(projects, value, key === 'CODEX_PROJECT');
+    if (project) return project;
+  }
+  return undefined;
+}
+
+function codexEnvSavedMessages(env: NodeJS.ProcessEnv): string[] {
+  const values: string[] = [];
+  const json = env[CODEX_MESSAGES_JSON_ENV]?.trim();
+  if (json) {
+    try {
+      const parsed = JSON.parse(json) as unknown;
+      if (Array.isArray(parsed)) {
+        for (const value of parsed) {
+          if (typeof value === 'string') values.push(value);
+        }
+      }
+    } catch {
+      // Invalid Codex env should never block app startup.
+    }
+  }
+  const single = env[CODEX_MESSAGE_ENV];
+  if (single) values.push(single);
+  return normalizedUniqueMessages(values);
+}
+
+function normalizedUniqueMessages(messages: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const message of messages) {
+    const trimmed = message.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+function findCodexEnvProject(projects: ProjectRecord[], selector: string, allowNameMatch: boolean): ProjectRecord | undefined {
+  const selectorPath = normalizeProjectPathForMatch(selector);
+  const pathMatch = projects.find((project) => normalizeProjectPathForMatch(project.path) === selectorPath);
+  if (pathMatch) return pathMatch;
+
+  if (!allowNameMatch) return undefined;
+  const nameMatches = projects.filter((project) => project.name === selector);
+  return nameMatches.length === 1 ? nameMatches[0] : undefined;
+}
+
+function savedMessageOwnerProjectId(projects: ProjectRecord[], project: ProjectRecord): number {
+  if (!project.isWorktree || !project.repoRoot) return project.id;
+  const repoRoot = normalizeProjectPathForMatch(project.repoRoot);
+  const root = projects.find((candidate) => !candidate.isWorktree && normalizeProjectPathForMatch(candidate.path) === repoRoot);
+  return root?.id ?? project.id;
+}
+
+function mergeSavedMessageFamily(projects: ProjectRecord[], envMessages: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  const add = (message: string) => {
+    const trimmed = message.trim();
+    if (!trimmed || seen.has(trimmed)) return;
+    seen.add(trimmed);
+    result.push(trimmed);
+  };
+  for (const project of projects) {
+    for (const message of project.savedMessages ?? []) add(message);
+  }
+  for (const message of envMessages) add(message);
+  return result;
+}
+
+function normalizeProjectPathForMatch(p: string): string {
+  return normalizeWindowsVerbatimPath(p.trim()).replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
+}
+
+function stringArraysEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((value, index) => value === b[index]);
+}
+
 export function loadConfigWithStatus(): { config: AppConfig; repaired: boolean } {
   const legacyPath = legacyConfigPath();
   const jsonPath = configPath();
@@ -162,10 +272,11 @@ export function loadConfigWithStatus(): { config: AppConfig; repaired: boolean }
       // Merge legacy TOML projects and saved messages into JSON config
       const { config: merged, merged: didMerge } = mergeLegacyTomlProjects(config);
       config = merged;
-      if (didMerge) {
+      const didImportCodexEnv = applyCodexEnvSavedMessages(config);
+      if (didMerge || didImportCodexEnv) {
         saveConfig(config);
       }
-      return { config, repaired: didMerge };
+      return { config, repaired: didMerge || didImportCodexEnv };
     } catch {
       return { config: defaultAppConfig(), repaired: false };
     }
@@ -176,6 +287,7 @@ export function loadConfigWithStatus(): { config: AppConfig; repaired: boolean }
       const text = fs.readFileSync(legacyPath, 'utf-8');
       const parsed = parseToml(text) as unknown as AppConfig;
       const config = normalizeConfig(parsed);
+      applyCodexEnvSavedMessages(config);
       saveConfig(config);
       return { config, repaired: true };
     } catch {
@@ -238,10 +350,6 @@ function normalizeConfig(config: AppConfig): AppConfig {
   const loadedVersion = config.version ?? 0;
 
   if (loadedVersion < 2) {
-    if (config.acpStartupMode === AcpStartupMode.Build) {
-      config.acpStartupMode = AcpStartupMode.Plan;
-      changed = true;
-    }
     if (!config.opencode?.planModel?.trim()) {
       const slotB = config.opencode?.buildModelSlotB?.trim() ?? '';
       if (!config.opencode) config.opencode = defaultOpenCodeModelConfig();
@@ -301,8 +409,19 @@ function normalizeConfig(config: AppConfig): AppConfig {
     config.opencode.planEffort = DEFAULT_OPENCODE_PLAN_EFFORT;
     changed = true;
   }
-  if (ensureConfiguredModelsAreFavorites(config.opencode)) {
-    changed = true;
+  const legacyConfig = config as unknown as Record<string, unknown>;
+  for (const key of ['acpModeToggleShortcut', 'acpStartupMode']) {
+    if (key in legacyConfig) {
+      delete legacyConfig[key];
+      changed = true;
+    }
+  }
+  const legacyOpenCode = config.opencode as unknown as Record<string, unknown>;
+  for (const key of ['acpFavoriteModels', 'acpKnownModels', 'acpBindModelToMode', 'acpAutoApprovePermissions']) {
+    if (key in legacyOpenCode) {
+      delete legacyOpenCode[key];
+      changed = true;
+    }
   }
 
   // Strip Windows verbatim path prefixes
@@ -332,12 +451,6 @@ function normalizeConfig(config: AppConfig): AppConfig {
   // Sanitize legacy browser_panel_expanded (always false)
   if (config.ui && config.ui.browserPanelExpanded !== false) {
     config.ui.browserPanelExpanded = false;
-    changed = true;
-  }
-
-  // Ensure acp_mode_toggle_shortcut exists
-  if (!config.acpModeToggleShortcut) {
-    config.acpModeToggleShortcut = defaultAcpModeToggleShortcut();
     changed = true;
   }
 
@@ -403,7 +516,7 @@ export function normalizeWindowsVerbatimPath(p: string): string {
 
 function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
   const normalized: LauncherEntry[] = [];
-  for (const builtin of [BuiltinLauncherKind.OpenCode, BuiltinLauncherKind.OpenCodeAcp, BuiltinLauncherKind.Codex, BuiltinLauncherKind.CodexAcp, BuiltinLauncherKind.Droid, BuiltinLauncherKind.Claude, BuiltinLauncherKind.ClaudeAcp]) {
+  for (const builtin of BuiltinLauncherKindAll) {
     const existing = entries.find((e) => e.builtin === builtin || e.id === builtin);
     if (existing) {
       normalized.push({
@@ -415,12 +528,9 @@ function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
         iconKey: (() => {
           switch (builtin) {
             case BuiltinLauncherKind.Codex: return LauncherIconKey.Codex;
-            case BuiltinLauncherKind.CodexAcp: return LauncherIconKey.Codex;
             case BuiltinLauncherKind.Claude: return LauncherIconKey.Claude;
             case BuiltinLauncherKind.Droid: return LauncherIconKey.Droid;
             case BuiltinLauncherKind.OpenCode: return LauncherIconKey.OpenCode;
-            case BuiltinLauncherKind.OpenCodeAcp: return LauncherIconKey.OpenCode;
-            case BuiltinLauncherKind.ClaudeAcp: return LauncherIconKey.Claude;
           }
         })(),
         bypassPermissions: existing.bypassPermissions,
@@ -435,15 +545,12 @@ function normalizeLauncherEntries(entries: LauncherEntry[]): LauncherEntry[] {
         iconKey: (() => {
           switch (builtin) {
             case BuiltinLauncherKind.Codex: return LauncherIconKey.Codex;
-            case BuiltinLauncherKind.CodexAcp: return LauncherIconKey.Codex;
             case BuiltinLauncherKind.Claude: return LauncherIconKey.Claude;
             case BuiltinLauncherKind.Droid: return LauncherIconKey.Droid;
             case BuiltinLauncherKind.OpenCode: return LauncherIconKey.OpenCode;
-            case BuiltinLauncherKind.OpenCodeAcp: return LauncherIconKey.OpenCode;
-            case BuiltinLauncherKind.ClaudeAcp: return LauncherIconKey.Claude;
           }
         })(),
-        bypassPermissions: builtin === BuiltinLauncherKind.Claude || builtin === BuiltinLauncherKind.ClaudeAcp,
+        bypassPermissions: builtin === BuiltinLauncherKind.Claude,
       });
     }
   }

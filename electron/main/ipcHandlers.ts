@@ -5,7 +5,6 @@ import path from 'path';
 import { loadConfig, saveConfig, loadHistory, saveHistory, repairMojibakePath } from './config';
 import { createTerminal, writeTerminal, resizeTerminal, killTerminal, getTerminalState } from './pty';
 import { discoverWorktrees, createWorktree, removeWorktree, getGitStatus, getGitDiffSummary, getGitFileDiff } from './worktree';
-import { spawnAcpChat, sendAcpPrompt, cancelAcpPrompt, setAcpConfigOption, sendAcpPermissionResponse, sendAcpQuestionResponse, getAcpSession, runAcpQueuedPromptNext, deleteAcpQueuedPrompt, moveAcpQueuedPrompt, restoreAcpQueuedPrompt, killAcpChat, warmAcpStandby, getAcpStandby, clearAcpStandby, promoteAcpStandby, clearAllAcpStandby } from './acpService';
 import { submitAnswer } from './hookService';
 import {
   createBrowserView,
@@ -151,59 +150,6 @@ export function registerIpcHandlers() {
   });
   ipcMain.handle('shell:showItemInFolder', async (_event, filePath: string) => {
     shell.showItemInFolder(filePath);
-  });
-
-  // ACP
-  ipcMain.handle('acp:spawn', async (_event, opts: { projectId: number; cwd: string; mcpServers: string[]; tool?: string }) => {
-    return spawnAcpChat(opts);
-  });
-  ipcMain.handle('acp:send', async (_event, opts: { chatId: string; promptText: string; attachments: string[]; modeId?: string; returnIndex?: number }) => {
-    sendAcpPrompt(opts.chatId, opts.promptText, opts.attachments, opts.modeId, opts.returnIndex);
-  });
-  ipcMain.handle('acp:cancel', async (_event, chatId: string) => {
-    cancelAcpPrompt(chatId);
-  });
-  ipcMain.handle('acp:setConfigOption', async (_event, opts: { chatId: string; configId: string; value: string }) => {
-    setAcpConfigOption(opts.chatId, opts.configId, opts.value);
-  });
-  ipcMain.handle('acp:permissionResponse', async (_event, opts: { chatId: string; requestId: string; answers: string[]; rejected: boolean }) => {
-    return sendAcpPermissionResponse(opts.chatId, opts.requestId, opts.answers, opts.rejected);
-  });
-  ipcMain.handle('acp:questionResponse', async (_event, opts: { chatId: string; requestId: string; answers: string[][]; rejected: boolean }) => {
-    return sendAcpQuestionResponse(opts.chatId, opts.requestId, opts.answers, opts.rejected);
-  });
-  ipcMain.handle('acp:getSession', async (_event, chatId: string) => {
-    return getAcpSession(chatId);
-  });
-  ipcMain.handle('acp:queueRunNext', async (_event, opts: { chatId: string; index: number }) => {
-    return runAcpQueuedPromptNext(opts.chatId, opts.index);
-  });
-  ipcMain.handle('acp:queueDelete', async (_event, opts: { chatId: string; index: number }) => {
-    return deleteAcpQueuedPrompt(opts.chatId, opts.index);
-  });
-  ipcMain.handle('acp:queueMove', async (_event, opts: { chatId: string; fromIndex: number; toIndex: number }) => {
-    return moveAcpQueuedPrompt(opts.chatId, opts.fromIndex, opts.toIndex);
-  });
-  ipcMain.handle('acp:queueRestore', async (_event, opts: { chatId: string; index: number; prompt: import('../shared/types').QueuedAcpPrompt }) => {
-    return restoreAcpQueuedPrompt(opts.chatId, opts.index, opts.prompt);
-  });
-  ipcMain.handle('acp:kill', async (_event, chatId: string) => {
-    killAcpChat(chatId);
-  });
-  ipcMain.handle('acp:standby:warm', async (_event, projectId: number, cwd: string) => {
-    return warmAcpStandby(projectId, cwd);
-  });
-  ipcMain.handle('acp:standby:get', async (_event, projectId: number) => {
-    return getAcpStandby(projectId);
-  });
-  ipcMain.handle('acp:standby:clear', async (_event, projectId: number) => {
-    return clearAcpStandby(projectId);
-  });
-  ipcMain.handle('acp:standby:promote', async (_event, projectId: number, visibleChatId: string) => {
-    return promoteAcpStandby(projectId, visibleChatId);
-  });
-  ipcMain.handle('acp:standby:clearAll', async () => {
-    return clearAllAcpStandby();
   });
 
   // Hook answer bridge

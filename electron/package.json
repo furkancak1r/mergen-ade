@@ -17,9 +17,6 @@
     "node-pty": "^1.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-markdown": "10.1.0",
-    "remark-breaks": "4.0.0",
-    "remark-gfm": "4.0.1",
     "zustand": "^4.5.2"
   },
   "devDependencies": {
@@ -42,7 +39,9 @@
       "buildResources": "build"
     },
     "asarUnpack": [
-      "node_modules/node-pty/**/*"
+      "node_modules/node-pty/package.json",
+      "node_modules/node-pty/lib/**",
+      "node_modules/node-pty/prebuilds/**"
     ],
     "files": [
       "renderer/dist/**/*",

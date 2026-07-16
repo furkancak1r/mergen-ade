@@ -65,7 +65,7 @@ export function parseGitWorktreeList(output: string): GitWorktreeInfo[] {
 
 export function discoverWorktrees(repoPath: string): Promise<GitWorktreeInfo[]> {
   return new Promise((resolve) => {
-    const proc = spawn('git', ['worktree', 'list', '--porcelain'], { cwd: repoPath });
+    const proc = spawn('git', ['worktree', 'list', '--porcelain'], { cwd: repoPath, windowsHide: true, shell: false });
     let stdout = '';
     let stderr = '';
     proc.stdout.on('data', (data) => { stdout += data; });
@@ -89,7 +89,7 @@ export function createWorktree(repoPath: string, branch: string, wtPath: string,
     if (baseBranch) {
       args.push(baseBranch);
     }
-    const proc = spawn('git', args, { cwd: repoPath });
+    const proc = spawn('git', args, { cwd: repoPath, windowsHide: true, shell: false });
     proc.on('close', (code) => {
       if (code === 0) {
         // Copy root .env* files to new worktree so runtime commands work immediately
@@ -113,7 +113,7 @@ function copyEnvFiles(fromDir: string, toDir: string): void {
       if (entry.startsWith('.env')) {
         const src = fromDir + path.sep + entry;
         const dest = toDir + path.sep + entry;
-        const stat = fs.statSync(src);
+        const stat = fs.lstatSync(src);
         if (stat.isFile()) {
           fs.copyFileSync(src, dest);
         }
@@ -145,7 +145,7 @@ export function cleanupOrphanWorktrees(
 
 export function removeWorktree(repoPath: string, path: string): Promise<boolean> {
   return new Promise((resolve) => {
-    const proc = spawn('git', ['worktree', 'remove', path], { cwd: repoPath });
+    const proc = spawn('git', ['worktree', 'remove', path], { cwd: repoPath, windowsHide: true, shell: false });
     proc.on('close', (code) => {
       resolve(code === 0);
     });
@@ -326,7 +326,8 @@ async function countUntrackedTextFileLines(repoPath: string): Promise<number> {
 
   let addedLines = 0;
   for (const relativePath of parseGitPathList(output.stdout)) {
-    const lines = countTextFileLines(path.join(repoPath, relativePath));
+    const absolutePath = repoFilePath(repoPath, relativePath);
+    const lines = absolutePath ? countTextFileLines(absolutePath) : undefined;
     if (lines !== undefined) {
       addedLines += lines;
     }
@@ -345,13 +346,26 @@ function countTextFileLines(filePath: string): number | undefined {
 }
 
 function repoRelativePath(repoPath: string, filePath: string): string | undefined {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- These resolutions implement the containment check; path.relative below rejects files outside absoluteRepo.
   const absoluteRepo = path.resolve(repoPath);
-  const absoluteFile = path.isAbsolute(filePath)
-    ? path.resolve(filePath)
-    : path.resolve(absoluteRepo, filePath);
+  let absoluteFile: string;
+  if (path.isAbsolute(filePath)) {
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- path.relative below rejects files outside absoluteRepo.
+    absoluteFile = path.resolve(filePath);
+  } else {
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- path.relative below rejects files outside absoluteRepo.
+    absoluteFile = path.resolve(absoluteRepo, filePath);
+  }
   const relative = path.relative(absoluteRepo, absoluteFile);
   if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return undefined;
   return relative.replace(/\\/g, '/');
+}
+
+function repoFilePath(repoPath: string, relativePath: string): string | undefined {
+  const normalized = repoRelativePath(repoPath, relativePath);
+  if (!normalized) return undefined;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- repoRelativePath already proved normalized is contained by repoPath.
+  return path.resolve(path.resolve(repoPath), normalized);
 }
 
 async function isGitUntracked(repoPath: string, relativePath: string): Promise<boolean> {
@@ -360,7 +374,18 @@ async function isGitUntracked(repoPath: string, relativePath: string): Promise<b
 }
 
 function untrackedFileDiff(repoPath: string, relativePath: string): GitFileDiff {
-  const absolutePath = path.join(repoPath, relativePath);
+  const absolutePath = repoFilePath(repoPath, relativePath);
+  if (!absolutePath) {
+    return {
+      status: 'error',
+      filePath: relativePath,
+      patch: '',
+      addedLines: 0,
+      removedLines: 0,
+      binary: false,
+      error: 'File is outside the repository',
+    };
+  }
   let bytes: Buffer;
   try {
     bytes = fs.readFileSync(absolutePath);
@@ -430,7 +455,7 @@ function runGitCommand(
   input?: string,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const proc = spawn('git', args, { cwd: repoPath, windowsHide: true });
+    const proc = spawn('git', args, { cwd: repoPath, windowsHide: true, shell: false });
     let stdout = '';
     let stderr = '';
 

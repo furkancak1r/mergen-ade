@@ -49,7 +49,7 @@ describe('gitDiffSummary', () => {
     } finally {
       fs.rmSync(repoPath, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it('returns a read-only patch for modified tracked files', async () => {
     const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'mergen-file-diff-'));

@@ -1,15 +1,13 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import type { AcpChatSession, AppConfig, ShellKind, TerminalKind, ProjectRecord, LeftSidebarTab, BrowserScopeKey, SmartInputState, SmartInputAttachment, AiHookEvent, AiCliAttentionKind, TerminalShortcutEntry, BrowserTab, InputHistoryFilter, TerminalManagerFilter, AppHistory } from '../../shared/types';
+import type { AppConfig, ShellKind, TerminalKind, ProjectRecord, LeftSidebarTab, BrowserScopeKey, SmartInputState, SmartInputAttachment, AiHookEvent, AiCliAttentionKind, TerminalShortcutEntry, BrowserTab, InputHistoryFilter, TerminalManagerFilter, AppHistory } from '../../shared/types';
 import type { ClaudeCodexPlanResult, ClaudeCodexReviewResult } from '../../shared/claudeCodexHook';
-import { resolveAcpRoute } from '../../shared/acpRoute';
+import { resolvePromptRoute } from '../../shared/promptRoute';
 import { BrowserScopeKeyType, AiCliTool as AiCliToolEnum } from '../../shared/types';
-import { LeftSidebarTab as LeftSidebarTabEnum, defaultAppConfig, defaultAppHistory } from '../../shared/types';
+import { LeftSidebarTab as LeftSidebarTabEnum, defaultAppHistory } from '../../shared/types';
 import { MainArea } from './components/MainArea';
 import { ProjectExplorer } from './components/ProjectExplorer';
 import { TerminalManager } from './components/TerminalManager';
 import { FileEditor } from './components/FileEditor';
-import { AcpChatPanel } from './components/AcpChatPanel';
-import { AcpErrorBoundary } from './components/AcpErrorBoundary';
 import { RightPanel } from './components/RightPanel';
 import type { RightPanelTab } from './components/RightPanel';
 import { SettingsPopup } from './components/SettingsPopup';
@@ -23,20 +21,12 @@ import {
   withBrowserLastUrlForProjectFamily,
   withoutBrowserLastUrlForProjectFamily,
 } from './lib/browserScope';
-import {
-  OPENCODE_ACP_LABEL,
-  nextAcpActivityState,
-  nextAcpTerminalManagerAttention,
-  type AcpEventLike,
-  type AcpTerminalManagerAttentionReason,
-} from './lib/acpUi';
 import type { SmartInputModeId } from './lib/smartInputMode';
 import { shouldShowSmartInputFooter } from './lib/smartInput';
 import { terminalWheelEnabled } from './lib/terminalWheel';
 import {
   normalizeTerminalManagerStartupState,
   withTerminalManagerFilter,
-  withTerminalManagerOpened,
   withToggledTerminalManagerHideInactive,
 } from './lib/terminalManagerState';
 import { recordInputHistory, removeProjectsInputHistory } from './lib/inputHistory';
@@ -75,14 +65,6 @@ function App() {
   const fileEditorPath = fileEditorState.active?.path ?? null;
   const fileEditorName = fileEditorState.active?.displayName ?? null;
 
-  const [activeAcpChat, setActiveAcpChat] = useState<{ chatId: string; projectId: number; tool: string } | null>(null);
-  const [activeAcpChatByProject, setActiveAcpChatByProject] = useState<Map<string, string>>(new Map());
-  const [activeAcpSessionByProject, setActiveAcpSessionByProject] = useState<Map<string, AcpChatSession>>(new Map());
-  const [activeAcpAttentionByProject, setActiveAcpAttentionByProject] = useState<Map<string, AcpTerminalManagerAttentionReason>>(new Map());
-  const [acpRunning, setAcpRunning] = useState(false);
-  const [acpQueuedPrompts, setAcpQueuedPrompts] = useState(false);
-  const [acpDraftByChatId, setAcpDraftByChatId] = useState<Map<string, string>>(new Map());
-
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('sourceControl');
   const [browserOpenProjects, setBrowserOpenProjects] = useState<Set<number>>(new Set());
@@ -104,8 +86,7 @@ function App() {
   const [browserUrlDraftByScope, setBrowserUrlDraftByScope] = useState<Map<string, string>>(new Map());
   const [browserDesignInspectByScope, setBrowserDesignInspectByScope] = useState<Map<string, boolean>>(new Map());
 
-  const pty = usePty({ allowClaudeCodexPlan: Boolean(config?.claudeCodeCodexHookEnabled) });
-  const suppressAcpRestoreRef = useRef(false);
+  const pty = usePty();
   const historyLoadedRef = useRef(false);
   const terminalHistorySignatureRef = useRef<Map<number, string>>(new Map());
 
@@ -211,8 +192,6 @@ function App() {
       const parts: string[] = [];
       if (fileEditorDirty) parts.push('You have unsaved changes in the file editor.');
       if (terminals.length > 0) parts.push(`${terminals.length} terminal session(s) are still running.`);
-      if (acpRunning) parts.push(`An ${OPENCODE_ACP_LABEL} session is still running.`);
-      if (acpQueuedPrompts) parts.push(`You have queued prompts in ${OPENCODE_ACP_LABEL}.`);
       const message = parts.length > 0
         ? `Are you sure you want to close Mergen ADE?\n\n${parts.join('\n')}`
         : 'Are you sure you want to close Mergen ADE?';
@@ -222,46 +201,7 @@ function App() {
       }
     });
     return () => { unsub(); };
-  }, [fileEditorDirty, terminals.length, acpRunning, acpQueuedPrompts]);
-
-  // Track ACP running state and queued prompts
-  useEffect(() => {
-    const unsub = api.on('acp:event', (eventChatId: string, event: AcpEventLike) => {
-      const projectEntry = Array.from(activeAcpChatByProject.entries()).find(([, chatId]) => chatId === eventChatId);
-      if (projectEntry) {
-        const [projectKey] = projectEntry;
-        setActiveAcpAttentionByProject((prev) => {
-          const currentReason = prev.get(projectKey);
-          const nextReason = nextAcpTerminalManagerAttention(currentReason, event);
-          if (nextReason === currentReason) return prev;
-          const next = new Map(prev);
-          if (nextReason) {
-            next.set(projectKey, nextReason);
-          } else {
-            next.delete(projectKey);
-          }
-          return next;
-        });
-        api.invoke('acp:getSession', eventChatId).then((session) => {
-          setActiveAcpSessionByProject((prev) => {
-            const next = new Map(prev);
-            if (session) {
-              next.set(projectKey, session as AcpChatSession);
-            } else {
-              next.delete(projectKey);
-            }
-            return next;
-          });
-        });
-      }
-      if (activeAcpChat && eventChatId === activeAcpChat.chatId) {
-        const next = nextAcpActivityState({ running: acpRunning, hasQueuedPrompts: acpQueuedPrompts }, event);
-        setAcpRunning(next.running);
-        setAcpQueuedPrompts(next.hasQueuedPrompts);
-      }
-    });
-    return () => { unsub(); };
-  }, [activeAcpChat, activeAcpChatByProject, acpRunning, acpQueuedPrompts]);
+  }, [fileEditorDirty, terminals.length]);
 
   // Browser hide on modal open (Settings) with grace period after close.
   useEffect(() => {
@@ -446,8 +386,6 @@ function App() {
   const activateTerminal = useCallback((id: number) => {
     setActiveTerminalId(id);
     setFileEditorState((prev) => withFileEditorHidden(prev));
-    setActiveAcpChat(null);
-    suppressAcpRestoreRef.current = true;
     const t = terminals.find((x) => x.id === id);
     if (t) {
       setSelectedProjectId(t.projectId);
@@ -455,53 +393,6 @@ function App() {
     // Clear terminal output focus override for the newly activated terminal
     pty.setTerminalOutputFocusOverride(id, false);
   }, [terminals, pty]);
-
-  const restoreActiveAcpForProject = useCallback((projectId: number) => {
-    const prefix = `${projectId}:`;
-    const entry = Array.from(activeAcpChatByProject.entries()).find(([key]) => key.startsWith(prefix));
-    if (entry) {
-      const [projectKey, chatId] = entry;
-      setActiveAcpAttentionByProject((prev) => {
-        if (!prev.has(projectKey)) return prev;
-        const next = new Map(prev);
-        next.delete(projectKey);
-        return next;
-      });
-      const tool = projectKey.slice(prefix.length);
-      setActiveAcpChat({ chatId, projectId, tool });
-      setFileEditorState((prev) => withFileEditorHidden(prev));
-      setActiveTab(LeftSidebarTabEnum.TerminalManager);
-      setConfig((prev) => prev ? withTerminalManagerOpened(prev) : prev);
-    }
-  }, [activeAcpChatByProject]);
-
-  // Warm ACP standby for selected project
-  useEffect(() => {
-    if (!selectedProjectId || !config) return;
-    const project = config.projects.find((p) => p.id === selectedProjectId);
-    if (!project) return;
-    // Warm standby after a short delay so it doesn't fire on every rapid selection change
-    const timer = setTimeout(() => {
-      api.invoke('acp:standby:warm', selectedProjectId, project.path);
-    }, 500);
-    return () => clearTimeout(timer);
-  }, [selectedProjectId, config]);
-
-  // Restore ACP chat when switching to a project that has an active chat
-  useEffect(() => {
-    if (!selectedProjectId) return;
-    if (suppressAcpRestoreRef.current) {
-      suppressAcpRestoreRef.current = false;
-      return;
-    }
-    const prefix = `${selectedProjectId}:`;
-    const entry = Array.from(activeAcpChatByProject.entries()).find(([key]) => key.startsWith(prefix));
-    if (entry) {
-      const [projectKey, chatId] = entry;
-      const tool = projectKey.slice(prefix.length);
-      setActiveAcpChat({ chatId, projectId: selectedProjectId, tool });
-    }
-  }, [selectedProjectId, activeAcpChatByProject]);
 
   const activeTerminals = terminals.filter((t) => {
     if (config?.ui.mainVisibilityMode === 'selected_project') {
@@ -547,9 +438,6 @@ function App() {
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     if (!config) return;
-
-    // ACP chat visible blocks terminal keyboard capture
-    if (activeAcpChat) return;
 
     // File editor open blocks terminal keyboard capture
     if (fileEditorOpen) return;
@@ -615,7 +503,7 @@ function App() {
       const idx = terminals.findIndex((t) => t.id === activeTerminalId);
       if (idx >= 0 && idx < terminals.length - 1) activateTerminal(terminals[idx + 1].id);
     }
-  }, [config, activeTerminals, activeTerminalId, pty, activateTerminal, activeAcpChat, terminals, shortcutMatchesEvent, formatShortcutCombo, settingsOpen, fileEditorOpen]);
+  }, [config, activeTerminals, activeTerminalId, pty, activateTerminal, terminals, shortcutMatchesEvent, formatShortcutCombo, settingsOpen, fileEditorOpen]);
 
   useEffect(() => {
     if (!mainRef.current) return;
@@ -792,7 +680,6 @@ function App() {
 
   const openFile = useCallback((filePath: string) => {
     setFileEditorState((prev) => withFileEditorOpened(prev, fileEditorLocationFromPath(filePath)));
-    setActiveAcpChat(null);
   }, []);
 
   const closeFileEditor = useCallback(() => {
@@ -864,105 +751,6 @@ function App() {
     return removedProjects;
   }, [config, selectedProjectId]);
 
-  const openAcpChat = useCallback(async (projectId: number, tool?: string) => {
-    if (!config) return;
-    const project = config.projects.find((p) => p.id === projectId);
-    if (!project) return;
-
-    const effectiveTool = tool || 'opencode';
-    const projectKey = `${projectId}:${effectiveTool}`;
-    let chatId: string;
-
-    // CLI-backed adapters bypass OpenCode's standby pool.
-    if (tool === 'claude_acp' || tool === 'codex_acp') {
-      chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [], tool }) as string;
-    } else {
-      // OpenCode: try to promote standby first
-      const standby = await api.invoke('acp:standby:get', projectId) as { chatId: string; sessionId?: string; status: string } | undefined;
-      if (standby && standby.sessionId && (standby.status === 'idle' || standby.status === 'running' || standby.status === 'permission')) {
-        const promoted = await api.invoke('acp:standby:promote', projectId, '') as { chatId: string } | undefined;
-        if (promoted) {
-          chatId = promoted.chatId;
-        } else {
-          chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [] }) as string;
-        }
-      } else {
-        chatId = await api.invoke('acp:spawn', { projectId, cwd: project.path, mcpServers: [] }) as string;
-      }
-    }
-
-    setActiveAcpChatByProject((prev) => {
-      const next = new Map(prev);
-      next.set(projectKey, chatId);
-      return next;
-    });
-    setActiveAcpAttentionByProject((prev) => {
-      if (!prev.has(projectKey)) return prev;
-      const next = new Map(prev);
-      next.delete(projectKey);
-      return next;
-    });
-    const session = await api.invoke('acp:getSession', chatId) as AcpChatSession | undefined;
-    if (session) {
-      setActiveAcpSessionByProject((prev) => {
-        const next = new Map(prev);
-        next.set(projectKey, session);
-        return next;
-      });
-    }
-    setActiveAcpChat({ chatId, projectId, tool: effectiveTool });
-    setFileEditorState((prev) => withFileEditorHidden(prev));
-    // Reveal Terminal Manager with Foreground filter and expand root project
-    setActiveTab(LeftSidebarTabEnum.TerminalManager);
-    setConfig((prev) => prev ? withTerminalManagerOpened(prev) : prev);
-  }, [config]);
-
-  const closeAcpChat = useCallback(() => {
-    setActiveAcpChat(null);
-  }, []);
-
-  const removeAcpChatForProject = useCallback((projectId: number) => {
-    const prefix = `${projectId}:`;
-    // Kill all ACP chats for this project
-    for (const [key, chatId] of activeAcpChatByProject.entries()) {
-      if (key.startsWith(prefix)) {
-        api.invoke('acp:kill', chatId);
-      }
-    }
-    setActiveAcpChatByProject((prev) => {
-      const next = new Map(prev);
-      for (const key of prev.keys()) {
-        if (key.startsWith(prefix)) next.delete(key);
-      }
-      return next;
-    });
-    setActiveAcpSessionByProject((prev) => {
-      const next = new Map(prev);
-      for (const key of prev.keys()) {
-        if (key.startsWith(prefix)) next.delete(key);
-      }
-      return next;
-    });
-    setActiveAcpAttentionByProject((prev) => {
-      const next = new Map(prev);
-      for (const key of prev.keys()) {
-        if (key.startsWith(prefix)) next.delete(key);
-      }
-      return next;
-    });
-    setAcpDraftByChatId((prev) => {
-      const next = new Map(prev);
-      for (const [key, chatId] of activeAcpChatByProject.entries()) {
-        if (key.startsWith(prefix)) next.delete(chatId);
-      }
-      return next;
-    });
-    if (activeAcpChat && activeAcpChat.projectId === projectId) {
-      setActiveAcpChat(null);
-    }
-    api.invoke('acp:standby:clear', projectId);
-  }, [activeAcpChat, activeAcpChatByProject]);
-
   const toggleRightPanel = useCallback((tab?: RightPanelTab) => {
     if (!selectedProjectId) return;
     if (rightPanelOpen && !tab) {
@@ -977,9 +765,7 @@ function App() {
     // If switching to browser, also register the project in browserOpenProjects
     if (targetTab === 'browser') {
       const hasForegroundTerminal = terminals.some((t) => t.projectId === selectedProjectId && t.kind === 'foreground' && !t.exited);
-      const prefix = `${selectedProjectId}:`;
-      const hasAcpChat = Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix));
-      if (hasForegroundTerminal || hasAcpChat) {
+      if (hasForegroundTerminal) {
         setBrowserOpenProjects((prev) => {
           const next = new Set(prev);
           next.add(selectedProjectId);
@@ -987,16 +773,14 @@ function App() {
         });
       }
     }
-  }, [selectedProjectId, rightPanelOpen, terminals, activeAcpChatByProject]);
+  }, [selectedProjectId, rightPanelOpen, terminals]);
 
   const toggleBrowser = useCallback(() => {
     if (!selectedProjectId) return;
     const isCurrentlyOpen = browserOpenProjects.has(selectedProjectId);
     if (!isCurrentlyOpen) {
       const hasForegroundTerminal = terminals.some((t) => t.projectId === selectedProjectId && t.kind === 'foreground' && !t.exited);
-      const prefix = `${selectedProjectId}:`;
-      const hasAcpChat = Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix));
-      if (!hasForegroundTerminal && !hasAcpChat) return;
+      if (!hasForegroundTerminal) return;
       setBrowserOpenProjects((prev) => {
         const next = new Set(prev);
         next.add(selectedProjectId);
@@ -1013,26 +797,22 @@ function App() {
         setRightPanelOpen(true);
       }
     }
-  }, [selectedProjectId, browserOpenProjects, terminals, activeAcpChatByProject, rightPanelOpen, rightPanelTab]);
+  }, [selectedProjectId, browserOpenProjects, terminals, rightPanelOpen, rightPanelTab]);
 
-  // Auto-close browser when project loses all foreground terminals and ACP chats
+  // Auto-close browser when project loses all foreground terminals
   useEffect(() => {
     setBrowserOpenProjects((prev) => {
       if (prev.size === 0) return prev;
       const next = new Set<number>();
       for (const projectId of prev) {
         const hasForegroundTerminal = terminals.some((t) => t.projectId === projectId && t.kind === 'foreground' && !t.exited);
-        const prefix = `${projectId}:`;
-        const hasAcpChat = Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix));
-        if (hasForegroundTerminal || hasAcpChat) {
+        if (hasForegroundTerminal) {
           next.add(projectId);
         }
       }
       return next.size === prev.size ? prev : next;
     });
-  }, [terminals, activeAcpChatByProject]);
-
-  const acpProject = activeAcpChat ? config?.projects.find((p) => p.id === activeAcpChat.projectId) ?? null : null;
+  }, [terminals]);
 
   const handleUpdateSmartInputState = useCallback((terminalId: number, state: Partial<SmartInputState>) => {
     pty.updateSmartInputState(terminalId, state);
@@ -1042,7 +822,7 @@ function App() {
     const terminal = terminals.find((candidate) => candidate.id === terminalId);
     const trimmed = text.trim();
     const project = terminal ? config?.projects.find((candidate) => candidate.id === terminal.projectId) : undefined;
-    const route = resolveAcpRoute(trimmed, {
+    const route = resolvePromptRoute(trimmed, {
       selectedRoute: modeId,
       allowCodexPlan: config?.claudeCodeCodexHookEnabled,
       attachmentCount: attachments.length,
@@ -1254,58 +1034,13 @@ function App() {
     pty.updateOpencodeManualScrollDetached(terminalId, detached);
   }, [pty]);
 
-  // Clear ACP chat state for projects that no longer exist in config
-  useEffect(() => {
-    if (!config) return;
-    const existingIds = new Set(config.projects.map((p) => p.id));
-    // Find composite keys whose projectId no longer exists
-    const removedKeys = Array.from(activeAcpChatByProject.keys()).filter((key) => {
-      const pid = parseInt(key.split(':')[0], 10);
-      return !existingIds.has(pid);
-    });
-    if (removedKeys.length === 0) return;
-    const removedKeySet = new Set(removedKeys);
-    // Collect removed projectIds for standby cleanup
-    const removedProjectIds = new Set(removedKeys.map((key) => parseInt(key.split(':')[0], 10)));
-
-    setActiveAcpChatByProject((prev) => {
-      const next = new Map(prev);
-      for (const key of removedKeySet) next.delete(key);
-      return next;
-    });
-    if (activeAcpChat && removedProjectIds.has(activeAcpChat.projectId)) {
-      setActiveAcpChat(null);
-    }
-    setActiveAcpSessionByProject((prev) => {
-      const next = new Map(prev);
-      for (const key of removedKeySet) next.delete(key);
-      return next;
-    });
-    setActiveAcpAttentionByProject((prev) => {
-      const next = new Map(prev);
-      for (const key of removedKeySet) next.delete(key);
-      return next;
-    });
-    // Kill ACP chats and clear standby for removed projects
-    for (const key of removedKeys) {
-      const chatId = activeAcpChatByProject.get(key);
-      if (chatId) {
-        api.invoke('acp:kill', chatId);
-      }
-    }
-    for (const projectId of removedProjectIds) {
-      api.invoke('acp:standby:clear', projectId);
-    }
-  }, [config, activeAcpChat, activeAcpChatByProject]);
-
   // Ensure Smart Input focus when visible and no override
   useEffect(() => {
     const activeTerminal = activeTerminals.find((t) => t.id === activeTerminalId);
     if (!activeTerminal) return;
-    const showSmartInput = shouldShowSmartInputFooter(activeTerminal.kind, activeTerminal.aiTool, activeTerminal.aiStatus, activeTerminal.opencodeSessionActive, activeTerminal.claudeLaunchPending);
+    const showSmartInput = shouldShowSmartInputFooter(activeTerminal.kind, activeTerminal.aiTool, activeTerminal.opencodeSessionActive);
     if (!showSmartInput) return;
     if (activeTerminal.terminalOutputFocusOverride) return;
-    if (activeAcpChat) return;
     // Surrender Smart Input focus when any modal/popup is open
     if (settingsOpen) return;
     // Do not steal focus from browser URL input or other text inputs
@@ -1317,7 +1052,7 @@ function App() {
     if (smartInput && document.activeElement !== smartInput) {
       smartInput.focus();
     }
-  }, [activeTerminals, activeTerminalId, activeAcpChat, settingsOpen]);
+  }, [activeTerminals, activeTerminalId, settingsOpen]);
 
   const leftSidebarVisible = Boolean(config?.ui.showProjectExplorer && config.ui.projectExplorerExpanded);
   const openLeftSidebarTab = useCallback((tab: LeftSidebarTab) => {
@@ -1428,13 +1163,6 @@ function App() {
             onKillTerminal={killTerminal}
             rerunBackground={pty.rerunBackground}
             sendSavedMessageToTerminal={pty.sendSavedMessageToTerminal}
-            activeAcpChatByProject={activeAcpChatByProject}
-            activeAcpSessionByProject={activeAcpSessionByProject}
-            activeAcpAttentionByProject={activeAcpAttentionByProject}
-            activeAcpProjectId={activeAcpChat?.projectId ?? null}
-            onActivateAcpChat={restoreActiveAcpForProject}
-            onRemoveAcpChat={removeAcpChatForProject}
-            onOpenAcpChat={openAcpChat}
             onOverlayOpenChange={setTerminalManagerOverlayOpen}
             onUpdateFilter={(terminalManagerFilter: TerminalManagerFilter) => {
               setConfig((prev) => prev ? withTerminalManagerFilter(prev, terminalManagerFilter) : prev);
@@ -1476,20 +1204,7 @@ function App() {
       )}
 
       <div className="main-area" ref={mainRef}>
-        {activeAcpChat && acpProject ? (
-          <AcpErrorBoundary key={activeAcpChat.chatId} onClose={closeAcpChat}>
-            <AcpChatPanel
-              project={acpProject}
-              chatId={activeAcpChat.chatId}
-              config={config || defaultAppConfig()}
-              onClose={closeAcpChat}
-              disabled={settingsOpen}
-              branchName={branchNameByProject.get(activeAcpChat.projectId)}
-              draft={acpDraftByChatId.get(activeAcpChat.chatId)}
-              onDraftChange={(id, text) => setAcpDraftByChatId((prev) => { const next = new Map(prev); next.set(id, text); return next; })}
-            />
-          </AcpErrorBoundary>
-        ) : fileEditorOpen && fileEditorPath && fileEditorName ? (
+        {fileEditorOpen && fileEditorPath && fileEditorName ? (
           <FileEditor
             filePath={fileEditorPath}
             displayName={fileEditorName}
@@ -1543,9 +1258,7 @@ function App() {
                 setRightPanelTab(tab);
                 if (tab === 'browser' && selectedProjectId) {
                   const hasForegroundTerminal = terminals.some((t) => t.projectId === selectedProjectId && t.kind === 'foreground' && !t.exited);
-                  const prefix = `${selectedProjectId}:`;
-                  const hasAcpChat = Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix));
-                  if (hasForegroundTerminal || hasAcpChat) {
+                  if (hasForegroundTerminal) {
                     setBrowserOpenProjects((prev) => {
                       const next = new Set(prev);
                       next.add(selectedProjectId);

@@ -39,33 +39,20 @@ export function canAutoDispatch(
   return true;
 }
 
-export function canAutoDispatchClaude(
-  queue: SmartInputTask[],
-  aiStatus: string,
-  aiAttentionKind: string | undefined,
-  promptSubmitSince: number | undefined,
-  now: number,
-): boolean {
-  if (queue.length === 0) return false;
-  if (aiStatus !== 'attention' || aiAttentionKind !== 'turn_complete') return false;
-  if (isStaleOpencodeCompletion(promptSubmitSince, now)) return false;
-  return true;
-}
-
 export function shouldShowSmartInputFooter(
   terminalKind: string,
   aiTool: string | undefined,
-  aiStatus: string | undefined,
   opencodeSessionActive: boolean,
-  claudeLaunchPending = false,
 ): boolean {
-  if (terminalKind !== 'foreground') return false;
-  if (aiTool === 'opencode') return opencodeSessionActive;
-  if (aiTool === 'claude') {
-    const effectiveStatus = effectiveAiStatusForDisplay(aiTool, aiStatus, claudeLaunchPending);
-    return effectiveStatus === 'running' || effectiveStatus === 'attention';
-  }
-  return false;
+  return terminalKind === 'foreground' && aiTool === 'opencode' && opencodeSessionActive;
+}
+
+export function removeMentionFromInput(input: string, mention: string): string {
+  const idx = input.lastIndexOf(mention);
+  if (idx < 0) return input;
+  const before = input.slice(0, idx);
+  const after = input.slice(idx + mention.length);
+  return before.endsWith(' ') ? before.slice(0, -1) + after : before + after;
 }
 
 export function effectiveAiStatusForDisplay(

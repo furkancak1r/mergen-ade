@@ -14,10 +14,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
@@ -35,8 +35,10 @@ jobs:
 
       - name: Package Windows portable ZIP
         shell: pwsh
+        env:
+          RELEASE_REF_NAME: ${{ github.ref_name }}
         run: |
-          $version = "${{ github.ref_name }}"
+          $version = "$env:RELEASE_REF_NAME"
           $asset = "mergen-ade-$version-windows-x64-portable.zip"
           New-Item -ItemType Directory -Force release-windows/scripts | Out-Null
           Copy-Item "electron/out/Mergen ADE.exe" "release-windows/mergen-ade.exe" -Force
@@ -46,7 +48,7 @@ jobs:
           Compress-Archive -Path "release-windows/*" -DestinationPath $asset -Force
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-windows
           path: mergen-ade-*-windows-x64-portable.zip
@@ -57,10 +59,10 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
@@ -109,7 +111,7 @@ jobs:
           APPLE_NOTARY_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_NOTARY_API_PRIVATE_KEY_BASE64 }}
 
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-macos
           path: electron/out/mergen-ade-*-macos-arm64.dmg
@@ -124,7 +126,7 @@ jobs:
     if: needs.build-windows.result == 'success' && needs.build-macos.result == 'success'
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           merge-multiple: true
@@ -134,7 +136,7 @@ jobs:
         run: ls -al release-assets
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release-assets/*
           generate_release_notes: true

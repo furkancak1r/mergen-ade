@@ -1,7 +1,4 @@
-import type { AcpRouteMode } from '../../../shared/acpRoute';
-import { acpRouteLabel, normalizeAcpRouteMode } from '../../../shared/acpRoute';
-
-export type SmartInputModeId = AcpRouteMode;
+export type SmartInputModeId = 'auto' | 'build' | 'plan' | 'codex_plan';
 export type RuntimeSmartInputModeId = 'build' | 'plan';
 
 export const normalizeSmartInputModeId = (modeId?: string): RuntimeSmartInputModeId => {
@@ -13,8 +10,10 @@ export const toggleSmartInputModeId = (modeId: SmartInputModeId): SmartInputMode
 };
 
 export const smartInputModeLabel = (modeId?: string): string | undefined => {
-  const route = normalizeAcpRouteMode(modeId);
-  return route === 'build' ? undefined : acpRouteLabel(route);
+  if (modeId === 'plan') return 'Plan';
+  if (modeId === 'codex_plan') return 'Codex Plan';
+  if (modeId === 'build') return undefined;
+  return 'Auto';
 };
 
 export const shouldSendOpenCodeModeToggle = (currentMode: string | undefined, targetMode: string | undefined): boolean => {

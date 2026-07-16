@@ -36,56 +36,41 @@ export const supportedShellsForPlatform = (): ShellKind[] => {
 export enum BuiltinLauncherKind {
   Droid = 'droid',
   Codex = 'codex',
-  CodexAcp = 'codex_acp',
   OpenCode = 'opencode',
   Claude = 'claude',
-  OpenCodeAcp = 'opencode_acp',
-  ClaudeAcp = 'claude_acp',
 }
 
 export const BuiltinLauncherKindAll: BuiltinLauncherKind[] = [
   BuiltinLauncherKind.OpenCode,
-  BuiltinLauncherKind.OpenCodeAcp,
   BuiltinLauncherKind.Codex,
-  BuiltinLauncherKind.CodexAcp,
   BuiltinLauncherKind.Droid,
   BuiltinLauncherKind.Claude,
-  BuiltinLauncherKind.ClaudeAcp,
 ];
 
 export const BuiltinLauncherKindId = (kind: BuiltinLauncherKind): string => {
   switch (kind) {
     case BuiltinLauncherKind.Codex: return 'codex';
-    case BuiltinLauncherKind.CodexAcp: return 'codex_acp';
     case BuiltinLauncherKind.Claude: return 'claude';
     case BuiltinLauncherKind.Droid: return 'droid';
     case BuiltinLauncherKind.OpenCode: return 'opencode';
-    case BuiltinLauncherKind.OpenCodeAcp: return 'opencode_acp';
-    case BuiltinLauncherKind.ClaudeAcp: return 'claude_acp';
   }
 };
 
 export const BuiltinLauncherKindDefaultDisplayName = (kind: BuiltinLauncherKind): string => {
   switch (kind) {
     case BuiltinLauncherKind.Codex: return 'Codex';
-    case BuiltinLauncherKind.CodexAcp: return 'Codex ACP';
     case BuiltinLauncherKind.Claude: return 'Claude';
     case BuiltinLauncherKind.Droid: return 'Droid';
     case BuiltinLauncherKind.OpenCode: return 'OpenCode';
-    case BuiltinLauncherKind.OpenCodeAcp: return 'OpenCode ACP';
-    case BuiltinLauncherKind.ClaudeAcp: return 'Claude ACP';
   }
 };
 
 export const BuiltinLauncherKindDefaultLaunchCommand = (kind: BuiltinLauncherKind): string => {
   switch (kind) {
     case BuiltinLauncherKind.Codex: return 'codex';
-    case BuiltinLauncherKind.CodexAcp: return '';
     case BuiltinLauncherKind.Claude: return defaultClaudeLaunchCommand();
     case BuiltinLauncherKind.Droid: return 'droid';
     case BuiltinLauncherKind.OpenCode: return 'opencode';
-    case BuiltinLauncherKind.OpenCodeAcp: return '';
-    case BuiltinLauncherKind.ClaudeAcp: return '';
   }
 };
 
@@ -95,7 +80,7 @@ export const defaultClaudeLaunchCommand = (): string =>
 export const normalizeBuiltinLaunchCommand = (kind: BuiltinLauncherKind, command: string): string => {
   const trimmed = command.trim();
   if (trimmed.length === 0) return BuiltinLauncherKindDefaultLaunchCommand(kind);
-  if (kind === BuiltinLauncherKind.Claude || kind === BuiltinLauncherKind.ClaudeAcp) return normalizeClaudeLaunchCommand(trimmed);
+  if (kind === BuiltinLauncherKind.Claude) return normalizeClaudeLaunchCommand(trimmed);
   return trimmed;
 };
 
@@ -195,15 +180,12 @@ export const defaultLaunchers = (): LauncherEntry[] =>
     iconKey: (() => {
       switch (kind) {
         case BuiltinLauncherKind.Codex: return LauncherIconKey.Codex;
-        case BuiltinLauncherKind.CodexAcp: return LauncherIconKey.Codex;
         case BuiltinLauncherKind.Claude: return LauncherIconKey.Claude;
         case BuiltinLauncherKind.Droid: return LauncherIconKey.Droid;
         case BuiltinLauncherKind.OpenCode: return LauncherIconKey.OpenCode;
-        case BuiltinLauncherKind.OpenCodeAcp: return LauncherIconKey.OpenCode;
-        case BuiltinLauncherKind.ClaudeAcp: return LauncherIconKey.Claude;
       }
     })(),
-    bypassPermissions: kind === BuiltinLauncherKind.Claude || kind === BuiltinLauncherKind.ClaudeAcp,
+    bypassPermissions: kind === BuiltinLauncherKind.Claude,
   }));
 
 export enum TerminalKind {
@@ -330,11 +312,6 @@ export const defaultAppHistory = (): AppHistory => ({
   projects: {},
 });
 
-export interface OpenCodeAcpModelEntry {
-  value: string;
-  name: string;
-}
-
 export const APP_CONFIG_VERSION = 2;
 export const DEFAULT_OPENCODE_BUILD_MODEL = 'mimo/mimo-v2.5-pro';
 export const DEFAULT_OPENCODE_PLAN_MODEL = 'openai/gpt-5.5-fast';
@@ -343,8 +320,6 @@ export const DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED = true;
 export const DEFAULT_OPENCODE_BUILD_STEPS_LIMIT = 32;
 export const DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS = 600_000;
 export const DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS = 120_000;
-export const DEFAULT_OPENCODE_ACP_BIND_MODEL_TO_MODE = true;
-export const DEFAULT_OPENCODE_ACP_AUTO_APPROVE_PERMISSIONS = false;
 export const DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS = true;
 
 export interface OpenCodeModelConfig {
@@ -353,14 +328,10 @@ export interface OpenCodeModelConfig {
   planModel: string;
   planEffort: string;
   activeBuildModelSlot: string;
-  acpFavoriteModels: string[];
-  acpKnownModels: OpenCodeAcpModelEntry[];
-  acpBindModelToMode: boolean;
   loopProtectionEnabled: boolean;
   buildStepsLimit: number;
   fireworksTimeoutMs: number;
   fireworksChunkTimeoutMs: number;
-  acpAutoApprovePermissions: boolean;
   kimiStrictPermissions: boolean;
 }
 
@@ -371,17 +342,12 @@ export const defaultOpenCodeModelConfig = (): OpenCodeModelConfig => {
     planModel: DEFAULT_OPENCODE_PLAN_MODEL,
     planEffort: DEFAULT_OPENCODE_PLAN_EFFORT,
     activeBuildModelSlot: 'a',
-    acpFavoriteModels: [],
-    acpKnownModels: [],
-    acpBindModelToMode: DEFAULT_OPENCODE_ACP_BIND_MODEL_TO_MODE,
     loopProtectionEnabled: DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED,
     buildStepsLimit: DEFAULT_OPENCODE_BUILD_STEPS_LIMIT,
     fireworksTimeoutMs: DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
     fireworksChunkTimeoutMs: DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS,
-    acpAutoApprovePermissions: DEFAULT_OPENCODE_ACP_AUTO_APPROVE_PERMISSIONS,
     kimiStrictPermissions: DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS,
   };
-  ensureConfiguredModelsAreFavorites(config);
   return config;
 };
 
@@ -413,82 +379,6 @@ export const effectiveFireworksTimeoutMs = (config: OpenCodeModelConfig): number
 export const effectiveFireworksChunkTimeoutMs = (config: OpenCodeModelConfig): number => {
   if (config.fireworksChunkTimeoutMs === 0) return DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS;
   return config.fireworksChunkTimeoutMs;
-};
-
-export const isAcpModelFavorite = (config: OpenCodeModelConfig, value: string): boolean => {
-  const v = value.trim();
-  return config.acpFavoriteModels.some((x) => x === v);
-};
-
-export const addAcpModelFavorite = (config: OpenCodeModelConfig, value: string): boolean => {
-  const v = value.trim();
-  if (!v || isAcpModelFavorite(config, v)) return false;
-  config.acpFavoriteModels.push(v);
-  return true;
-};
-
-export const toggleAcpModelFavorite = (config: OpenCodeModelConfig, value: string): boolean => {
-  const v = value.trim();
-  if (!v) return false;
-  const idx = config.acpFavoriteModels.indexOf(v);
-  if (idx >= 0) {
-    config.acpFavoriteModels.splice(idx, 1);
-    return false;
-  }
-  config.acpFavoriteModels.push(v);
-  return true;
-};
-
-export const normalizeAcpFavoriteModels = (config: OpenCodeModelConfig): boolean => {
-  const before = config.acpFavoriteModels;
-  const seen = new Set<string>();
-  config.acpFavoriteModels = before.filter((value) => {
-    const v = value.trim();
-    if (!v || seen.has(v)) return false;
-    seen.add(v);
-    return true;
-  });
-  return config.acpFavoriteModels.length !== before.length || config.acpFavoriteModels.some((v, i) => v !== before[i]);
-};
-
-export const ensureConfiguredModelsAreFavorites = (config: OpenCodeModelConfig): boolean => {
-  const configured = [
-    config.buildModelSlotA.trim(),
-    config.buildModelSlotB.trim(),
-    effectivePlanModel(config).trim(),
-  ];
-  let changed = normalizeAcpFavoriteModels(config);
-  for (const m of configured) {
-    if (m) changed ||= addAcpModelFavorite(config, m);
-  }
-  return changed;
-};
-
-export const normalizeAcpKnownModels = (config: OpenCodeModelConfig): void => {
-  const seen = new Set<string>();
-  config.acpKnownModels = config.acpKnownModels.filter((e) => {
-    if (!e.value || seen.has(e.value)) return false;
-    seen.add(e.value);
-    return true;
-  });
-};
-
-export const mergeAcpKnownModels = (config: OpenCodeModelConfig, options: Iterable<[string, string]>): boolean => {
-  let changed = false;
-  for (const [value, name] of options) {
-    const existing = config.acpKnownModels.find((e) => e.value === value);
-    if (existing) {
-      if (existing.name !== name) {
-        existing.name = name;
-        changed = true;
-      }
-    } else {
-      config.acpKnownModels.push({ value, name });
-      changed = true;
-    }
-  }
-  normalizeAcpKnownModels(config);
-  return changed;
 };
 
 export interface ShortcutModifiers {
@@ -539,35 +429,6 @@ export const defaultOsNotificationConfig = (): OsNotificationConfig => ({
   cooldownSecs: 30,
 });
 
-export interface AcpModeToggleShortcut {
-  key: string;
-  modifiers: ShortcutModifiers;
-  enabled: boolean;
-}
-
-export const defaultAcpModeToggleShortcut = (): AcpModeToggleShortcut => ({
-  key: 'Tab',
-  modifiers: defaultShortcutModifiers(),
-  enabled: true,
-});
-
-export enum AcpStartupMode {
-  Build = 'build',
-  Plan = 'plan',
-}
-
-export const AcpStartupModeLabel: Record<AcpStartupMode, string> = {
-  [AcpStartupMode.Build]: 'Default',
-  [AcpStartupMode.Plan]: 'Plan',
-};
-
-export const AcpStartupModeAsModeId = (mode: AcpStartupMode): string => {
-  switch (mode) {
-    case AcpStartupMode.Build: return 'build';
-    case AcpStartupMode.Plan: return 'plan';
-  }
-};
-
 export interface AiCliConfig {
   // per-project AI CLI settings
 }
@@ -595,8 +456,6 @@ export interface AppConfig {
   aiHooks: AiHooksConfig;
   opencode: OpenCodeModelConfig;
   notifications: OsNotificationConfig;
-  acpModeToggleShortcut: AcpModeToggleShortcut;
-  acpStartupMode: AcpStartupMode;
 }
 
 export const defaultAppConfig = (): AppConfig => ({
@@ -610,8 +469,6 @@ export const defaultAppConfig = (): AppConfig => ({
   aiHooks: defaultAiHooksConfig(),
   opencode: defaultOpenCodeModelConfig(),
   notifications: defaultOsNotificationConfig(),
-  acpModeToggleShortcut: defaultAcpModeToggleShortcut(),
-  acpStartupMode: AcpStartupMode.Plan,
 });
 
 export enum AiCliTool {
@@ -820,151 +677,6 @@ export interface GitFileDiff {
   error?: string;
 }
 
-export interface AcpChatSession {
-  sessionId?: string;
-  status: 'starting' | 'connected' | 'session_created' | 'idle' | 'running' | 'permission' | 'error';
-  title?: string;
-  timeline: AcpTimelineItem[];
-  messages: AcpChatMessage[];
-  promptInput: string;
-  attachments: string[];
-  configOptions: AcpConfigOption[];
-  currentModeId?: string;
-  currentModel?: string;
-  currentEffort?: string;
-  availableCommands?: AcpAvailableCommand[];
-  queuedPrompts: QueuedAcpPrompt[];
-  partialStderr?: string;
-  tool?: 'opencode' | 'claude_acp' | 'codex_acp';
-}
-
-export interface AcpChatMessage {
-  role: 'user' | 'assistant' | 'system';
-  text: string;
-  timestamp: number;
-}
-
-export type AcpTimelineToolStatus = 'pending' | 'running' | 'completed' | 'failed' | 'unknown';
-
-export type AcpTimelineNoticeKind = 'stderr' | 'warning' | 'error' | 'cancelled';
-
-export type AcpTimelineItem =
-  | AcpTimelineMessageItem
-  | AcpTimelineToolItem
-  | AcpTimelinePermissionItem
-  | AcpTimelineNoticeItem
-  | AcpTimelineThinkingItem
-  | AcpTimelineChangeSummaryItem
-  | AcpTimelineStatusItem;
-
-export interface AcpTimelineMessageItem {
-  id: string;
-  type: 'message';
-  role: 'user' | 'assistant' | 'system';
-  text: string;
-  timestamp: number;
-}
-
-export interface AcpTimelineToolItem {
-  id: string;
-  type: 'tool';
-  toolCallId: string;
-  title: string;
-  kind: string;
-  status: AcpTimelineToolStatus;
-  startedAt: number;
-  updatedAt: number;
-  raw?: unknown;
-}
-
-export interface AcpTimelinePermissionItem {
-  id: string;
-  type: 'permission';
-  interactionKind: 'permission' | 'question';
-  requestId: string;
-  header: string;
-  question: string;
-  options: OpenCodeQuestionOption[];
-  status: 'pending' | 'answered' | 'rejected';
-  timestamp: number;
-}
-
-export interface AcpTimelineNoticeItem {
-  id: string;
-  type: 'notice';
-  kind: AcpTimelineNoticeKind;
-  text: string;
-  timestamp: number;
-}
-
-export interface AcpTimelineThinkingItem {
-  id: string;
-  type: 'thinking';
-  text: string;
-  timestamp: number;
-}
-
-export interface AcpTimelineChangeSummaryFile {
-  path: string;
-  status: string;
-  staged: boolean;
-  addedLines: number;
-  removedLines: number;
-  binary: boolean;
-  error?: string;
-}
-
-export interface AcpTimelineChangeSummaryItem {
-  id: string;
-  type: 'change_summary';
-  files: AcpTimelineChangeSummaryFile[];
-  totalFiles: number;
-  addedLines: number;
-  removedLines: number;
-  signature: string;
-  timestamp: number;
-}
-
-export type AcpTimelineStatusKind = 'compact' | 'context' | 'status' | 'cost' | 'terminal' | 'info';
-
-export interface AcpTimelineStatusItem {
-  id: string;
-  type: 'status';
-  kind: AcpTimelineStatusKind;
-  title: string;
-  text: string;
-  timestamp: number;
-}
-
-export interface AcpConfigOption {
-  id: string;
-  name: string;
-  category: string;
-  currentValue: string;
-  options: { label: string; value: string }[];
-}
-
-export interface AcpAvailableCommand {
-  id: string;
-  name: string;
-  description?: string;
-}
-
-export interface QueuedAcpPrompt {
-  text: string;
-  attachments: string[];
-  modeId: string;
-  finalPromptText: string;
-}
-
-export interface AcpStandbyEntry {
-  chatId: string;
-  sessionId?: string;
-  status: AcpChatSession['status'];
-  projectId: number;
-  retryCooldownUntil?: number;
-}
-
 export interface FileEditorState {
   open: boolean;
   visible: boolean;
@@ -1053,26 +765,6 @@ export interface IpcChannels {
   'claudeCodex:runReview': (opts: import('./claudeCodexHook').ClaudeCodexReviewRequest) => Promise<import('./claudeCodexHook').ClaudeCodexReviewResult>;
   'claudeCodex:updateUiVerification': (opts: { planPath: string; note: string }) => Promise<boolean>;
 
-  // ACP
-  'acp:spawn': (opts: { projectId: number; cwd: string; mcpServers: string[]; tool?: string }) => Promise<string>;
-  'acp:send': (opts: { chatId: string; promptText: string; attachments: string[]; modeId?: string }) => Promise<void>;
-  'acp:cancel': (chatId: string) => Promise<void>;
-  'acp:setConfigOption': (opts: { chatId: string; configId: string; value: string }) => Promise<void>;
-  'acp:permissionResponse': (opts: { chatId: string; requestId: string; answers: string[]; rejected: boolean }) => Promise<boolean>;
-  'acp:questionResponse': (opts: { chatId: string; requestId: string; answers: string[][]; rejected: boolean }) => Promise<boolean>;
-  'acp:getSession': (chatId: string) => Promise<AcpChatSession | undefined>;
-  'acp:queueRunNext': (opts: { chatId: string; index: number }) => Promise<boolean>;
-  'acp:queueDelete': (opts: { chatId: string; index: number }) => Promise<boolean>;
-  'acp:queueMove': (opts: { chatId: string; fromIndex: number; toIndex: number }) => Promise<boolean>;
-  'acp:queueRestore': (opts: { chatId: string; index: number; prompt: QueuedAcpPrompt }) => Promise<boolean>;
-  'acp:event': (chatId: string, event: unknown) => void;
-  'acp:standby:warm': (projectId: number, cwd: string) => Promise<void>;
-  'acp:standby:get': (projectId: number) => Promise<AcpStandbyEntry | undefined>;
-  'acp:standby:clear': (projectId: number) => Promise<void>;
-  'acp:standby:promote': (projectId: number, visibleChatId: string) => Promise<AcpStandbyEntry | undefined>;
-  'acp:standby:clearAll': () => Promise<void>;
-  'acp:kill': (chatId: string) => Promise<void>;
-
   // Browser
   'browser:navigate': (opts: { scope: BrowserScopeKey; url: string }) => Promise<void>;
   'browser:syncBounds': (opts: { scope: BrowserScopeKey; x: number; y: number; width: number; height: number }) => Promise<void>;
@@ -1148,9 +840,9 @@ export interface BrowserMcpAuthScope {
   sessionId: string;
 }
 
-export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'diagnostics:get' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'git:diffSummary' | 'git:fileDiff' | 'git:status' | 'git:discoverWorktrees' | 'git:createWorktree' | 'git:removeWorktree' | 'git:copyEnvFiles' | 'acp:spawn' | 'acp:send' | 'acp:cancel' | 'acp:setConfigOption' | 'acp:permissionResponse' | 'acp:questionResponse' | 'acp:getSession' | 'acp:queueRunNext' | 'acp:queueDelete' | 'acp:queueMove' | 'acp:queueRestore' | 'acp:kill' | 'acp:standby:warm' | 'acp:standby:get' | 'acp:standby:clear' | 'acp:standby:promote' | 'acp:standby:clearAll' | 'hook:answer' | 'claudeCodex:runPlan' | 'claudeCodex:runReview' | 'claudeCodex:updateUiVerification' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'shell:openPath' | 'shell:showItemInFolder' | 'notify:show' | 'window:confirmClose'>;
+export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'diagnostics:get' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'git:diffSummary' | 'git:fileDiff' | 'git:status' | 'git:discoverWorktrees' | 'git:createWorktree' | 'git:removeWorktree' | 'git:copyEnvFiles' | 'hook:answer' | 'claudeCodex:runPlan' | 'claudeCodex:runReview' | 'claudeCodex:updateUiVerification' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'shell:openPath' | 'shell:showItemInFolder' | 'notify:show' | 'window:confirmClose'>;
 
-export type IpcSendChannel = keyof Pick<IpcChannels, 'pty:data' | 'pty:exit' | 'hook:status' | 'acp:event' | 'browser:urlChanged' | 'browser:tabOpened' | 'browser:tabsChanged' | 'browser:designElementClicked' | 'window:closeRequest' | 'window:focused'>;
+export type IpcSendChannel = keyof Pick<IpcChannels, 'pty:data' | 'pty:exit' | 'hook:status' | 'browser:urlChanged' | 'browser:tabOpened' | 'browser:tabsChanged' | 'browser:designElementClicked' | 'window:closeRequest' | 'window:focused'>;
 
 export interface WindowState {
   width: number;

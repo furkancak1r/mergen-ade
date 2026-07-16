@@ -6155,3 +6155,39 @@
   - Added a regression test for Claude Code ACP plan args and prompt text.
 - Files/Commands touched: `electron/main/acpService.ts`, `electron/main/acpService.test.ts`, `.agents/claude-code.md`, `KNOWN_ISSUES.md`
 - References: User request 2026-06-15
+
+---
+
+#### Portable EXE terminal could not load node-pty native module {#electron-portable-node-pty-native-load}
+- Date: 2026-06-15
+- Context: User reported a packaged Electron dialog: `Terminal spawn failed` with `Failed to load native module: conpty.node` from a portable EXE Temp extraction path.
+- Symptoms/Impact:
+  - Opening a terminal in the portable Windows EXE failed before the shell started.
+  - The failure was tied to `node-pty` resolving native files from `resources/app.asar`.
+- Root cause:
+  - The `asarUnpack` glob used `node_modules/node-pty/**/*`, which unpacked nested native binaries but could leave root package files such as `package.json` out of `app.asar.unpacked`.
+  - On portable Temp extraction paths that use a Windows 8.3 short username segment, Electron's ASAR resolution could redirect `node-pty` package metadata reads to `app.asar.unpacked`, where the root metadata was missing.
+- Resolution:
+  - Changed the packaging globs so `node-pty` root metadata, runtime `lib/**` files, and native `prebuilds/**` are available in the unpacked tree.
+- Prevent recurrence:
+  - After packaging changes involving native modules, verify `resources/app.asar.unpacked/node_modules/node-pty/package.json` and run a packaged `node-pty` PTY smoke test.
+- Files/Commands touched: `electron/package.json`, `KNOWN_ISSUES.md`
+- References: User screenshot 2026-06-15
+
+---
+
+#### Codex env messages did not populate Background saved messages {#electron-codex-env-saved-messages-import}
+- Date: 2026-06-15
+- Context: User wanted Mergen Background saved messages to import Codex app environment-provided project/message data so the same project shows the same reusable messages.
+- Symptoms/Impact:
+  - Codex app env metadata could identify a project/message, but Mergen did not import it into `ProjectRecord.savedMessages`.
+  - Background Terminal Manager rows only showed messages already saved through Mergen config.
+- Root cause:
+  - Config loading had no Codex env import path for `CODEX_WORKSPACE_ROOT`, `CODEX_PROJECT_PATH`, `CODEX_PROJECT`, `CODEX_SAVED_MESSAGES_JSON`, or `CODEX_MESSAGE`.
+- Resolution:
+  - Added additive config-load import for Codex env saved messages, matching existing projects by path or unique `CODEX_PROJECT` name.
+  - Imported messages are trimmed, deduped, and synced across the root/worktree saved-message family without deleting existing messages.
+- Prevent recurrence:
+  - Added config tests for JSON and single-message imports, duplicate trimming, root/worktree family sync, invalid JSON, unmatched projects, and ambiguous project names.
+- Files/Commands touched: `electron/main/config.ts`, `electron/main/config.test.ts`, `KNOWN_ISSUES.md`
+- References: User request 2026-06-15

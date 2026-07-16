@@ -2,10 +2,12 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { BuiltinLauncherKind, BuiltinLauncherKindDefaultLaunchCommand, DEFAULT_OPENCODE_BUILD_MODEL, defaultAppConfig } from '../shared/types';
+import { BuiltinLauncherKind, BuiltinLauncherKindDefaultLaunchCommand, DEFAULT_OPENCODE_BUILD_MODEL, defaultAppConfig, type ProjectRecord } from '../shared/types';
 import { configPath, legacyConfigPath, loadConfig } from './config';
 
 const originalAppData = process.env.APPDATA;
+const CODEX_ENV_KEYS = ['CODEX_WORKSPACE_ROOT', 'CODEX_PROJECT_PATH', 'CODEX_PROJECT', 'CODEX_SAVED_MESSAGES_JSON', 'CODEX_MESSAGE'] as const;
+const originalCodexEnv = new Map<string, string | undefined>(CODEX_ENV_KEYS.map((key) => [key, process.env[key]]));
 let tempDir: string | undefined;
 
 function writeConfigJson(config: Record<string, unknown>) {
@@ -20,13 +22,42 @@ function writeConfigToml(content: string) {
   fs.writeFileSync(p, content, 'utf-8');
 }
 
+const project = (partial: Partial<ProjectRecord>): ProjectRecord => ({
+  id: partial.id ?? 1,
+  name: partial.name ?? 'Project',
+  path: partial.path ?? 'C:\\repo',
+  savedMessages: partial.savedMessages ?? [],
+  aiConfig: partial.aiConfig ?? {},
+  checklist: partial.checklist ?? [],
+  browserLastUrl: partial.browserLastUrl,
+  repoRoot: partial.repoRoot,
+  isWorktree: partial.isWorktree ?? false,
+});
+
+function clearCodexEnv() {
+  for (const key of CODEX_ENV_KEYS) delete process.env[key];
+}
+
+function restoreCodexEnv() {
+  for (const key of CODEX_ENV_KEYS) {
+    const original = originalCodexEnv.get(key);
+    if (original === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = original;
+    }
+  }
+}
+
 describe('config normalization', () => {
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mergen-electron-config-'));
     process.env.APPDATA = tempDir;
+    clearCodexEnv();
   });
 
   afterEach(() => {
+    restoreCodexEnv();
     if (originalAppData === undefined) {
       delete process.env.APPDATA;
     } else {
@@ -70,18 +101,37 @@ describe('config normalization', () => {
     expect(loadedClaude?.launchCommand).toBe(BuiltinLauncherKindDefaultLaunchCommand(BuiltinLauncherKind.Claude));
   });
 
-  it('adds the Codex ACP launcher to older launcher configs', () => {
+  it('removes ACP launchers from older launcher configs', () => {
     const config = defaultAppConfig();
-    config.launchers = config.launchers.filter((entry) => entry.builtin !== BuiltinLauncherKind.CodexAcp);
+    for (const id of ['opencode_acp', 'codex_acp', 'claude_acp']) {
+      config.launchers.push({
+        id,
+        builtin: id as BuiltinLauncherKind,
+        displayName: id,
+        launchCommand: '',
+        enabled: true,
+        iconKey: config.launchers[0].iconKey,
+      });
+    }
+    const legacy = config as unknown as Record<string, unknown>;
+    legacy.acpModeToggleShortcut = { key: 'Tab' };
+    legacy.acpStartupMode = 'plan';
+    Object.assign(config.opencode as unknown as Record<string, unknown>, {
+      acpFavoriteModels: ['legacy'],
+      acpKnownModels: [],
+      acpBindModelToMode: true,
+      acpAutoApprovePermissions: true,
+    });
     writeConfigJson(config as unknown as Record<string, unknown>);
 
-    const loadedCodexAcp = loadConfig().launchers.find((entry) => entry.builtin === BuiltinLauncherKind.CodexAcp);
-    expect(loadedCodexAcp).toMatchObject({
-      id: BuiltinLauncherKind.CodexAcp,
-      displayName: 'Codex ACP',
-      launchCommand: '',
-      enabled: true,
-    });
+    const loaded = loadConfig();
+    expect(loaded.launchers.some((entry) => entry.id.endsWith('_acp'))).toBe(false);
+    expect(loaded).not.toHaveProperty('acpModeToggleShortcut');
+    expect(loaded).not.toHaveProperty('acpStartupMode');
+    expect(loaded.opencode).not.toHaveProperty('acpFavoriteModels');
+    expect(loaded.opencode).not.toHaveProperty('acpKnownModels');
+    expect(loaded.opencode).not.toHaveProperty('acpBindModelToMode');
+    expect(loaded.opencode).not.toHaveProperty('acpAutoApprovePermissions');
   });
 
   it('migrates the old Kimi K2.5 OpenCode build default to Mimo', () => {
@@ -177,5 +227,98 @@ hooks_enabled = false
     expect(loaded.projects).toHaveLength(1);
     expect(loaded.projects[0].name).toBe('LegacyProject');
     expect(loaded.projects[0].savedMessages).toEqual(['cargo run']);
+  });
+
+  it('imports Codex env JSON saved messages by workspace root', () => {
+    const config = defaultAppConfig();
+    config.projects = [
+      project({ id: 1, name: 'Repo', path: 'C:\\repo', savedMessages: ['npm test'] }),
+    ];
+    writeConfigJson(config as unknown as Record<string, unknown>);
+    process.env.CODEX_WORKSPACE_ROOT = 'C:/repo/';
+    process.env.CODEX_SAVED_MESSAGES_JSON = JSON.stringify([' npm run dev ', 'npm test', '']);
+
+    const loaded = loadConfig();
+
+    expect(loaded.projects[0].savedMessages).toEqual(['npm test', 'npm run dev']);
+    const saved = JSON.parse(fs.readFileSync(configPath(), 'utf-8')) as { projects: ProjectRecord[] };
+    expect(saved.projects[0].savedMessages).toEqual(['npm test', 'npm run dev']);
+  });
+
+  it('falls back to a matching Codex project selector when an earlier selector is unmatched', () => {
+    const config = defaultAppConfig();
+    config.projects = [project({ id: 1, name: 'Repo', path: 'C:\\repo' })];
+    writeConfigJson(config as unknown as Record<string, unknown>);
+    process.env.CODEX_WORKSPACE_ROOT = 'C:\\missing';
+    process.env.CODEX_PROJECT_PATH = 'C:\\repo';
+    process.env.CODEX_MESSAGE = 'npm start';
+
+    expect(loadConfig().projects[0].savedMessages).toEqual(['npm start']);
+  });
+
+  it('imports a single Codex message by unique CODEX_PROJECT name', () => {
+    const config = defaultAppConfig();
+    config.projects = [
+      project({ id: 1, name: 'Named Project', path: 'C:\\named' }),
+    ];
+    writeConfigJson(config as unknown as Record<string, unknown>);
+    process.env.CODEX_PROJECT = 'Named Project';
+    process.env.CODEX_MESSAGE = ' npm start ';
+
+    const loaded = loadConfig();
+
+    expect(loaded.projects[0].savedMessages).toEqual(['npm start']);
+  });
+
+  it('syncs Codex env messages across the root/worktree saved-message family', () => {
+    const config = defaultAppConfig();
+    config.projects = [
+      project({ id: 1, name: 'Root', path: 'C:\\repo', savedMessages: ['root command'] }),
+      project({ id: 2, name: 'Feature', path: 'C:\\worktrees\\feature', repoRoot: 'C:\\repo', isWorktree: true, savedMessages: ['worktree command'] }),
+      project({ id: 3, name: 'Other', path: 'C:\\other', savedMessages: ['keep'] }),
+    ];
+    writeConfigJson(config as unknown as Record<string, unknown>);
+    process.env.CODEX_WORKSPACE_ROOT = 'C:\\worktrees\\feature';
+    process.env.CODEX_SAVED_MESSAGES_JSON = JSON.stringify(['codex command']);
+
+    const loaded = loadConfig();
+
+    expect(loaded.projects[0].savedMessages).toEqual(['root command', 'worktree command', 'codex command']);
+    expect(loaded.projects[1].savedMessages).toEqual(['root command', 'worktree command', 'codex command']);
+    expect(loaded.projects[2].savedMessages).toEqual(['keep']);
+  });
+
+  it('ignores invalid Codex message JSON without changing matching projects', () => {
+    const config = defaultAppConfig();
+    config.projects = [
+      project({ id: 1, name: 'Repo', path: 'C:\\repo', savedMessages: ['keep'] }),
+    ];
+    writeConfigJson(config as unknown as Record<string, unknown>);
+    process.env.CODEX_WORKSPACE_ROOT = 'C:\\repo';
+    process.env.CODEX_SAVED_MESSAGES_JSON = '{not json';
+
+    const loaded = loadConfig();
+
+    expect(loaded.projects[0].savedMessages).toEqual(['keep']);
+  });
+
+  it('ignores unmatched and ambiguous Codex project selectors', () => {
+    const config = defaultAppConfig();
+    config.projects = [
+      project({ id: 1, name: 'Duplicate', path: 'C:\\one', savedMessages: ['one'] }),
+      project({ id: 2, name: 'Duplicate', path: 'C:\\two', savedMessages: ['two'] }),
+    ];
+    writeConfigJson(config as unknown as Record<string, unknown>);
+    process.env.CODEX_PROJECT = 'Duplicate';
+    process.env.CODEX_MESSAGE = 'codex command';
+
+    let loaded = loadConfig();
+    expect(loaded.projects[0].savedMessages).toEqual(['one']);
+    expect(loaded.projects[1].savedMessages).toEqual(['two']);
+
+    process.env.CODEX_PROJECT = 'Missing';
+    loaded = loadConfig();
+    expect(loaded.projects[0].savedMessages).toEqual(['one']);
+    expect(loaded.projects[1].savedMessages).toEqual(['two']);
   });
 });

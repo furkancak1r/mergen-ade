@@ -1,18 +1,10 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
-import type { AcpChatSession, AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry, AiCliTool } from '../../../shared/types';
+import type { AppConfig, TerminalKind, TerminalManagerFilter, ProjectRecord, LauncherEntry, AiCliTool } from '../../../shared/types';
 import { TerminalKind as TerminalKindEnum, TerminalManagerFilter as TerminalManagerFilterEnum, BuiltinLauncherKind, AiCliTool as AiCliToolEnum, activeBuildModel } from '../../../shared/types';
 import type { TerminalInstance } from '../hooks/usePty';
-import {
-  OPENCODE_ACP_OPEN_BUTTON_LABEL,
-  acpLabelForTool,
-  acpStatusText,
-  acpTerminalManagerRowLabel,
-  type AcpTerminalManagerAttentionReason,
-  type AcpTerminalManagerBadgeVisual,
-} from '../lib/acpUi';
 import { effectiveLauncherCommand } from '../lib/launcher';
 import { effectiveAiStatusForDisplay } from '../lib/smartInput';
-import { shouldShowForegroundLauncherButton, shouldShowOpenCodeAcpButton, terminalManagerPathMenuLabel } from '../lib/terminalManagerState';
+import { shouldShowForegroundLauncherButton, terminalManagerPathMenuLabel } from '../lib/terminalManagerState';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
 
@@ -88,13 +80,6 @@ interface TerminalManagerProps {
   onKillTerminal: (id: number) => void;
   rerunBackground: (terminalId: number) => void;
   sendSavedMessageToTerminal?: (terminalId: number, message: string, recordRecentInput: boolean) => void;
-  activeAcpChatByProject?: Map<string, string>;
-  activeAcpSessionByProject?: Map<string, AcpChatSession>;
-  activeAcpAttentionByProject?: Map<string, AcpTerminalManagerAttentionReason>;
-  activeAcpProjectId?: number | null;
-  onActivateAcpChat?: (projectId: number) => void;
-  onRemoveAcpChat?: (projectId: number) => void;
-  onOpenAcpChat?: (projectId: number, tool?: string) => void;
   onOverlayOpenChange?: (open: boolean) => void;
   onUpdateFilter?: (filter: TerminalManagerFilter) => void;
   onToggleHideInactiveProjects?: () => void;
@@ -111,28 +96,19 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
   onKillTerminal,
   rerunBackground,
   sendSavedMessageToTerminal,
-  activeAcpChatByProject,
-  activeAcpSessionByProject,
-  activeAcpAttentionByProject,
-  activeAcpProjectId,
-  onActivateAcpChat,
-  onRemoveAcpChat,
-  onOpenAcpChat,
   onOverlayOpenChange,
   onUpdateFilter,
   onToggleHideInactiveProjects,
 }) => {
-  // Only expand projects that have active terminals or ACP chats
+  // Only expand projects that have active terminals
   const initialExpanded = useMemo(() => {
     const expanded = new Set<number>();
     for (const p of config.projects) {
       const hasTerminal = terminals.some((t) => t.projectId === p.id && !t.exited);
-      const prefix = `${p.id}:`;
-      const hasAcp = activeAcpChatByProject ? Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(prefix)) : false;
-      if (hasTerminal || hasAcp) expanded.add(p.id);
+      if (hasTerminal) expanded.add(p.id);
     }
     return expanded;
-  }, [config.projects, terminals, activeAcpChatByProject]);
+  }, [config.projects, terminals]);
   const [expandedProjects, setExpandedProjects] = useState<Set<number>>(initialExpanded);
   const [showSavedMessages, setShowSavedMessages] = useState<number | null>(null);
   const [showLauncherMenu, setShowLauncherMenu] = useState<number | null>(null);
@@ -386,13 +362,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                 config={config}
                 allTerminals={terminals}
                 rootProject={project}
-                activeAcpChatByProject={activeAcpChatByProject}
-                activeAcpSessionByProject={activeAcpSessionByProject}
-                activeAcpAttentionByProject={activeAcpAttentionByProject}
-                activeAcpProjectId={activeAcpProjectId}
-                onActivateAcpChat={onActivateAcpChat}
-                onRemoveAcpChat={onRemoveAcpChat}
-                onOpenAcpChat={onOpenAcpChat}
                 onPathContextMenu={openPathContextMenu}
                 historyPopupTerminalId={historyPopupTerminalId}
                 setHistoryPopupTerminalId={(id) => {
@@ -427,13 +396,6 @@ export const TerminalManager: React.FC<TerminalManagerProps> = ({
                     allTerminals={terminals}
                     rootProject={project}
                     isWorktree
-                    activeAcpChatByProject={activeAcpChatByProject}
-                    activeAcpSessionByProject={activeAcpSessionByProject}
-                    activeAcpAttentionByProject={activeAcpAttentionByProject}
-                    activeAcpProjectId={activeAcpProjectId}
-                    onActivateAcpChat={onActivateAcpChat}
-                    onRemoveAcpChat={onRemoveAcpChat}
-                    onOpenAcpChat={onOpenAcpChat}
                     onPathContextMenu={openPathContextMenu}
                     historyPopupTerminalId={historyPopupTerminalId}
                     setHistoryPopupTerminalId={(id) => {
@@ -516,13 +478,6 @@ interface ProjectGroupProps {
   allTerminals: TerminalInstance[];
   rootProject?: ProjectRecord;
   isWorktree?: boolean;
-  activeAcpChatByProject?: Map<string, string>;
-  activeAcpSessionByProject?: Map<string, AcpChatSession>;
-  activeAcpAttentionByProject?: Map<string, AcpTerminalManagerAttentionReason>;
-  activeAcpProjectId?: number | null;
-  onActivateAcpChat?: (projectId: number) => void;
-  onRemoveAcpChat?: (projectId: number) => void;
-  onOpenAcpChat?: (projectId: number, tool?: string) => void;
   onPathContextMenu?: (event: React.MouseEvent, project: ProjectRecord, kind: TerminalManagerPathContextKind) => void;
   historyPopupTerminalId: number | null;
   setHistoryPopupTerminalId: (id: number | null) => void;
@@ -552,13 +507,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
   allTerminals,
   rootProject,
   isWorktree,
-  activeAcpChatByProject,
-  activeAcpSessionByProject,
-  activeAcpAttentionByProject,
-  activeAcpProjectId,
-  onActivateAcpChat,
-  onRemoveAcpChat,
-  onOpenAcpChat,
   onPathContextMenu,
   historyPopupTerminalId,
   setHistoryPopupTerminalId,
@@ -567,22 +515,12 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
 }) => {
   const [hoveredRow, setHoveredRow] = useState<number | null>(null);
   const [hoveredProject, setHoveredProject] = useState(false);
-  const [hoveredAcpRow, setHoveredAcpRow] = useState(false);
   const [launcherMenuButtonRect, setLauncherMenuButtonRect] = useState<DOMRect | null>(null);
   const effectiveSavedMessages = isWorktree && rootProject ? rootProject.savedMessages : project.savedMessages;
   const hasSavedMessages = effectiveSavedMessages.length > 0;
   const hasLiveTerminals = terminals.length > 0;
   const isSelected = activeTerminalId !== null && terminals.some((t) => t.id === activeTerminalId);
   const hasLiveTerminal = terminals.some((t) => !t.exited);
-  const acpKeyPrefix = `${project.id}:`;
-  const hasActiveAcpChat = activeAcpChatByProject ? Array.from(activeAcpChatByProject.keys()).some((k) => k.startsWith(acpKeyPrefix)) : false;
-  const activeAcpSession = activeAcpSessionByProject ? Array.from(activeAcpSessionByProject.entries()).find(([k]) => k.startsWith(acpKeyPrefix))?.[1] : undefined;
-  const activeAcpStatus = hasActiveAcpChat ? (activeAcpSession?.status ?? 'starting') : undefined;
-  const activeAcpAttention = activeAcpAttentionByProject ? Array.from(activeAcpAttentionByProject.entries()).find(([k]) => k.startsWith(acpKeyPrefix))?.[1] : undefined;
-  const activeAcpBadge = acpTerminalManagerRowBadgeVisual(activeAcpStatus, activeAcpAttention);
-  const activeAcpRow = activeAcpProjectId === project.id;
-  const activeAcpRowChrome = terminalManagerRowChrome(activeAcpRow, hoveredAcpRow);
-  const showOpenCodeAcpButton = shouldShowOpenCodeAcpButton(filter, hasActiveAcpChat);
   // Project header text color: bright only when has live terminal
   const headerTextColor = hasLiveTerminal ? TEXT_PRIMARY : withAlpha(TEXT_MUTED, 180);
 
@@ -694,18 +632,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                     onClick={async () => {
                       try {
                         setShowLauncherMenu(null);
-                        if (l.builtin === BuiltinLauncherKind.OpenCodeAcp) {
-                          onOpenAcpChat?.(project.id, 'opencode');
-                          return;
-                        }
-                        if (l.builtin === BuiltinLauncherKind.CodexAcp) {
-                          onOpenAcpChat?.(project.id, 'codex_acp');
-                          return;
-                        }
-                        if (l.builtin === BuiltinLauncherKind.ClaudeAcp) {
-                          onOpenAcpChat?.(project.id, 'claude_acp');
-                          return;
-                        }
                         const cmd = effectiveLauncherCommand(l, config.defaultShell);
                         if (l.builtin === BuiltinLauncherKind.OpenCode) {
                           const model = activeBuildModel(config.opencode);
@@ -812,83 +738,6 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
               </div>
             );
           })()}
-
-          {/* OpenCode ACP row - only in Foreground filter */}
-          {hasActiveAcpChat && filter === TerminalManagerFilterEnum.Foreground && (
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                height: CONTROL_ROW_HEIGHT,
-                padding: isWorktree ? '0 8px 0 36px' : '0 8px 0 24px',
-                cursor: 'pointer',
-                borderRadius: 8,
-                margin: '1px 4px',
-                position: 'relative',
-              }}
-              onClick={() => onActivateAcpChat?.(project.id)}
-              onMouseEnter={() => setHoveredAcpRow(true)}
-              onMouseLeave={() => setHoveredAcpRow(false)}
-            >
-              {(activeAcpRow || hoveredAcpRow) && (
-                <div style={{
-                  position: 'absolute',
-                  inset: 1,
-                  borderRadius: 8,
-                  background: activeAcpRowChrome.fill,
-                  border: activeAcpRowChrome.stroke,
-                  pointerEvents: 'none',
-                }} />
-              )}
-              <span
-                className={`terminal-ai-badge terminal-ai-badge--${activeAcpBadge.kind}`}
-                style={terminalManagerBadgeStyle(activeAcpBadge)}
-                data-tooltip={`${acpLabelForTool(activeAcpSession?.tool)}: ${acpStatusText(activeAcpStatus)}`}
-              />
-              <span style={{
-                fontSize: 11,
-                color: activeAcpStatus === 'error' ? BTN_RED : activeAcpRowChrome.titleColor,
-                flex: 1,
-                minWidth: 0,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-                marginLeft: 6,
-                zIndex: 1,
-              }}>
-                {acpTerminalManagerRowLabel(activeAcpSession)}
-              </span>
-              <div style={{ display: 'flex', gap: 2, zIndex: 1, minWidth: CONTROL_ROW_HEIGHT, marginLeft: 'auto', justifyContent: 'flex-end', flexShrink: 0 }}>
-                <div style={{ display: 'flex', gap: 2, visibility: (hoveredAcpRow || activeAcpRow) ? 'visible' : 'hidden' }}>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onRemoveAcpChat?.(project.id);
-                    }}
-                    style={{
-                      padding: '1px 4px',
-                      fontSize: 10,
-                      background: 'transparent',
-                      border: '1px solid #444',
-                      color: BTN_RED,
-                      borderRadius: 3,
-                      cursor: 'pointer',
-                      flexShrink: 0,
-                      width: CONTROL_ROW_HEIGHT,
-                      height: CONTROL_ROW_HEIGHT - 4,
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                    }}
-                    data-tooltip={`Close ${acpLabelForTool(activeAcpSession?.tool)}`}
-                  >
-                    ✕
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-          {/* OpenCode ACP button removed */}
 
           {/* Terminal rows */}
           {terminals.map((t) => {
@@ -1081,7 +930,7 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
               </div>
             );
           })}
-          {terminals.length === 0 && !hasActiveAcpChat && (
+          {terminals.length === 0 && (
             <div style={{ padding: '2px 8px 2px 24px', fontSize: 11, color: withAlpha(TEXT_MUTED, 120) }}>No terminals</div>
           )}
         </div>
@@ -1218,35 +1067,6 @@ interface RowChrome {
   fill: string;
   stroke: string;
   titleColor: string;
-}
-
-function acpTerminalManagerRowBadgeVisual(
-  status: AcpChatSession['status'] | undefined,
-  attentionReason?: AcpTerminalManagerAttentionReason,
-): AcpTerminalManagerBadgeVisual {
-  switch (status) {
-    case 'starting':
-    case 'connected':
-    case 'session_created':
-    case 'running':
-      return { kind: 'spinner', color: TERMINAL_AI_BADGE_RUNNING };
-    case 'permission':
-      return { kind: 'pulse', color: TERMINAL_AI_BADGE_ATTENTION };
-    case 'idle':
-      return attentionReason === 'turn_complete'
-        ? { kind: 'pulse', color: TERMINAL_AI_BADGE_ATTENTION }
-        : { kind: 'solid', color: TERMINAL_AI_BADGE_INACTIVE };
-    case 'error':
-      return { kind: 'solid', color: BTN_RED };
-    default:
-      return { kind: 'solid', color: TERMINAL_AI_BADGE_INACTIVE };
-  }
-}
-
-function terminalManagerBadgeStyle(badge: AcpTerminalManagerBadgeVisual): React.CSSProperties {
-  return badge.kind === 'spinner'
-    ? { borderColor: TERMINAL_AI_BADGE_RUNNING_BORDER, borderTopColor: badge.color }
-    : { background: badge.color };
 }
 
 function terminalManagerRowChrome(isActive: boolean, isHovered: boolean): RowChrome {

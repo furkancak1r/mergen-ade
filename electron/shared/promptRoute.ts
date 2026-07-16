@@ -1,36 +1,24 @@
-export type AcpRouteMode = 'auto' | 'build' | 'plan' | 'codex_plan';
-export type ResolvedAcpRouteMode = Exclude<AcpRouteMode, 'auto'>;
+export type PromptRouteMode = 'auto' | 'build' | 'plan' | 'codex_plan';
+type ResolvedPromptRouteMode = Exclude<PromptRouteMode, 'auto'>;
 
-export interface AcpRouteDecision {
-  route: ResolvedAcpRouteMode;
+export interface PromptRouteDecision {
+  route: ResolvedPromptRouteMode;
   auto: boolean;
   label: string;
   question?: string;
 }
 
-const labels: Record<ResolvedAcpRouteMode, string> = {
+const labels: Record<ResolvedPromptRouteMode, string> = {
   build: 'Build',
   plan: 'Plan',
   codex_plan: 'Codex Plan',
 };
 
-export function acpRouteLabel(route: string | undefined): string | undefined {
-  if (route === 'auto') return 'Auto';
-  if (route === 'build') return labels.build;
-  if (route === 'plan') return labels.plan;
-  if (route === 'codex_plan') return labels.codex_plan;
-  return route;
-}
-
-export function resetAcpRouteAfterSend(route: AcpRouteMode): AcpRouteMode {
-  return route === 'auto' ? 'auto' : 'auto';
-}
-
-export function resolveAcpRoute(
+export function resolvePromptRoute(
   prompt: string,
   opts: { selectedRoute?: string; allowCodexPlan?: boolean; attachmentCount?: number } = {},
-): AcpRouteDecision {
-  const selectedRoute = normalizeAcpRouteMode(opts.selectedRoute);
+): PromptRouteDecision {
+  const selectedRoute = normalizePromptRouteMode(opts.selectedRoute);
   const allowCodexPlan = opts.allowCodexPlan !== false;
   if (selectedRoute !== 'auto') {
     const route = selectedRoute === 'codex_plan' && !allowCodexPlan ? 'build' : selectedRoute;
@@ -52,7 +40,7 @@ export function resolveAcpRoute(
   return { route: 'build', auto: true, label: labels.build };
 }
 
-export function normalizeAcpRouteMode(route: string | undefined): AcpRouteMode {
+function normalizePromptRouteMode(route: string | undefined): PromptRouteMode {
   return route === 'build' || route === 'plan' || route === 'codex_plan' ? route : 'auto';
 }
 
@@ -66,7 +54,7 @@ function isGreetingOrAck(text: string): boolean {
 
 function isTinyDirectTask(text: string): boolean {
   if (text.length > 120) return false;
-  if (/\b(acp|hook|routing|provider|integration|workflow|state|queue|parser|protocol|bug|debug|refactor|feature|test|vitest|electron|renderer|main|shared)\b/.test(text)) {
+  if (/\b(hook|routing|provider|integration|workflow|state|queue|parser|protocol|bug|debug|refactor|feature|test|vitest|electron|renderer|main|shared)\b/.test(text)) {
     return false;
   }
   return /\b(buton|button|renk|color|text|label|yazı|typo|copy path|padding|margin)\b/.test(text)
@@ -83,7 +71,7 @@ function isPlanningConversation(text: string): boolean {
 function isMediumComplexCodingWork(text: string, attachmentCount: number): boolean {
   if (attachmentCount > 0 && text.length > 80) return true;
   const matches = [
-    /\b(acp|hook|routing|provider|integration|workflow|state|queue|parser|protocol)\b/,
+    /\b(hook|routing|provider|integration|workflow|state|queue|parser|protocol)\b/,
     /\b(bug|debug|hata|regression|refactor|feature|özellik|implement|uygula)\b/,
     /\b(test|vitest|build|electron|renderer|main|shared)\b/,
     /\b(çok dosya|multi[- ]?file|birden fazla|karmaşık|riskli|complex)\b/,

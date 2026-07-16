@@ -5,14 +5,11 @@ import type {
   ShortcutModifiers,
   OpenCodeModelConfig,
   OsNotificationConfig,
-  AcpModeToggleShortcut,
-  AcpStartupMode,
   MainVisibilityMode,
   LauncherEntry,
   AppDiagnostics,
 } from '../../../shared/types';
 import {
-  AcpStartupModeLabel,
   BuiltinLauncherKind,
   BuiltinLauncherKindDefaultDisplayName,
   BuiltinLauncherKindDefaultLaunchCommand,
@@ -32,7 +29,6 @@ import {
   runtimeOverview,
   type ActiveTerminalDiagnostics,
 } from '../lib/diagnostics';
-import { OPENCODE_ACP_LABEL } from '../lib/acpUi';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> } }).mergenApi;
 
@@ -59,7 +55,6 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
   const [activeTab, setActiveTab] = useState<SettingsTab>('general');
   const [draft, setDraft] = useState<AppConfig>({ ...config });
   const [recordingShortcutIndex, setRecordingShortcutIndex] = useState<number | null>(null);
-  const [recordingAcpShortcut, setRecordingAcpShortcut] = useState(false);
   const [diagnostics, setDiagnostics] = useState<AppDiagnostics | undefined>();
   const [diagnosticsError, setDiagnosticsError] = useState<string | undefined>();
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
@@ -96,10 +91,6 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
 
   const updateNotifications = useCallback((partial: Partial<OsNotificationConfig>) => {
     setDraft((prev) => ({ ...prev, notifications: { ...prev.notifications, ...partial } }));
-  }, []);
-
-  const updateAcpModeToggle = useCallback((partial: Partial<AcpModeToggleShortcut>) => {
-    setDraft((prev) => ({ ...prev, acpModeToggleShortcut: { ...prev.acpModeToggleShortcut, ...partial } }));
   }, []);
 
   const updateShortcut = useCallback((index: number, partial: Partial<TerminalShortcutEntry>) => {
@@ -234,27 +225,6 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
     [updateShortcut]
   );
 
-  const handleAcpKeyCapture = useCallback(
-    (e: React.KeyboardEvent) => {
-      e.preventDefault();
-      const key = e.key;
-      if (key === 'Escape') {
-        setRecordingAcpShortcut(false);
-        return;
-      }
-      const onMac = navigator.platform.toLowerCase().includes('mac');
-      const modifiers: ShortcutModifiers = {
-        ctrl: e.ctrlKey,
-        alt: e.altKey,
-        shift: e.shiftKey,
-        command: onMac ? e.metaKey : false,
-      };
-      updateAcpModeToggle({ key, modifiers });
-      setRecordingAcpShortcut(false);
-    },
-    [updateAcpModeToggle]
-  );
-
   const duplicateShortcuts = (() => {
     const combos = new Map<string, number[]>();
     draft.terminalShortcuts.forEach((s, i) => {
@@ -385,17 +355,6 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
                   Lets Auto or the Codex mode run Codex planning before Mergen-submitted Claude Code prompts.
                 </div>
               </div>
-              <div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 8 }}>ACP Startup Mode</div>
-                <select
-                  value={draft.acpStartupMode}
-                  onChange={(e) => setDraft((prev) => ({ ...prev, acpStartupMode: e.target.value as AcpStartupMode }))}
-                  style={{ background: '#1a1a1a', border: '1px solid #333', color: '#ccc', padding: '4px 8px', fontSize: 12, borderRadius: 4 }}
-                >
-                  <option value="build">{AcpStartupModeLabel.build}</option>
-                  <option value="plan">{AcpStartupModeLabel.plan}</option>
-                </select>
-              </div>
             </div>
           )}
 
@@ -404,7 +363,7 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
               <div style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>Foreground Launchers</div>
               {draft.launchers.map((launcher, i) => {
                 const isBuiltin = Boolean(launcher.builtin);
-                const isClaude = launcher.builtin === BuiltinLauncherKind.Claude || launcher.builtin === BuiltinLauncherKind.ClaudeAcp;
+                const isClaude = launcher.builtin === BuiltinLauncherKind.Claude;
                 const stem = launcherCommandStem(launcher.launchCommand);
                 const displayNameMissing = launcher.displayName.trim().length === 0;
                 const commandMissing = launcher.launchCommand.trim().length === 0;
@@ -619,15 +578,6 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <input
                   type="checkbox"
-                  checked={draft.opencode.acpBindModelToMode}
-                  onChange={(e) => updateOpenCode({ acpBindModelToMode: e.target.checked })}
-                  id="acpBind"
-                />
-                <label htmlFor="acpBind" style={{ fontSize: 12, color: '#ccc' }}>Bind ACP model to mode</label>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <input
-                  type="checkbox"
                   checked={draft.opencode.loopProtectionEnabled}
                   onChange={(e) => updateOpenCode({ loopProtectionEnabled: e.target.checked })}
                   id="loopProtection"
@@ -642,67 +592,6 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, activeTerm
                   id="kimiStrict"
                 />
                 <label htmlFor="kimiStrict" style={{ fontSize: 12, color: '#ccc' }}>Kimi strict permissions (ask mode)</label>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <input
-                  type="checkbox"
-                  checked={draft.opencode.acpAutoApprovePermissions}
-                  onChange={(e) => updateOpenCode({ acpAutoApprovePermissions: e.target.checked })}
-                  id="autoApprove"
-                />
-                <label htmlFor="autoApprove" style={{ fontSize: 12, color: '#ccc' }}>Auto-approve ACP permissions</label>
-              </div>
-              <div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 8 }}>{OPENCODE_ACP_LABEL} Mode Toggle Shortcut</div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <input
-                    type="checkbox"
-                    checked={draft.acpModeToggleShortcut.enabled}
-                    onChange={(e) => updateAcpModeToggle({ enabled: e.target.checked })}
-                    id="acpToggleEnabled"
-                  />
-                  <label htmlFor="acpToggleEnabled" style={{ fontSize: 12, color: '#ccc' }}>Enabled</label>
-                  <button
-                    onClick={() => setRecordingAcpShortcut(true)}
-                    onKeyDown={recordingAcpShortcut ? handleAcpKeyCapture : undefined}
-                    style={{ padding: '4px 12px', fontSize: 11, background: recordingAcpShortcut ? '#1f3a4c' : '#1a1a1a', border: '1px solid #333', color: '#ccc', borderRadius: 4, cursor: 'pointer', outline: recordingAcpShortcut ? '1px solid #0078d4' : 'none' }}
-                  >
-                    {recordingAcpShortcut ? 'Press key...' : formatShortcut(draft.acpModeToggleShortcut.key, draft.acpModeToggleShortcut.modifiers)}
-                  </button>
-                  {recordingAcpShortcut && (
-                    <span style={{ fontSize: 11, color: '#888' }}>Press Esc to cancel</span>
-                  )}
-                </div>
-              </div>
-              <div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 8 }}>{OPENCODE_ACP_LABEL} Favorite Models</div>
-                {draft.opencode.acpKnownModels.length === 0 ? (
-                  <div style={{ fontSize: 11, color: '#666' }}>No known models yet. Open {OPENCODE_ACP_LABEL} to populate this list.</div>
-                ) : (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    {draft.opencode.acpKnownModels.map((model) => {
-                      const isFavorite = draft.opencode.acpFavoriteModels.includes(model.value);
-                      return (
-                        <div key={model.value} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px', background: '#1a1a1a', borderRadius: 4 }}>
-                          <button
-                            onClick={() => {
-                              const next = isFavorite
-                                ? draft.opencode.acpFavoriteModels.filter((v) => v !== model.value)
-                                : [...draft.opencode.acpFavoriteModels, model.value];
-                              updateOpenCode({ acpFavoriteModels: next });
-                            }}
-                            style={{ background: 'transparent', border: 'none', color: isFavorite ? '#dcB43C' : '#666', cursor: 'pointer', fontSize: 12 }}
-                            title={isFavorite ? 'Unfavorite' : 'Favorite'}
-                          >
-                            {isFavorite ? '★' : '☆'}
-                          </button>
-                          <span style={{ fontSize: 12, color: '#ccc', flex: 1 }}>{model.name || model.value}</span>
-                          <span style={{ fontSize: 10, color: '#666' }}>{model.value}</span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
               </div>
             </div>
           )}

@@ -2,15 +2,25 @@ import { describe, it, expect } from 'vitest';
 import {
   isStaleOpencodeCompletion,
   canAutoDispatch,
-  canAutoDispatchClaude,
   effectiveAiStatusForDisplay,
   smartInputFooterHeight,
   selectionEdgeAutoscrollDelta,
   shouldShowSmartInputFooter,
+  removeMentionFromInput,
   SMART_INPUT_AUTO_DISPATCH_SETTLE_MS,
 } from './smartInput';
 
 describe('smartInput', () => {
+  describe('removeMentionFromInput', () => {
+    it('removes the last exact mention', () => {
+      expect(removeMentionFromInput('hello @file.ts world @file.ts', '@file.ts')).toBe('hello @file.ts world');
+    });
+
+    it('leaves missing mentions unchanged', () => {
+      expect(removeMentionFromInput('hello', '@missing')).toBe('hello');
+    });
+  });
+
   describe('isStaleOpencodeCompletion', () => {
     it('returns false when no submit timestamp', () => {
       expect(isStaleOpencodeCompletion(undefined, 1000)).toBe(false);
@@ -125,42 +135,17 @@ describe('smartInput', () => {
     });
   });
 
-  describe('canAutoDispatchClaude', () => {
-    it('allows Claude queue dispatch on turn-complete attention', () => {
-      expect(canAutoDispatchClaude(
-        [{ text: 'task', attachments: [] }],
-        'attention',
-        'turn_complete',
-        undefined,
-        Date.now(),
-      )).toBe(true);
-    });
-
-    it('blocks Claude queue dispatch for running, permission, empty queue, and settle guard', () => {
-      const queue = [{ text: 'task', attachments: [] }];
-      const now = Date.now();
-      expect(canAutoDispatchClaude(queue, 'running', undefined, undefined, now)).toBe(false);
-      expect(canAutoDispatchClaude(queue, 'attention', 'permission', undefined, now)).toBe(false);
-      expect(canAutoDispatchClaude([], 'attention', 'turn_complete', undefined, now)).toBe(false);
-      expect(canAutoDispatchClaude(queue, 'attention', 'turn_complete', now - 100, now)).toBe(false);
-    });
-  });
-
   describe('shouldShowSmartInputFooter', () => {
-    it('shows Smart Input for active OpenCode and Claude foreground terminals', () => {
-      expect(shouldShowSmartInputFooter('foreground', 'opencode', 'running', true)).toBe(true);
-      expect(shouldShowSmartInputFooter('foreground', 'claude', 'running', false)).toBe(true);
-      expect(shouldShowSmartInputFooter('foreground', 'claude', 'attention', false)).toBe(true);
-      expect(shouldShowSmartInputFooter('foreground', 'claude', 'inactive', false, true)).toBe(true);
+    it('shows Smart Input only for active OpenCode foreground terminals', () => {
+      expect(shouldShowSmartInputFooter('foreground', 'opencode', true)).toBe(true);
     });
 
     it('hides Smart Input for inactive/background terminals and inactive OpenCode sessions', () => {
-      expect(shouldShowSmartInputFooter('background', 'claude', 'attention', false)).toBe(false);
-      expect(shouldShowSmartInputFooter('foreground', 'claude', 'inactive', false)).toBe(false);
-      expect(shouldShowSmartInputFooter('foreground', 'opencode', 'attention', false)).toBe(false);
-      expect(shouldShowSmartInputFooter('foreground', 'codex', 'attention', false)).toBe(false);
-      expect(shouldShowSmartInputFooter('foreground', 'codex', 'running', true)).toBe(false);
-      expect(shouldShowSmartInputFooter('foreground', 'droid', 'running', true)).toBe(false);
+      expect(shouldShowSmartInputFooter('background', 'opencode', true)).toBe(false);
+      expect(shouldShowSmartInputFooter('foreground', 'opencode', false)).toBe(false);
+      expect(shouldShowSmartInputFooter('foreground', 'claude', true)).toBe(false);
+      expect(shouldShowSmartInputFooter('foreground', 'codex', true)).toBe(false);
+      expect(shouldShowSmartInputFooter('foreground', 'droid', true)).toBe(false);
     });
   });
 

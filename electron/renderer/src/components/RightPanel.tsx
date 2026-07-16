@@ -141,7 +141,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', padding: 24, gap: 16 }}>
             <span style={{ fontSize: 28, opacity: 0.3 }}>&#x25CE;</span>
             <span style={{ fontSize: 13, color: '#888', textAlign: 'center' }}>
-              Browser requires a foreground terminal or ACP chat.
+              Browser requires a foreground terminal.
             </span>
           </div>
         )}

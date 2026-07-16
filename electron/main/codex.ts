@@ -1,6 +1,7 @@
 import path from 'path';
 import fs from 'fs';
-import { spawn } from 'child_process';
+import os from 'os';
+import { spawn, spawnSync } from 'child_process';
 import { getHookServicePort, getHookInboxDir } from './hookService';
 
 export type CodexExecParsedEvent =
@@ -10,7 +11,7 @@ export type CodexExecParsedEvent =
   | { kind: 'status'; title: string; text: string };
 
 const DEFAULT_CODEX_INBOX_DIR = () => {
-  const appData = process.env.APPDATA || path.join(require('os').homedir(), 'AppData', 'Roaming');
+  const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
   return path.join(appData, 'Mergen', 'MergenADE', 'runtime', 'codex-cli');
 };
 
@@ -25,25 +26,10 @@ export function getCodexInboxDir(): string {
 }
 
 export function getCodexBinPath(): string {
-  try {
-    if (process.platform === 'win32') {
-      const result = require('child_process').execSync('where codex', { encoding: 'utf-8', timeout: 5000 });
-      const lines = result.split(/\r?\n/).map((s: string) => s.trim()).filter(Boolean);
-      const exeLine = lines.find((s: string) => s.toLowerCase().endsWith('.exe'));
-      if (exeLine) return exeLine;
-      const cmdLine = lines.find((s: string) => s.toLowerCase().endsWith('.cmd'));
-      if (cmdLine) return cmdLine;
-      if (lines[0]) return lines[0];
-    } else {
-      const result = require('child_process').execSync('which codex', { encoding: 'utf-8', timeout: 5000 });
-      const first = result.trim();
-      if (first) return first;
-    }
-  } catch {
-    // fallback below
-  }
+  const found = findCodexOnPath();
+  if (found) return found;
 
-  const homeDir = require('os').homedir();
+  const homeDir = os.homedir();
   const candidates = [
     path.join(homeDir, 'AppData', 'Roaming', 'npm', 'codex.cmd'),
     path.join(homeDir, 'AppData', 'Roaming', 'npm', 'codex'),
@@ -54,6 +40,24 @@ export function getCodexBinPath(): string {
     if (fs.existsSync(candidate)) return candidate;
   }
   return process.platform === 'win32' ? 'codex.cmd' : 'codex';
+}
+
+function findCodexOnPath(): string | undefined {
+  const command = process.platform === 'win32' ? 'where' : 'which';
+  const result = spawnSync(command, ['codex'], {
+    encoding: 'utf-8',
+    timeout: 5000,
+    windowsHide: true,
+    shell: false,
+  });
+  if (result.error || result.status !== 0) return undefined;
+  const lines = String(result.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  if (process.platform === 'win32') {
+    return lines.find((s) => s.toLowerCase().endsWith('.exe'))
+      || lines.find((s) => s.toLowerCase().endsWith('.cmd'))
+      || lines[0];
+  }
+  return lines[0];
 }
 
 export function codexExecJsonArgs(cwd: string): string[] {
@@ -247,8 +251,15 @@ export function killStaleCodexProcesses(): void {
 
 export function verifyCodexVersion(): string | null {
   try {
-    const result = require('child_process').execSync('npm list -g @openai/codex --depth=0', { encoding: 'utf-8', timeout: 10000 });
-    const match = result.match(/@openai\/codex@(\d+\.\d+\.\d+)/);
+    const command = npmCommand();
+    const result = spawnSync(command.file, [...command.args, 'list', '-g', '@openai/codex', '--depth=0'], {
+      encoding: 'utf-8',
+      timeout: 10000,
+      windowsHide: true,
+      shell: false,
+    });
+    if (result.error || result.status !== 0) return null;
+    const match = String(result.stdout || '').match(/@openai\/codex@(\d+\.\d+\.\d+)/);
     return match ? match[1] : null;
   } catch {
     return null;
@@ -258,10 +269,11 @@ export function verifyCodexVersion(): string | null {
 export function installCodexCli(): void {
   killStaleCodexProcesses();
   try {
-    const proc = spawn('npm', ['install', '-g', '@openai/codex'], {
+    const command = npmCommand();
+    const proc = spawn(command.file, [...command.args, 'install', '-g', '@openai/codex'], {
       stdio: 'inherit',
       windowsHide: true,
-      shell: process.platform === 'win32',
+      shell: false,
     });
     proc.on('exit', (code) => {
       if (code === 0) {
@@ -276,8 +288,15 @@ export function installCodexCli(): void {
   }
 }
 
+function npmCommand(): { file: string; args: string[] } {
+  if (process.platform !== 'win32') return { file: 'npm', args: [] };
+  const npmCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (fs.existsSync(npmCli)) return { file: process.execPath, args: [npmCli] };
+  return { file: 'cmd.exe', args: ['/d', '/s', '/c', 'npm'] };
+}
+
 function getCodexConfigDir(): string {
-  const homeDir = require('os').homedir();
+  const homeDir = os.homedir();
   const dir = path.join(homeDir, '.codex');
   fs.mkdirSync(dir, { recursive: true });
   return dir;

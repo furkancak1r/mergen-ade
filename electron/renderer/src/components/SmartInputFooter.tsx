@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import type { SmartInputState, SmartInputTask, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
-import { removeMentionFromInput } from '../lib/acpParser';
+import { removeMentionFromInput } from '../lib/smartInput';
 import { shouldReadNativeClipboardFilePaths, shouldReadNativeClipboardImage, snapshotClipboardPaste } from '../lib/clipboardPaste';
 import type { SmartInputModeId } from '../lib/smartInputMode';
 import { smartInputModeLabel, toggleSmartInputModeId } from '../lib/smartInputMode';
@@ -102,7 +102,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
     if (!question) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.altKey || e.metaKey) return;
-      // Do not steal keyboard events from other text inputs (ACP composer, file editor, etc.)
+      // Do not steal keyboard events from other text inputs such as the file editor.
       const active = document.activeElement;
       if (active) {
         const tag = active.tagName.toLowerCase();

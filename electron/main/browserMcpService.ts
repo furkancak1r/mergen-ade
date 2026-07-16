@@ -94,6 +94,7 @@ export function spawnBrowserMcpSession(sessionId: string, scope: BrowserScopeKey
   const proc = spawn(cmd[0], cmd.slice(1), {
     stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
     windowsHide: true,
+    shell: false,
   });
 
   const session: BrowserMcpSession = {
@@ -336,7 +337,7 @@ function startBrowserVideoRecording(scope: BrowserScopeKey): unknown {
   }
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const outputBasePath = path.join(browserRecordingsDir(projectId), `browser-recording-${stamp}`);
+  const outputBasePath = [browserRecordingsDir(projectId), `browser-recording-${stamp}`].join(path.sep);
   const state: BrowserVideoRecordingState = {
     scope,
     projectId,
@@ -865,10 +866,11 @@ function browserElementActionScript(action: 'click' | 'hover' | 'type' | 'select
 
 function browserPressKeyScript(key: string): string {
   return `(() => {
+    const key = ${js(key)};
     const el = document.activeElement || document.body;
-    el.dispatchEvent(new KeyboardEvent('keydown', { key: ${js(key)}, bubbles: true, cancelable: true }));
-    el.dispatchEvent(new KeyboardEvent('keyup', { key: ${js(key)}, bubbles: true, cancelable: true }));
-    return { success: true, text: 'Pressed key ${key.replace(/'/g, '')}' };
+    el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+    el.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true, cancelable: true }));
+    return { success: true, text: 'Pressed key ' + key };
   })()`;
 }
 
@@ -990,9 +992,12 @@ function browserWaitProbeScript(params: { selector: string; text: string; textGo
 function browserHighlightScript(params: Record<string, unknown>): string {
   const color = String(params.color || '#16a34a');
   const label = String(params.label || '');
-  const padding = Number(params.padding ?? 8);
-  const radius = Number(params.radius ?? 10);
+  const padding = Math.max(0, Math.min(100, Number(params.padding ?? 8) || 0));
+  const radius = Math.max(0, Math.min(100, Number(params.radius ?? 10) || 0));
   return `(() => {
+    const color = ${js(color)};
+    const padding = ${padding};
+    const radius = ${radius};
     ${browserFindElementPrelude(params)}
     const el = findElement();
     if (!el) return { success: false, error: 'Element not found' };
@@ -1001,11 +1006,11 @@ function browserHighlightScript(params: Record<string, unknown>): string {
     document.getElementById('__mergen-mcp-highlight')?.remove();
     const overlay = document.createElement('div');
     overlay.id = '__mergen-mcp-highlight';
-    overlay.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;border:3px solid ${color};border-radius:${radius}px;box-shadow:0 0 0 9999px rgba(0,0,0,0.08);left:' + Math.max(0, rect.left - ${padding}) + 'px;top:' + Math.max(0, rect.top - ${padding}) + 'px;width:' + (rect.width + ${padding} * 2) + 'px;height:' + (rect.height + ${padding} * 2) + 'px;';
+    overlay.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;border:3px solid ' + color + ';border-radius:' + radius + 'px;box-shadow:0 0 0 9999px rgba(0,0,0,0.08);left:' + Math.max(0, rect.left - padding) + 'px;top:' + Math.max(0, rect.top - padding) + 'px;width:' + (rect.width + padding * 2) + 'px;height:' + (rect.height + padding * 2) + 'px;';
     if (${js(label)}) {
       const badge = document.createElement('div');
       badge.textContent = ${js(label)};
-      badge.style.cssText = 'position:absolute;left:-3px;top:-24px;background:${color};color:white;font:12px sans-serif;padding:2px 6px;border-radius:4px;';
+      badge.style.cssText = 'position:absolute;left:-3px;top:-24px;background:' + color + ';color:white;font:12px sans-serif;padding:2px 6px;border-radius:4px;';
       overlay.appendChild(badge);
     }
     document.body.appendChild(overlay);

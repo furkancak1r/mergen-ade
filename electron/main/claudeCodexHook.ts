@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import {
   buildClaudeCodexFixPrompt,
   buildClaudeCodexImplementationPrompt,
@@ -16,6 +16,7 @@ import {
   renderClaudeCodexPlanFile,
   testSummary,
 } from '../shared/claudeCodexHook';
+import { getCodexBinPath } from './codex';
 
 let sessionCounter = 0;
 
@@ -27,7 +28,9 @@ export interface RunClaudeCodexPlanRequest {
 
 export async function runClaudeCodexPlan(request: RunClaudeCodexPlanRequest): Promise<ClaudeCodexPlanResult> {
   const sessionId = nextSessionId(request.terminalId);
-  const planPath = path.join(request.projectPath, '.claude', 'plans', `${sessionId}.md`);
+  const projectPath = safeProjectDir(request.projectPath);
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- safePlanPath enforces the generated file stays under this project's .claude/plans directory.
+  const planPath = safePlanPath(projectPath, path.join(projectPath, '.claude', 'plans', `${sessionId}.md`));
   writePlanFile(planPath, {
     sessionId,
     status: 'planned',
@@ -35,7 +38,7 @@ export async function runClaudeCodexPlan(request: RunClaudeCodexPlanRequest): Pr
   });
 
   const prompt = buildCodexPlanPrompt(request.originalPrompt, planPath);
-  const result = await runCodexExec(request.projectPath, prompt);
+  const result = await runCodexExec(projectPath, prompt);
   const plan = result.ok ? result.output : undefined;
   const planError = result.ok ? undefined : result.error;
 
@@ -63,8 +66,10 @@ export async function runClaudeCodexPlan(request: RunClaudeCodexPlanRequest): Pr
 }
 
 export async function runClaudeCodexReview(request: ClaudeCodexReviewRequest): Promise<ClaudeCodexReviewResult> {
+  const projectPath = safeProjectDir(request.projectPath);
+  const planPath = safePlanPath(projectPath, request.planPath);
   const reviewRound = request.reviewRound + 1;
-  writePlanFile(request.planPath, {
+  writePlanFile(planPath, {
     sessionId: request.sessionId,
     status: 'testing',
     originalPrompt: request.originalPrompt,
@@ -73,13 +78,13 @@ export async function runClaudeCodexReview(request: ClaudeCodexReviewRequest): P
     reviewRound,
   });
 
-  const commands = discoverTestCommands(request.projectPath);
-  const testResults = await runTestCommands(request.projectPath, commands);
+  const commands = discoverTestCommands(projectPath);
+  const testResults = await runTestCommands(projectPath, commands);
   const testNote = commands.length === 0 ? 'No test/lint/typecheck commands were detected.' : undefined;
   const summary = testSummary(testResults, testNote);
-  const uiChangedFiles = detectUiChangedFiles(request.projectPath);
+  const uiChangedFiles = detectUiChangedFiles(projectPath);
 
-  writePlanFile(request.planPath, {
+  writePlanFile(planPath, {
     sessionId: request.sessionId,
     status: 'reviewing',
     originalPrompt: request.originalPrompt,
@@ -91,8 +96,8 @@ export async function runClaudeCodexReview(request: ClaudeCodexReviewRequest): P
     uiChangedFiles,
   });
 
-  const reviewPrompt = buildCodexReviewPrompt(request.planPath, summary, reviewRound);
-  const review = await runCodexExec(request.projectPath, reviewPrompt);
+  const reviewPrompt = buildCodexReviewPrompt(planPath, summary, reviewRound);
+  const review = await runCodexExec(projectPath, reviewPrompt);
   const reviewOutput = review.ok ? review.output : undefined;
   const reviewError = review.ok ? undefined : review.error;
   const hasActionableFindings = review.ok ? reviewHasActionableFindings(review.output) : false;
@@ -115,14 +120,14 @@ export async function runClaudeCodexReview(request: ClaudeCodexReviewRequest): P
       finalNote = undefined;
       fixPrompt = buildClaudeCodexFixPrompt({
         reviewRound,
-        planPath: request.planPath,
+        planPath,
         reviewOutput,
         testSummary: summary,
       });
     }
   }
 
-  writePlanFile(request.planPath, {
+  writePlanFile(planPath, {
     sessionId: request.sessionId,
     status,
     originalPrompt: request.originalPrompt,
@@ -142,7 +147,7 @@ export async function runClaudeCodexReview(request: ClaudeCodexReviewRequest): P
 
   return {
     sessionId: request.sessionId,
-    planPath: request.planPath,
+    planPath,
     reviewRound,
     testResults,
     testNote,
@@ -158,8 +163,9 @@ export async function runClaudeCodexReview(request: ClaudeCodexReviewRequest): P
 }
 
 export function updateClaudeCodexUiVerification(opts: { planPath: string; note: string }): boolean {
-  if (!opts.planPath || !fs.existsSync(opts.planPath)) return false;
-  const text = fs.readFileSync(opts.planPath, 'utf-8');
+  const planPath = safeExistingPlanPath(opts.planPath);
+  if (!planPath) return false;
+  const text = fs.readFileSync(planPath, 'utf-8');
   const replacement = opts.note.trim() || 'UI verification unavailable.';
   let next = text.replace(
     'UI verification pending: UI-facing changed files were detected.',
@@ -173,7 +179,7 @@ export function updateClaudeCodexUiVerification(opts: { planPath: string; note: 
       next = `${text.trimEnd()}\n\n${replacement}\n`;
     }
   }
-  fs.writeFileSync(opts.planPath, next, 'utf-8');
+  fs.writeFileSync(planPath, next, 'utf-8');
   return true;
 }
 
@@ -187,6 +193,35 @@ function writePlanFile(planPath: string, content: Parameters<typeof renderClaude
   fs.writeFileSync(planPath, renderClaudeCodexPlanFile(content), 'utf-8');
 }
 
+function safeProjectDir(projectPath: string): string {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- The user-selected project directory is intentionally the root; statSync rejects missing and non-directory paths.
+  const resolved = path.resolve(projectPath);
+  const stat = fs.statSync(resolved);
+  if (!stat.isDirectory()) throw new Error('Project path is not a directory.');
+  return resolved;
+}
+
+function safePlanPath(projectPath: string, planPath: string): string {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- projectPath was resolved and verified by safeProjectDir.
+  const plansDir = path.join(projectPath, '.claude', 'plans');
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- The path.relative containment check below rejects traversal outside plansDir.
+  const resolved = path.resolve(planPath);
+  const relative = path.relative(plansDir, resolved);
+  if (relative.startsWith('..') || path.isAbsolute(relative) || path.basename(resolved) !== path.basename(planPath) || path.extname(resolved) !== '.md') {
+    throw new Error('Plan path must be a Markdown file under .claude/plans.');
+  }
+  return resolved;
+}
+
+function safeExistingPlanPath(planPath: string): string | undefined {
+  if (!planPath) return undefined;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- The following segment and extension checks restrict updates to existing .claude/plans/*.md files.
+  const resolved = path.resolve(planPath);
+  const parts = resolved.split(path.sep);
+  if (path.extname(resolved) !== '.md' || parts.at(-3) !== '.claude' || parts.at(-2) !== 'plans') return undefined;
+  return fs.existsSync(resolved) ? resolved : undefined;
+}
+
 interface TestCommand {
   label: string;
   program: string;
@@ -195,9 +230,11 @@ interface TestCommand {
 
 function discoverTestCommands(projectPath: string): TestCommand[] {
   const commands: TestCommand[] = [];
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- projectPath was resolved and verified by safeProjectDir.
   if (fs.existsSync(path.join(projectPath, 'Cargo.toml'))) {
     commands.push({ label: 'cargo test', program: cargoProgram(), args: ['test'] });
   }
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- projectPath was resolved and verified by safeProjectDir.
   const packageJsonPath = path.join(projectPath, 'package.json');
   if (fs.existsSync(packageJsonPath)) {
     try {
@@ -231,11 +268,15 @@ async function runTestCommand(projectPath: string, command: TestCommand): Promis
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(command.program, command.args, {
+      const isWindowsCommandShim = process.platform === 'win32' && command.program.toLowerCase().endsWith('.cmd');
+      const program = isWindowsCommandShim ? (process.env.ComSpec || 'cmd.exe') : command.program;
+      const args = isWindowsCommandShim ? ['/d', '/s', '/c', command.program, ...command.args] : command.args;
+      // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process -- program and args come only from the fixed commands built by discoverTestCommands; shell execution remains disabled.
+      child = spawn(program, args, {
         cwd: projectPath,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
-        shell: process.platform === 'win32',
+        shell: false,
       });
     } catch (error) {
       resolve({
@@ -271,17 +312,12 @@ function detectUiChangedFiles(projectPath: string): string[] {
 }
 
 function gitOutputLines(projectPath: string, args: string[]): string[] {
-  const result = spawnSyncText('git', ['-C', projectPath, ...args]);
-  if (!result.ok) return [];
-  return result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-}
-
-function spawnSyncText(program: string, args: string[]): { ok: boolean; stdout: string } {
-  const child = require('child_process').spawnSync(program, args, {
+  const child = spawnSync('git', ['-C', projectPath, ...args], {
     encoding: 'utf-8',
     windowsHide: true,
   }) as { status: number | null; stdout?: string };
-  return { ok: child.status === 0, stdout: child.stdout || '' };
+  if (child.status !== 0) return [];
+  return (child.stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
 function isUiFacingPath(filePath: string): boolean {
@@ -300,8 +336,10 @@ function isUiFacingPath(filePath: string): boolean {
 }
 
 async function runCodexExec(projectPath: string, prompt: string): Promise<{ ok: true; output: string } | { ok: false; error: string }> {
-  const program = codexProgram();
+  const command = codexCommand();
+  const program = command.program;
   const args = [
+    ...command.args,
     '--ask-for-approval',
     'never',
     'exec',
@@ -316,27 +354,12 @@ async function runCodexExec(projectPath: string, prompt: string): Promise<{ ok: 
   return new Promise((resolve) => {
     let child;
     try {
-      // On Windows, .cmd files require shell:true. Stdin piping through
-      // cmd.exe doesn't work, so pass prompt via temp file + shell redirect.
-      if (process.platform === 'win32') {
-        const tmpFile = path.join(os.tmpdir(), `mergen-codex-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
-        fs.writeFileSync(tmpFile, prompt, 'utf-8');
-        const quotedArgs = args.map((a) => `"${a}"`).join(' ');
-        child = spawn(`"${program}" ${quotedArgs} < "${tmpFile}"`, [], {
-          stdio: ['ignore', 'pipe', 'pipe'],
-          windowsHide: true,
-          shell: true,
-        });
-        const cleanup = () => { try { fs.unlinkSync(tmpFile); } catch { /* ignore */ } };
-        child.on('exit', cleanup);
-        child.on('error', cleanup);
-      } else {
-        child = spawn(program, args, {
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        });
-        child.stdin?.end(prompt);
-      }
+      child = spawn(program, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+        shell: false,
+      });
+      child.stdin?.end(prompt);
     } catch (error) {
       resolve({ ok: false, error: `Failed to start Codex CLI at ${program}: ${error instanceof Error ? error.message : String(error)}` });
       return;
@@ -366,14 +389,15 @@ async function runCodexExec(projectPath: string, prompt: string): Promise<{ ok: 
   });
 }
 
-function codexProgram(): string {
-  if (process.platform === 'win32') {
-    const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
-    const appDataCodex = path.join(appData, 'npm', 'codex.cmd');
-    if (fs.existsSync(appDataCodex)) return appDataCodex;
-    return 'codex.cmd';
+function codexCommand(): { program: string; args: string[] } {
+  const program = getCodexBinPath();
+  if (process.platform !== 'win32' || !program.toLowerCase().endsWith('.cmd')) {
+    return { program, args: [] };
   }
-  return 'codex';
+  const binDir = path.dirname(program);
+  const node = path.join(binDir, 'node.exe');
+  const cli = path.join(binDir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+  return { program: fs.existsSync(node) ? node : 'node.exe', args: [cli] };
 }
 
 function cargoProgram(): string {

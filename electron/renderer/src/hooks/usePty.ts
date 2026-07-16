@@ -2,11 +2,9 @@ import { useEffect, useRef, useCallback } from 'react';
 import { AiCliTool as AiCliToolEnum } from '../../../shared/types';
 import type { TerminalKind, ShellKind, AiHookEvent, AiCliTool, AiCliAttentionKind, SmartInputState, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
 import type { ClaudeCodexHookProgress } from '../../../shared/claudeCodexHook';
-import type { ClaudeCodexPlanResult } from '../../../shared/claudeCodexHook';
-import { resolveAcpRoute } from '../../../shared/acpRoute';
+import { resolvePromptRoute } from '../../../shared/promptRoute';
 import type { SmartInputModeId } from '../lib/smartInputMode';
 import { normalizeSmartInputModeId, shouldSendOpenCodeModeToggle } from '../lib/smartInputMode';
-import { canAutoDispatchClaude } from '../lib/smartInput';
 
 const SMART_INPUT_AUTO_DISPATCH_SETTLE_MS = 300;
 const OPENCODE_RUNNING_GRACE_MS = 2000;
@@ -74,8 +72,7 @@ function clearOpenCodeSessionState(t: TerminalInstance) {
   t.opencodeLastHookEventSince = undefined;
 }
 
-export function usePty(options: { allowClaudeCodexPlan?: boolean } = {}) {
-  const allowClaudeCodexPlan = options.allowClaudeCodexPlan === true;
+export function usePty() {
   const terminalsRef = useRef<Map<number, TerminalInstance>>(new Map());
   const listenersRef = useRef<Set<() => void>>(new Set());
 
@@ -497,41 +494,26 @@ export function usePty(options: { allowClaudeCodexPlan?: boolean } = {}) {
         }
 
         if (t.kind !== 'foreground') continue;
-        const isOpenCodeSmartInput = t.aiTool === 'opencode' && t.opencodeSessionActive;
-        const isClaudeSmartInput = t.aiTool === 'claude' && (t.aiStatus === 'running' || t.aiStatus === 'attention');
-        if (!isOpenCodeSmartInput && !isClaudeSmartInput) continue;
-        if (isOpenCodeSmartInput && t.opencodePendingQuestion) continue;
+        if (t.aiTool !== 'opencode' || !t.opencodeSessionActive) continue;
+        if (t.opencodePendingQuestion) continue;
         if (t.smartInputState.queue.length === 0) continue;
 
         // Kimi thought-loop guard blocks auto-dispatch only
-        if (isOpenCodeSmartInput && (t.opencodeThoughtLoopBlocked || t.opencodeLoopLimitEmitted)) continue;
+        if (t.opencodeThoughtLoopBlocked || t.opencodeLoopLimitEmitted) continue;
 
-        // Stale Working recovery: clear stale Working if no hook event for 6s
-        if (isOpenCodeSmartInput && t.opencodeTransportStatus === 'Working') {
-          const lastHook = t.opencodeLastHookEventSince ?? 0;
-          if (now - lastHook > OPENCODE_RUNNING_GRACE_MS * 3) {
-            t.opencodeTransportStatus = 'Idle';
-            notify();
-          }
-        }
+        // Auto-dispatch only when Idle AND the last attention reason was TurnComplete
+        const isIdle = t.opencodeTransportStatus === 'Idle';
+        const hasTurnComplete = t.opencodeAttentionReason === 'turn_complete';
+        if (!isIdle || !hasTurnComplete) continue;
 
-        if (isOpenCodeSmartInput) {
-          // Auto-dispatch only when Idle AND the last attention reason was TurnComplete
-          const isIdle = t.opencodeTransportStatus === 'Idle';
-          const hasTurnComplete = t.opencodeAttentionReason === 'turn_complete';
-          if (!isIdle || !hasTurnComplete) continue;
-
-          // Settle guard: suppress stale Idle within 300ms of prompt submit
-          const submitSince = t.opencodePromptSubmitSince ?? 0;
-          if (now - submitSince < SMART_INPUT_AUTO_DISPATCH_SETTLE_MS) continue;
-        } else if (!canAutoDispatchClaude(t.smartInputState.queue, t.aiStatus, t.aiAttentionKind, t.opencodePromptSubmitSince, now)) {
-          continue;
-        }
+        // Settle guard: suppress stale Idle within 300ms of prompt submit
+        const submitSince = t.opencodePromptSubmitSince ?? 0;
+        if (now - submitSince < SMART_INPUT_AUTO_DISPATCH_SETTLE_MS) continue;
 
         const task = t.smartInputState.queue[0];
-        const route = resolveAcpRoute(task.text, {
+        const route = resolvePromptRoute(task.text, {
           selectedRoute: task.modeId,
-          allowCodexPlan: isClaudeSmartInput && allowClaudeCodexPlan && task.attachments.length === 0,
+          allowCodexPlan: false,
           attachmentCount: task.attachments.length,
         });
         const nextQueue = t.smartInputState.queue.slice(1);
@@ -540,96 +522,11 @@ export function usePty(options: { allowClaudeCodexPlan?: boolean } = {}) {
           queue: nextQueue,
         };
 
-        if (route.question && isClaudeSmartInput) {
-          t.claudeCodexHookProgress = {
-            phase: 'blocked',
-            sessionId: 'auto-route',
-            error: route.question,
-          };
-          notify();
-          continue;
-        }
-
         t.opencodePromptSubmitSince = now;
-        if (isOpenCodeSmartInput) {
-          t.opencodeTransportStatus = 'Working';
-        } else {
-          t.aiStatus = 'running';
-          t.aiAttentionKind = undefined;
-        }
+        t.opencodeTransportStatus = 'Working';
 
         // Clear previous delayed enters
         t.pendingDelayedEnters = [];
-
-        if (isClaudeSmartInput && route.route === 'codex_plan') {
-          t.claudeCodexHookProgress = {
-            phase: 'planning',
-            sessionId: 'pending',
-          };
-          if (task.text.trim()) {
-            pushRecentInput(t.id, task.text);
-          }
-          api.invoke('claudeCodex:runPlan', {
-            terminalId: t.id,
-            projectPath: t.cwd,
-            originalPrompt: task.text.trim(),
-          }).then((value) => {
-            const current = terminalsRef.current.get(t.id);
-            if (!current) return;
-            const result = value as ClaudeCodexPlanResult;
-            current.claudeCodexHookProgress = {
-              phase: 'awaiting_implementation',
-              sessionId: result.sessionId,
-              planPath: result.planPath,
-              error: result.planError,
-              originalPrompt: task.text.trim(),
-              plan: result.plan,
-              planError: result.planError,
-              reviewRound: 0,
-            };
-            const sendAt = Date.now();
-            current.opencodePromptSubmitSince = sendAt;
-            current.aiStatus = 'running';
-            current.aiAttentionKind = undefined;
-            current.claudeLaunchPending = false;
-            current.pendingDelayedEnters = [];
-            const payloadDelay = writeSmartInputPayload(current, result.implementationPrompt, [], 'build');
-            if (result.implementationPrompt.trim()) {
-              pushRecentInput(current.id, result.implementationPrompt);
-            }
-            current.pendingDelayedEnters.push(sendAt + payloadDelay + 600);
-            current.pendingDelayedEnters.push(sendAt + payloadDelay + 1200);
-            notify();
-          }).catch((error) => {
-            const current = terminalsRef.current.get(t.id);
-            if (!current) return;
-            const message = error instanceof Error ? error.message : String(error);
-            current.claudeCodexHookProgress = {
-              phase: 'awaiting_implementation',
-              sessionId: 'failed',
-              error: message,
-              originalPrompt: task.text.trim(),
-              planError: message,
-              reviewRound: 0,
-            };
-            const fallback = `${task.text.trim()}\n\nCodex pre-implementation step failed; continue with the original prompt using normal implementation flow.\n\nPre-step error:\n${message}`;
-            const sendAt = Date.now();
-            current.opencodePromptSubmitSince = sendAt;
-            current.aiStatus = 'running';
-            current.aiAttentionKind = undefined;
-            current.claudeLaunchPending = false;
-            current.pendingDelayedEnters = [];
-            const payloadDelay = writeSmartInputPayload(current, fallback, [], 'build');
-            if (fallback.trim()) {
-              pushRecentInput(current.id, fallback);
-            }
-            current.pendingDelayedEnters.push(sendAt + payloadDelay + 600);
-            current.pendingDelayedEnters.push(sendAt + payloadDelay + 1200);
-            notify();
-          });
-          notify();
-          continue;
-        }
 
         const runtimeMode = route.route === 'plan' ? 'plan' : 'build';
         const payloadDelay = writeSmartInputPayload(t, task.text, task.attachments, runtimeMode);
@@ -646,7 +543,7 @@ export function usePty(options: { allowClaudeCodexPlan?: boolean } = {}) {
       }
     }, 100);
     return () => clearInterval(interval);
-  }, [allowClaudeCodexPlan, notify, pushRecentInput, writeSmartInputPayload]);
+  }, [notify, pushRecentInput, writeSmartInputPayload]);
 
   const getTerminals = useCallback(() => {
     return Array.from(terminalsRef.current.values());
