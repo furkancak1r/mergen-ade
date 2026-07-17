@@ -1,8 +1,11 @@
-import { spawn } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import JSON5 from 'json5';
 import { DEFAULT_OPENCODE_BUILD_MODEL } from '../shared/types';
 import { getHookServicePort, getHookInboxDir } from './hookService';
+import { getBrowserMcpStdioConfig } from './browserMcpCommand';
+import { resolveChildPath } from './safePath';
 
 // OpenCode process detection and plugin lifecycle
 const MIMO_PROVIDER_ID = 'mimo';
@@ -178,9 +181,8 @@ export function getOpencodeBinPath(): string {
   return 'opencode';
 }
 
-export function handleOpencodeNotifyMode(): boolean {
+export function handleOpencodeNotifyMode(args = process.argv.slice(2)): boolean {
   try {
-    const args = process.argv.slice(2);
     const eventName = args[0];
     const eventJson = args[1];
     if (!eventName) {
@@ -230,6 +232,51 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? (value as Record<string, unknown>)
     : undefined;
 
+export async function verifyOpencodePonytailPlugin(
+  configDir = path.join(process.env.XDG_CONFIG_HOME || path.join(require('os').homedir(), '.config'), 'opencode'),
+): Promise<string> {
+  let pluginPath: string | undefined;
+  for (const name of ['config.json', 'opencode.json', 'opencode.jsonc']) {
+    const configPath = resolveChildPath(configDir, name);
+    if (!fs.existsSync(configPath)) continue;
+    let config: Record<string, unknown>;
+    try {
+      config = asRecord(JSON5.parse(fs.readFileSync(configPath, 'utf-8'))) ?? {};
+    } catch (err) {
+      throw new Error(`OpenCode Ponytail preflight failed: invalid ${name} (${err instanceof Error ? err.message : String(err)})`);
+    }
+    const entry = Array.isArray(config.plugin)
+      ? config.plugin.find((value): value is string => typeof value === 'string' && /ponytail/i.test(value))
+      : undefined;
+    if (entry) pluginPath = resolveChildPath(configDir, entry);
+  }
+
+  if (!pluginPath || !fs.existsSync(pluginPath)) {
+    throw new Error('OpenCode Ponytail preflight failed: configured plugin module is missing');
+  }
+
+  const probe = `
+    import { pathToFileURL } from 'node:url';
+    const plugin = await import(pathToFileURL(process.argv[1]).href + '?preflight=' + Date.now());
+    if (typeof plugin.default !== 'function') throw new Error('default plugin factory is missing');
+    const hooks = await plugin.default();
+    const transform = hooks['experimental.chat.system.transform'];
+    if (typeof transform !== 'function') throw new Error('system transform hook is missing');
+    const output = { system: [] };
+    await transform({}, output);
+    if (!output.system.some((value) => /ponytail/i.test(value))) throw new Error('plugin mode is inactive');
+  `;
+  await new Promise<void>((resolve, reject) => execFile(
+    process.execPath,
+    ['--input-type=module', '--eval', probe, pluginPath],
+    { encoding: 'utf-8', timeout: 10_000, windowsHide: true, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } },
+    (error, _stdout, stderr) => error
+      ? reject(new Error(`OpenCode Ponytail preflight failed: plugin runtime check failed (${error.message || stderr})`))
+      : resolve(),
+  ));
+  return pluginPath;
+}
+
 function addMimoProvider(config: Record<string, unknown>, model: string): void {
   if (!model.trim().startsWith(`${MIMO_PROVIDER_ID}/`)) return;
 
@@ -263,17 +310,18 @@ export function generateOpencodeRuntimeConfig(cwd: string, opts: {
   // Write to global OpenCode config so it does not overwrite per-project terminal config
   const configPath = getOpencodeGlobalConfigPath();
 
-  const mcpServers: Record<string, { command: string[]; enabled: boolean }> = {};
+  const mcpServers: Record<string, { command: string[]; enabled: boolean; environment?: Record<string, string> }> = {};
   // Disable external browser MCP servers
   for (const name of ['playwright', 'browser', 'puppeteer']) {
     mcpServers[name] = { command: ['echo', 'disabled'], enabled: false };
   }
 
   // Enable mergen-browser MCP
-  const exe = process.execPath;
+  const helper = getBrowserMcpStdioConfig();
   mcpServers['mergen-browser'] = {
-    command: [exe, '--browser-mcp-helper', '--caps=devtools,vision,network,storage'],
+    command: [helper.command, ...helper.args],
     enabled: true,
+    environment: helper.env,
   };
 
   if (opts.mcpServers) {
@@ -335,20 +383,41 @@ export function generateOpencodeTerminalConfig(cwd: string, opts: {
     : { '*': 'allow', 'edit': 'allow', 'task/external_directory': 'allow', 'bash': 'allow' };
   const model = opts.model?.trim() || DEFAULT_OPENCODE_BUILD_MODEL;
 
-  const config: Record<string, unknown> = {
-    agent: {
-      build: {
-        model,
-        permission,
-      },
-    },
-    mode: {
-      build: {
-        model,
-        permission,
-      },
-    },
-  };
+  // ponytail: JSON5 keeps OpenCode's comment/trailing-comma semantics; formatting is normalized on write.
+  const parsed = fs.existsSync(configPath)
+    ? JSON5.parse(fs.readFileSync(configPath, 'utf-8'))
+    : {};
+  const config = asRecord(parsed);
+  if (!config) {
+    throw new Error('OpenCode project config must contain a JSON object');
+  }
+
+  const agent = asRecord(config.agent) ?? {};
+  config.agent = agent;
+  agent.build = { ...(asRecord(agent.build) ?? {}), model, permission };
+
+  const mode = asRecord(config.mode) ?? {};
+  config.mode = mode;
+  mode.build = { ...(asRecord(mode.build) ?? {}), model, permission };
+
+  const mcp = asRecord(config.mcp) ?? {};
+  config.mcp = mcp;
+  const hasMergen = Object.prototype.hasOwnProperty.call(mcp, 'mergen-browser');
+  const existingMergen = asRecord(mcp['mergen-browser']);
+  const existingCommand = existingMergen?.command;
+  const isManagedMergen = Array.isArray(existingCommand) && existingCommand.some((part) =>
+    part === '--browser-mcp-helper' || (typeof part === 'string' && /browser-mcp-helper\.js$/i.test(part))
+  );
+  if (!hasMergen || isManagedMergen) {
+    const helper = getBrowserMcpStdioConfig();
+    mcp['mergen-browser'] = {
+      ...(existingMergen ?? {}),
+      type: 'local',
+      command: [helper.command, ...helper.args],
+      enabled: true,
+      environment: helper.env,
+    };
+  }
   addMimoProvider(config, model);
 
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');

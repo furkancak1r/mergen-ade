@@ -788,7 +788,8 @@ export interface IpcChannels {
   'browser:showActive': (scope: BrowserScopeKey) => Promise<void>;
   'browser:destroyInstance': (scope: BrowserScopeKey) => Promise<void>;
 
-  // OpenCode config
+  // AI CLI config
+  'codex:generateTerminalConfig': (opts: { cwd: string }) => Promise<string>;
   'opencode:generateTerminalConfig': (opts: { cwd: string; model?: string; effort?: string; kimiStrictPermissions?: boolean }) => Promise<string>;
   'opencode:generateRuntimeConfig': (opts: { cwd: string; model?: string; effort?: string; mcpServers?: string[]; kimiStrictPermissions?: boolean }) => Promise<string>;
 
@@ -840,7 +841,7 @@ export interface BrowserMcpAuthScope {
   sessionId: string;
 }
 
-export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'diagnostics:get' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'git:diffSummary' | 'git:fileDiff' | 'git:status' | 'git:discoverWorktrees' | 'git:createWorktree' | 'git:removeWorktree' | 'git:copyEnvFiles' | 'hook:answer' | 'claudeCodex:runPlan' | 'claudeCodex:runReview' | 'claudeCodex:updateUiVerification' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'shell:openPath' | 'shell:showItemInFolder' | 'notify:show' | 'window:confirmClose'>;
+export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'diagnostics:get' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'git:diffSummary' | 'git:fileDiff' | 'git:status' | 'git:discoverWorktrees' | 'git:createWorktree' | 'git:removeWorktree' | 'git:copyEnvFiles' | 'hook:answer' | 'claudeCodex:runPlan' | 'claudeCodex:runReview' | 'claudeCodex:updateUiVerification' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'codex:generateTerminalConfig' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'shell:openPath' | 'shell:showItemInFolder' | 'notify:show' | 'window:confirmClose'>;
 
 export type IpcSendChannel = keyof Pick<IpcChannels, 'pty:data' | 'pty:exit' | 'hook:status' | 'browser:urlChanged' | 'browser:tabOpened' | 'browser:tabsChanged' | 'browser:designElementClicked' | 'window:closeRequest' | 'window:focused'>;
 

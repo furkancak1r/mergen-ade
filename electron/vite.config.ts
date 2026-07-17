@@ -35,6 +35,16 @@ export default defineConfig({
           },
         },
       },
+      {
+        entry: '../main/browserMcpCli.ts',
+        vite: {
+          build: {
+            lib: {
+              fileName: 'browser-mcp-helper',
+            },
+          },
+        },
+      },
     ]),
   ],
   root: 'renderer',

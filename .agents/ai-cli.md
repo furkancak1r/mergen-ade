@@ -1,7 +1,8 @@
 # AI CLI Integration Guidelines
 
 ## AI CLI Integration
-- **Supported AI tools:** `Factory Droid`, `Codex CLI`, `OpenCode`, and `Claude Code` are supported. Codex CLI uses hook-only integration.
+- **Supported AI tools:** `Factory Droid`, `Codex CLI`, `OpenCode`, and `Claude Code` are supported. Codex CLI uses hook-only state integration; browser tools use the project-local Mergen MCP entry.
+- **Ponytail is a launch prerequisite:** Built-in Codex/OpenCode launchers must fail closed before PTY creation unless the active Ponytail plugin passes its runtime preflight.
 - **Factory Droid hook format:** Only `droid-hook:*` and `factory-droid-hook:*` format patterns are recognized for Factory Droid. The `claude-hook:*` format is not supported.
 - **Factory Droid detection commands:** Only `droid` and `factory` trigger Factory Droid session detection. Do not add `cc`, `claude`, or other AI CLI commands.
 - **OpenCode detection commands:** `opencode` triggers OpenCode session detection. OpenCode is tracked through explicit launch detection, process-based status, visible UI/title parsing, notify/inbox status paths, and the Mergen-owned `mergen-opencode-status.js` plugin. If OpenCode hangs at `Loading plugins`, inspect MCP startup load before disabling the plugin path.
@@ -12,7 +13,7 @@
 - **Wheel hit-testing must use hover fallback.** Terminal wheel handling should use hover position before falling back to interaction position so passive wheel scrolling works.
 - **OpenCode manual scroll detach must reflect actual Mergen scroll.** Set `opencode_manual_scroll_detached` only after Mergen consumes the wheel scroll; runtime direct-forward wheel events must not disable bottom-stick behavior.
 - **Terminal wheel handling must yield to UI overlays.** When Settings popup, exit confirmation popup, Terminal Manager history popup, or foreground message popup is open, terminal wheel handling must be disabled to allow wheel events to reach the overlay's ScrollArea. Use `terminal_output_mouse_wheel_enabled()` helper to check overlay state before processing wheel events in `draw_terminal_pane()`.
-- **Codex CLI integration:** Codex uses strict hook-only integration with narrow visible-state exceptions. Mergen configures `hooks.json` with `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, and `Stop` events that route to the Mergen bridge. The status transitions are:
+- **Codex CLI integration:** Codex status/session detection uses strict hook-only integration with narrow visible-state exceptions. Browser tool access is configured separately through project-local `.codex/config.toml`. Mergen configures `hooks.json` with `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, and `Stop` events that route to the Mergen bridge. The status transitions are:
   - `UserPromptSubmit`, `PreToolUse`, and `PostToolUse` hooks → Running (gray spinner)
   - `PermissionRequest` hook → `ApprovalRequested` / amber pulse (waiting for user)
   - `Stop` hook → short debounce, then `TurnComplete` / green pulse unless follow-up work arrives first

@@ -20,6 +20,7 @@ import {
 import { BrowserScopeKeyType, type BrowserScopeKey, type BrowserState, type BrowserTab } from '../shared/types';
 import { registerBrowserMcpHandler } from './hookService';
 import { normalizeBrowserMcpToolName } from './browserMcpTools';
+import { getBrowserMcpStdioConfig } from './browserMcpCommand';
 import { browserRecordingsDir } from './config';
 
 interface BrowserMcpSession {
@@ -58,14 +59,6 @@ interface BrowserVideoRecordingState {
 
 const browserVideoRecordings = new Map<string, BrowserVideoRecordingState>();
 
-function getExePath(): string {
-  return process.execPath;
-}
-
-function getMcpCommand(): string[] {
-  return [getExePath(), '--browser-mcp-helper', '--caps=devtools,vision,network,storage'];
-}
-
 function browserMcpScopeKey(scope: BrowserScopeKey): string {
   if (scope.type === BrowserScopeKeyType.Terminal) {
     return `terminal:${scope.projectId}:${scope.terminalId ?? 0}`;
@@ -90,11 +83,12 @@ function broadcastBrowserTabsChanged(scope: BrowserScopeKey, state: Pick<Browser
 }
 
 export function spawnBrowserMcpSession(sessionId: string, scope: BrowserScopeKey): string {
-  const cmd = getMcpCommand();
-  const proc = spawn(cmd[0], cmd.slice(1), {
+  const helper = getBrowserMcpStdioConfig();
+  const proc = spawn(helper.command, helper.args, {
     stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
     windowsHide: true,
     shell: false,
+    env: { ...process.env, ...helper.env },
   });
 
   const session: BrowserMcpSession = {
@@ -1059,7 +1053,8 @@ export function killBrowserMcpSession(sessionId: string): void {
 }
 
 export function getBrowserMcpCommandArray(): string[] {
-  return getMcpCommand();
+  const helper = getBrowserMcpStdioConfig();
+  return [helper.command, ...helper.args];
 }
 
 export function prepareBrowserMcpToolScope(terminalId: number, projectId: number): BrowserScopeKey {

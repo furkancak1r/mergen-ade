@@ -51,12 +51,7 @@ function sendMessage(msg: BrowserMcpMessage): void {
 }
 
 function readCaps(): string[] {
-  return parseBrowserMcpCapsFromArgs(process.argv.slice(2));
-}
-
-export function getBrowserMcpCommandArray(): string[] {
-  const caps = readCaps();
-  return [process.execPath, '--browser-mcp-helper', `--caps=${caps.join(',')}`];
+  return parseBrowserMcpCapsFromArgs(process.argv);
 }
 
 export function handleBrowserMcpHelperMode(): void {

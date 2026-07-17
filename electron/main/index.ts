@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { registerIpcHandlers } from './ipcHandlers';
 import { handleBrowserMcpHelperMode } from './browserMcpHelper';
+import { getMergenCliArgs } from './cliArgs';
 import { handleOpencodeNotifyMode } from './opencode';
 import { handleCodexNotifyMode, handleCodexHookMode } from './codex';
 import { startHookService, stopHookService } from './hookService';
@@ -173,7 +174,10 @@ function clearTray() {
   }
 }
 
-app.whenReady().then(() => {
+const cliArgs = getMergenCliArgs(process.argv);
+const isBrowserMcpHelper = cliArgs[0] === '--browser-mcp-helper';
+
+if (!isBrowserMcpHelper) app.whenReady().then(() => {
   // Remove all menus from menu bar
   Menu.setApplicationMenu(null);
 
@@ -208,7 +212,7 @@ process.on('unhandledRejection', (reason) => {
   console.error('Unhandled rejection:', reason);
 });
 
-app.on('window-all-closed', () => {
+if (!isBrowserMcpHelper) app.on('window-all-closed', () => {
   stopHookService();
   clearTray();
   if (process.platform !== 'darwin') {
@@ -218,23 +222,21 @@ app.on('window-all-closed', () => {
 
 // CLI mode dispatch
 function dispatchCliMode() {
-  const args = process.argv.slice(2);
-  console.log('CLI args:', args);
+  const args = cliArgs;
   if (args.length === 0) return false;
   const mode = args[0];
-  console.log('CLI mode:', mode);
   switch (mode) {
     case '--browser-mcp-helper': {
       handleBrowserMcpHelperMode();
       return true;
     }
     case '--opencode-notify': {
-      const ok = handleOpencodeNotifyMode();
+      const ok = handleOpencodeNotifyMode(args.slice(1));
       if (!ok) process.exit(1);
       return true;
     }
     case '--codex-notify': {
-      const ok = handleCodexNotifyMode();
+      const ok = handleCodexNotifyMode(args.slice(1));
       if (!ok) process.exit(1);
       return true;
     }
@@ -244,7 +246,7 @@ function dispatchCliMode() {
         process.exit(1);
       }
       const eventName = args[1];
-      handleCodexHookMode(eventName);
+      handleCodexHookMode(eventName, args.slice(2).join(' '));
       return true;
     }
     default:
@@ -254,7 +256,7 @@ function dispatchCliMode() {
 
 if (dispatchCliMode()) {
   // Browser MCP helper runs as a long-lived child process; do not exit
-  if (process.argv[2] !== '--browser-mcp-helper') {
+  if (!isBrowserMcpHelper) {
     process.exit(0);
   }
 }

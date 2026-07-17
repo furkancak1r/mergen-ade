@@ -35,7 +35,8 @@ import {
   prepareBrowserMcpToolScope,
   getBrowserMcpCommandArray,
 } from './browserMcpService';
-import { generateOpencodeTerminalConfig, generateOpencodeRuntimeConfig } from './opencode';
+import { generateOpencodeTerminalConfig, generateOpencodeRuntimeConfig, verifyOpencodePonytailPlugin } from './opencode';
+import { generateCodexTerminalConfig, verifyCodexPonytailCli, verifyCodexPonytailPlugin } from './codex';
 import { getAppDiagnostics } from './diagnostics';
 import { runClaudeCodexPlan, runClaudeCodexReview, updateClaudeCodexUiVerification } from './claudeCodexHook';
 
@@ -255,8 +256,14 @@ export function registerIpcHandlers() {
     destroyBrowserInstance(scope);
   });
 
-  // OpenCode config generation
+  // AI CLI config generation
+  ipcMain.handle('codex:generateTerminalConfig', async (_event, opts: { cwd: string }) => {
+    verifyCodexPonytailPlugin();
+    await verifyCodexPonytailCli();
+    return generateCodexTerminalConfig(opts.cwd);
+  });
   ipcMain.handle('opencode:generateTerminalConfig', async (_event, opts: { cwd: string; model?: string; effort?: string; kimiStrictPermissions?: boolean }) => {
+    await verifyOpencodePonytailPlugin();
     return generateOpencodeTerminalConfig(opts.cwd, { model: opts.model, effort: opts.effort, kimiStrictPermissions: opts.kimiStrictPermissions });
   });
   ipcMain.handle('opencode:generateRuntimeConfig', async (_event, opts: { cwd: string; model?: string; effort?: string; mcpServers?: string[]; kimiStrictPermissions?: boolean }) => {

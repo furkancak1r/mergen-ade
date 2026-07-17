@@ -1,8 +1,11 @@
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { spawn, spawnSync } from 'child_process';
+import { execFile, spawn, spawnSync } from 'child_process';
+import { parse as parseToml } from '@iarna/toml';
 import { getHookServicePort, getHookInboxDir } from './hookService';
+import { getBrowserMcpStdioConfig } from './browserMcpCommand';
+import { resolveChildPath } from './safePath';
 
 export type CodexExecParsedEvent =
   | { kind: 'assistant_message'; text: string }
@@ -166,9 +169,8 @@ function truncateCodexTitle(value: string): string {
   return value.length > 120 ? `${value.slice(0, 117)}...` : value;
 }
 
-export function handleCodexNotifyMode(): boolean {
+export function handleCodexNotifyMode(args = process.argv.slice(2)): boolean {
   try {
-    const args = process.argv.slice(2);
     const eventName = args[0];
     const eventJson = args[1];
     if (!eventName) {
@@ -206,9 +208,8 @@ export function handleCodexNotifyMode(): boolean {
   }
 }
 
-export function handleCodexHookMode(eventName: string): void {
+export function handleCodexHookMode(eventName: string, eventJson = process.argv.slice(3).join(' ')): void {
   try {
-    const eventJson = process.argv.slice(3).join(' ');
     const port = getHookServicePort();
     const dir = getCodexInboxDir();
 
@@ -300,6 +301,149 @@ function getCodexConfigDir(): string {
   const dir = path.join(homeDir, '.codex');
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+export function verifyCodexPonytailPlugin(homeDir = os.homedir()): string {
+  const codexDir = resolveChildPath(homeDir, '.codex');
+  const configPath = resolveChildPath(codexDir, 'config.toml');
+  if (!fs.existsSync(configPath)) throw new Error('Codex Ponytail preflight failed: config.toml is missing');
+
+  let config: Record<string, unknown>;
+  try {
+    config = asRecord(parseToml(fs.readFileSync(configPath, 'utf-8'))) ?? {};
+  } catch (err) {
+    throw new Error(`Codex Ponytail preflight failed: invalid config.toml (${err instanceof Error ? err.message : String(err)})`);
+  }
+
+  const plugin = asRecord(asRecord(config.plugins)?.['ponytail@ponytail']);
+  if (plugin?.enabled !== true) throw new Error('Codex Ponytail preflight failed: plugin is not enabled');
+
+  const hookState = asRecord(asRecord(config.hooks)?.state) ?? {};
+  const trustedHook = Object.entries(hookState).some(([key, value]) => {
+    const state = asRecord(value);
+    return key.startsWith('ponytail@ponytail:')
+      && key.includes('session_start')
+      && state?.enabled !== false
+      && typeof state?.trusted_hash === 'string';
+  });
+  if (!trustedHook) throw new Error('Codex Ponytail preflight failed: no trusted session hook');
+
+  const cacheRoot = resolveChildPath(codexDir, 'plugins', 'cache', 'ponytail', 'ponytail');
+  if (!fs.existsSync(cacheRoot)) throw new Error('Codex Ponytail preflight failed: plugin cache is missing');
+  const version = fs.readdirSync(cacheRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];
+  if (!version) throw new Error('Codex Ponytail preflight failed: plugin cache is missing');
+
+  const pluginRoot = resolveChildPath(cacheRoot, version);
+  for (const required of [
+    '.codex-plugin/plugin.json',
+    'skills/ponytail/SKILL.md',
+    'hooks/claude-codex-hooks.json',
+    'hooks/ponytail-config.js',
+    'hooks/ponytail-instructions.js',
+  ]) {
+    if (!fs.existsSync(resolveChildPath(pluginRoot, required))) {
+      throw new Error(`Codex Ponytail preflight failed: ${required} is missing`);
+    }
+  }
+
+  try {
+    const { getDefaultMode } = require(resolveChildPath(pluginRoot, 'hooks', 'ponytail-config.js')) as {
+      getDefaultMode: () => string;
+    };
+    const { getPonytailInstructions } = require(resolveChildPath(pluginRoot, 'hooks', 'ponytail-instructions.js')) as {
+      getPonytailInstructions: (mode: string) => string;
+    };
+    const mode = getDefaultMode();
+    const instructions = mode === 'off' ? '' : getPonytailInstructions(mode);
+    if (!['lite', 'full', 'ultra'].includes(mode) || !/ponytail/i.test(instructions)) {
+      throw new Error(`inactive mode: ${mode}`);
+    }
+    return mode;
+  } catch (err) {
+    throw new Error(`Codex Ponytail preflight failed: plugin runtime check failed (${err instanceof Error ? err.message : String(err)})`);
+  }
+}
+
+export function parseCodexPonytailPluginList(output: string): string {
+  const installed = asRecord(JSON.parse(output))?.installed;
+  const plugin = Array.isArray(installed)
+    ? installed.map(asRecord).find((entry) => entry?.pluginId === 'ponytail@ponytail')
+    : undefined;
+  if (plugin?.installed !== true || plugin.enabled !== true || typeof plugin.version !== 'string') {
+    throw new Error('Ponytail is not installed and enabled');
+  }
+  return plugin.version;
+}
+
+export function verifyCodexPonytailCli(): Promise<string> {
+  const bin = getCodexBinPath();
+  return new Promise((resolve, reject) => execFile(
+    bin,
+    ['plugin', 'list', '--marketplace', 'ponytail', '--json'],
+    { encoding: 'utf-8', timeout: 15_000, windowsHide: true, shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin) },
+    (error, stdout, stderr) => {
+      if (error) return reject(new Error(`Codex Ponytail preflight failed: CLI plugin check failed (${error.message || stderr})`));
+      try {
+        resolve(parseCodexPonytailPluginList(stdout));
+      } catch (err) {
+        reject(new Error(`Codex Ponytail preflight failed: CLI plugin check failed (${err instanceof Error ? err.message : String(err)})`));
+      }
+    },
+  ));
+}
+
+const MERGEN_MCP_BLOCK_START = '# BEGIN MERGEN ADE BROWSER MCP';
+const MERGEN_MCP_BLOCK_END = '# END MERGEN ADE BROWSER MCP';
+
+export function generateCodexTerminalConfig(cwd: string): string {
+  if (!cwd || typeof cwd !== 'string') {
+    throw new Error('Invalid cwd for Codex terminal config');
+  }
+
+  const configPath = resolveChildPath(cwd, '.codex', 'config.toml');
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  const current = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf-8') : '';
+  const eol = current.includes('\r\n') ? '\r\n' : '\n';
+  const helper = getBrowserMcpStdioConfig();
+  const block = [
+    MERGEN_MCP_BLOCK_START,
+    '[mcp_servers.mergen-browser]',
+    `command = ${JSON.stringify(helper.command)}`,
+    `args = ${JSON.stringify(helper.args)}`,
+    'enabled = true',
+    '[mcp_servers.mergen-browser.env]',
+    'ELECTRON_RUN_AS_NODE = "1"',
+    MERGEN_MCP_BLOCK_END,
+  ].join(eol);
+  const managedBlock = new RegExp(`${MERGEN_MCP_BLOCK_START}[\\s\\S]*?${MERGEN_MCP_BLOCK_END}`);
+  let existingMergen = false;
+  if (current) {
+    try {
+      const parsed = asRecord(parseToml(current));
+      const servers = asRecord(parsed?.mcp_servers);
+      existingMergen = Boolean(servers && Object.prototype.hasOwnProperty.call(servers, 'mergen-browser'));
+    } catch (err) {
+      throw new Error(`Invalid Codex project config: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  let next: string;
+  if (managedBlock.test(current)) {
+    next = current.replace(managedBlock, block);
+  } else if (existingMergen) {
+    return configPath;
+  } else {
+    const separator = current.endsWith(`${eol}${eol}`) ? '' : current.endsWith(eol) ? eol : `${eol}${eol}`;
+    next = current ? `${current}${separator}${block}${eol}` : `${block}${eol}`;
+  }
+
+  if (next !== current) {
+    fs.writeFileSync(configPath, next, 'utf-8');
+  }
+  return configPath;
 }
 
 export function writeCodexHooksConfig(): string {

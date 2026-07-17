@@ -641,6 +641,8 @@ const ProjectGroup: React.FC<ProjectGroupProps> = ({
                             effort: config.opencode.planEffort,
                             kimiStrictPermissions: config.opencode.kimiStrictPermissions,
                           });
+                        } else if (l.builtin === BuiltinLauncherKind.Codex) {
+                          await api.invoke('codex:generateTerminalConfig', { cwd: project.path });
                         }
                         const targetId = await onSpawn(project.id, TerminalKindEnum.Foreground);
                         if (targetId) {

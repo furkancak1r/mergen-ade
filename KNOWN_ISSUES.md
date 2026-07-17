@@ -6191,3 +6191,41 @@
   - Added config tests for JSON and single-message imports, duplicate trimming, root/worktree family sync, invalid JSON, unmatched projects, and ambiguous project names.
 - Files/Commands touched: `electron/main/config.ts`, `electron/main/config.test.ts`, `KNOWN_ISSUES.md`
 - References: User request 2026-06-15
+
+---
+
+#### Packaged Browser MCP helper opened the Mergen GUI {#electron-packaged-browser-mcp-argv}
+- Date: 2026-07-16
+- Context: Codex and OpenCode project configs registered the Mergen Browser MCP, but the packaged helper timed out instead of completing stdio initialization.
+- Symptoms/Impact:
+  - `opencode mcp list` reported `mergen-browser` as failed after 30 seconds.
+  - Launching `Mergen ADE.exe --browser-mcp-helper` created Electron GPU/renderer child processes instead of remaining a headless stdio helper.
+- Root cause:
+  - Packaged Electron places the first user argument at `process.argv[1]`, while development Electron places it after the app path.
+  - CLI dispatch and the GUI guard only inspected `process.argv[2]` / `slice(2)`, so packaged helper mode was missed and normal window startup ran.
+- Resolution:
+  - Detect known Mergen CLI mode flags at either packaged or development argv positions.
+  - Pass normalized mode arguments to Codex/OpenCode notify handlers and keep Browser MCP capability parsing position-independent.
+- Prevent recurrence:
+  - Added regression tests for both packaged and development Electron argv layouts.
+  - Keep helper-mode stdout reserved for JSON-RPC and never initialize the GUI lifecycle in helper mode.
+- Files/Commands touched: `electron/main/cliArgs.ts`, `electron/main/cliArgs.test.ts`, `electron/main/index.ts`, `electron/main/browserMcpHelper.ts`, `electron/main/codex.ts`, `electron/main/opencode.ts`, `KNOWN_ISSUES.md`
+- References: User request 2026-07-16
+
+---
+
+#### Packaged Electron GUI process closed Browser MCP stdio {#electron-browser-mcp-node-helper}
+- Date: 2026-07-17
+- Context: Arg normalization stopped the packaged helper from opening the GUI, but OpenCode still reported `Connection closed` during MCP initialization.
+- Symptoms/Impact:
+  - The packaged executable emitted only a blank line and exited before returning the JSON-RPC `initialize` response.
+  - Both the outer portable wrapper and `win-unpacked/Mergen ADE.exe` failed as direct stdio MCP commands.
+- Root cause:
+  - The Windows Electron GUI process does not provide a durable stdio server lifecycle for this helper mode.
+- Resolution:
+  - Added a pure Node Browser MCP bundle and run it through the packaged Electron runtime with `ELECTRON_RUN_AS_NODE=1`.
+  - Codex, OpenCode, and Mergen's internal Browser MCP sessions now share that command and environment.
+- Prevent recurrence:
+  - Keep the helper bundle unpacked from ASAR and verify its JSON-RPC `initialize` handshake through the packaged runtime.
+- Files/Commands touched: `electron/main/browserMcpCli.ts`, `electron/main/browserMcpCommand.ts`, `electron/main/browserMcpService.ts`, `electron/main/codex.ts`, `electron/main/opencode.ts`, `electron/vite.config.ts`, `electron/package.json`, `KNOWN_ISSUES.md`
+- References: User request 2026-07-17
